@@ -748,7 +748,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
+    <div className="flex h-screen w-full flex-col overflow-x-hidden bg-background text-foreground">
       <header className="flex items-center justify-between border-b px-4 py-3">
         <div className="flex items-center gap-2">
           <Label htmlFor="inspect" className="text-xs text-muted-foreground">
@@ -828,7 +828,7 @@ export default function App() {
                     Keyboard shortcuts
                   </Button>
                 </DialogTrigger>
-                <DialogContent className="max-h-[80vh] max-w-md overflow-y-auto">
+                <DialogContent className="max-h-[80vh] w-[calc(100vw-16px)] max-w-[calc(100vw-16px)] overflow-x-hidden overflow-y-auto">
                   <DialogHeader>
                     <DialogTitle>Keyboard shortcuts</DialogTitle>
                   </DialogHeader>
@@ -859,7 +859,10 @@ export default function App() {
           if (v !== 'element') loadCommentsAndTokens()
         }}
       >
-        <TabsList className="mx-4 mt-3 flex w-auto justify-start gap-1 overflow-x-auto">
+        <TabsList
+          variant="line"
+          className="mx-4 mt-2 h-auto w-auto justify-start gap-2 overflow-x-auto px-0 pt-0 pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
           <TabsTrigger value="element" className="shrink-0">
             Element
           </TabsTrigger>
@@ -1376,13 +1379,15 @@ function ShortcutsList() {
         <div key={group.title} className="space-y-2">
           <p className="text-xs font-medium text-muted-foreground">{group.title}</p>
           {group.note && <p className="text-[11px] text-muted-foreground">{group.note}</p>}
-          <div className="space-y-1.5">
+          <div className="space-y-3">
             {group.items.map((item) => (
-              <div key={item.keys} className="flex items-start justify-between gap-3 text-xs">
-                <kbd className="shrink-0 rounded border bg-muted px-1.5 py-0.5 font-mono text-[11px]">
-                  {item.keys}
-                </kbd>
-                <span className="text-right text-muted-foreground">{item.desc}</span>
+              <div key={item.keys} className="space-y-1">
+                <div>
+                  <kbd className="inline-block rounded border bg-muted px-1.5 py-0.5 font-mono text-[11px]">
+                    {item.keys}
+                  </kbd>
+                </div>
+                <p className="text-xs break-words text-muted-foreground">{item.desc}</p>
               </div>
             ))}
           </div>
