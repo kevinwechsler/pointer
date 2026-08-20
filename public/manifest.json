@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Pointer",
+  "version": "0.1.0",
+  "description": "Point at elements in your localhost app and turn visual edits into precise prompts for Claude.",
+  "action": {
+    "default_title": "Pointer"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": ["sidePanel", "activeTab", "tabs", "scripting", "clipboardWrite", "storage"],
+  "host_permissions": ["http://localhost/*", "http://127.0.0.1/*"],
+  "content_scripts": [
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
