@@ -48,6 +48,7 @@ const STYLE_PROPS = [
   'boxShadow',
   'width',
   'height',
+  'transform',
 ] as const
 
 let active = false
@@ -254,6 +255,8 @@ function selectElement(el: Element) {
   selectedEl = el
   ensureOverlay()
   positionBox(selectBox!, el)
+  clearHighlight()
+  drawGridOverlay(el)
   chrome.runtime.sendMessage({ type: 'PTR_SELECTED', payload: buildPayload(el) })
 }
 
@@ -467,10 +470,463 @@ setTimeout(renderPins, 500)
 
 // ---------- event handlers ----------
 
+// ---------- Figma-style measurement & navigation micro-interactions ----------
+
+function toKebabCase(p: string): string {
+  return p.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
+}
+
+function makeMeasureLine(): HTMLDivElement {
+  const line = document.createElement('div')
+  Object.assign(line.style, {
+    position: 'fixed',
+    pointerEvents: 'none',
+    zIndex: '2147483645',
+    background: '#f43f5e',
+    display: 'none',
+  })
+  document.documentElement.appendChild(line)
+  return line
+}
+
+function makeMeasureLabel(): HTMLDivElement {
+  const label = document.createElement('div')
+  Object.assign(label.style, {
+    position: 'fixed',
+    pointerEvents: 'none',
+    zIndex: '2147483647',
+    background: '#f43f5e',
+    color: '#fff',
+    font: 'bold 10px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
+    padding: '1px 4px',
+    borderRadius: '3px',
+    display: 'none',
+    whiteSpace: 'nowrap',
+  })
+  document.documentElement.appendChild(label)
+  return label
+}
+
+// A small pool of reusable line/label nodes, repositioned per frame instead
+// of recreated — cheap enough to update at mousemove rate.
+const measure: {
+  hLine: HTMLDivElement | null
+  vLine: HTMLDivElement | null
+  hLabel: HTMLDivElement | null
+  vLabel: HTMLDivElement | null
+  edgeLines: HTMLDivElement[]
+  edgeLabels: HTMLDivElement[]
+} = { hLine: null, vLine: null, hLabel: null, vLabel: null, edgeLines: [], edgeLabels: [] }
+
+function ensureMeasure() {
+  if (measure.hLine) return
+  measure.hLine = makeMeasureLine()
+  measure.vLine = makeMeasureLine()
+  measure.hLabel = makeMeasureLabel()
+  measure.vLabel = makeMeasureLabel()
+  for (let i = 0; i < 4; i++) {
+    measure.edgeLines.push(makeMeasureLine())
+    measure.edgeLabels.push(makeMeasureLabel())
+  }
+}
+
+function hideMeasure() {
+  if (!measure.hLine) return
+  hideBox(measure.hLine)
+  hideBox(measure.vLine)
+  hideBox(measure.hLabel)
+  hideBox(measure.vLabel)
+  for (const l of measure.edgeLines) hideBox(l)
+  for (const l of measure.edgeLabels) hideBox(l)
+}
+
+function placeHLine(line: HTMLDivElement, x1: number, x2: number, y: number) {
+  Object.assign(line.style, {
+    display: 'block',
+    left: `${Math.min(x1, x2)}px`,
+    top: `${y}px`,
+    width: `${Math.abs(x2 - x1)}px`,
+    height: '1px',
+  })
+}
+
+function placeVLine(line: HTMLDivElement, y1: number, y2: number, x: number) {
+  Object.assign(line.style, {
+    display: 'block',
+    left: `${x}px`,
+    top: `${Math.min(y1, y2)}px`,
+    width: '1px',
+    height: `${Math.abs(y2 - y1)}px`,
+  })
+}
+
+function placeLabel(label: HTMLDivElement, x: number, y: number, text: string) {
+  label.textContent = text
+  Object.assign(label.style, { display: 'block', left: `${x}px`, top: `${y}px` })
+}
+
+// Alt + hover a different element than the current selection: show the gap
+// between them (Figma's "measure against selection").
+function drawDistanceOverlay(a: Element, b: Element) {
+  ensureMeasure()
+  const ra = a.getBoundingClientRect()
+  const rb = b.getBoundingClientRect()
+
+  let horizontalGap: number | null = null
+  let hx1 = 0
+  let hx2 = 0
+  if (rb.left >= ra.right) {
+    horizontalGap = rb.left - ra.right
+    hx1 = ra.right
+    hx2 = rb.left
+  } else if (rb.right <= ra.left) {
+    horizontalGap = ra.left - rb.right
+    hx1 = rb.right
+    hx2 = ra.left
+  }
+  if (horizontalGap !== null) {
+    const overlapTop = Math.max(ra.top, rb.top)
+    const overlapBottom = Math.min(ra.bottom, rb.bottom)
+    const hy = overlapBottom > overlapTop ? (overlapTop + overlapBottom) / 2 : (ra.top + rb.top) / 2
+    placeHLine(measure.hLine!, hx1, hx2, hy)
+    placeLabel(measure.hLabel!, (hx1 + hx2) / 2 - 12, hy - 18, `${Math.round(horizontalGap)}`)
+  } else {
+    hideBox(measure.hLine)
+    hideBox(measure.hLabel)
+  }
+
+  let verticalGap: number | null = null
+  let vy1 = 0
+  let vy2 = 0
+  if (rb.top >= ra.bottom) {
+    verticalGap = rb.top - ra.bottom
+    vy1 = ra.bottom
+    vy2 = rb.top
+  } else if (rb.bottom <= ra.top) {
+    verticalGap = ra.top - rb.bottom
+    vy1 = rb.bottom
+    vy2 = ra.top
+  }
+  if (verticalGap !== null) {
+    const overlapLeft = Math.max(ra.left, rb.left)
+    const overlapRight = Math.min(ra.right, rb.right)
+    const vx = overlapRight > overlapLeft ? (overlapLeft + overlapRight) / 2 : (ra.left + rb.left) / 2
+    placeVLine(measure.vLine!, vy1, vy2, vx)
+    placeLabel(measure.vLabel!, vx + 6, (vy1 + vy2) / 2 - 8, `${Math.round(verticalGap)}`)
+  } else {
+    hideBox(measure.vLine)
+    hideBox(measure.vLabel)
+  }
+
+  ensureOverlay()
+  positionBox(hoverBox!, b)
+}
+
+// Alt+Shift + hover: this element's padding on all four sides.
+function drawPaddingOverlay(el: Element) {
+  ensureMeasure()
+  ensureOverlay()
+  positionBox(hoverBox!, el)
+  const r = el.getBoundingClientRect()
+  const s = getComputedStyle(el)
+  const pt = parseFloat(s.paddingTop) || 0
+  const pr = parseFloat(s.paddingRight) || 0
+  const pb = parseFloat(s.paddingBottom) || 0
+  const pl = parseFloat(s.paddingLeft) || 0
+
+  const edges: [number, number, number, number, number][] = [
+    [r.left, r.top, r.width, pt, pt], // top
+    [r.left, r.bottom - pb, r.width, pb, pb], // bottom
+    [r.left, r.top + pt, pl, Math.max(0, r.height - pt - pb), pl], // left
+    [r.right - pr, r.top + pt, pr, Math.max(0, r.height - pt - pb), pr], // right
+  ]
+
+  edges.forEach(([x, y, w, h, value], i) => {
+    const line = measure.edgeLines[i]
+    const label = measure.edgeLabels[i]
+    if (value <= 0 || w <= 0 || h <= 0) {
+      hideBox(line)
+      hideBox(label)
+      return
+    }
+    Object.assign(line.style, {
+      display: 'block',
+      left: `${x}px`,
+      top: `${y}px`,
+      width: `${w}px`,
+      height: `${h}px`,
+      background: 'rgba(244, 63, 94, 0.25)',
+    })
+    placeLabel(label, x + w / 2 - 8, y + h / 2 - 8, `${Math.round(value)}`)
+  })
+}
+
+// Alt+Ctrl + hover: distance from this element to each viewport edge.
+function drawViewportOverlay(el: Element) {
+  ensureMeasure()
+  ensureOverlay()
+  positionBox(hoverBox!, el)
+  const r = el.getBoundingClientRect()
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const cx = r.left + r.width / 2
+  const cy = r.top + r.height / 2
+
+  placeVLine(measure.edgeLines[0], 0, r.top, cx)
+  placeLabel(measure.edgeLabels[0], cx + 4, r.top / 2 - 8, `${Math.round(r.top)}`)
+  placeVLine(measure.edgeLines[1], r.bottom, vh, cx)
+  placeLabel(measure.edgeLabels[1], cx + 4, r.bottom + (vh - r.bottom) / 2 - 8, `${Math.round(vh - r.bottom)}`)
+  placeHLine(measure.edgeLines[2], 0, r.left, cy)
+  placeLabel(measure.edgeLabels[2], r.left / 2 - 12, cy - 18, `${Math.round(r.left)}`)
+  placeHLine(measure.edgeLines[3], r.right, vw, cy)
+  placeLabel(measure.edgeLabels[3], r.right + (vw - r.right) / 2 - 12, cy - 18, `${Math.round(vw - r.right)}`)
+}
+
+// Grid overlay: automatically shown while a CSS grid container is selected.
+let gridLines: HTMLDivElement[] = []
+
+function clearGridOverlay() {
+  for (const l of gridLines) l.remove()
+  gridLines = []
+}
+
+function drawGridOverlay(el: Element) {
+  clearGridOverlay()
+  const s = getComputedStyle(el)
+  if (s.display !== 'grid' && s.display !== 'inline-grid') return
+  const r = el.getBoundingClientRect()
+  const pl = parseFloat(s.paddingLeft) || 0
+  const pt = parseFloat(s.paddingTop) || 0
+  const cols = s.gridTemplateColumns.split(' ').map(parseFloat).filter((n) => !Number.isNaN(n))
+  const rows = s.gridTemplateRows.split(' ').map(parseFloat).filter((n) => !Number.isNaN(n))
+  const colGap = parseFloat(s.columnGap) || 0
+  const rowGap = parseFloat(s.rowGap) || 0
+
+  const addLine = (style: Partial<CSSStyleDeclaration>) => {
+    const line = document.createElement('div')
+    Object.assign(line.style, {
+      position: 'fixed',
+      pointerEvents: 'none',
+      zIndex: '2147483644',
+      background: 'rgba(139, 92, 246, 0.5)',
+      ...style,
+    })
+    document.documentElement.appendChild(line)
+    gridLines.push(line)
+  }
+
+  let x = r.left + pl
+  cols.forEach((w, i) => {
+    if (i > 0) {
+      addLine({ left: `${x - colGap / 2}px`, top: `${r.top}px`, width: '1px', height: `${r.height}px` })
+    }
+    x += w + colGap
+  })
+  let y = r.top + pt
+  rows.forEach((h, i) => {
+    if (i > 0) {
+      addLine({ left: `${r.left}px`, top: `${y - rowGap / 2}px`, width: `${r.width}px`, height: '1px' })
+    }
+    y += h + rowGap
+  })
+}
+
+// "H": highlight every other element that shares the selected element's
+// exact class list — a stand-in for "same component" without needing a
+// full framework-aware component match.
+let highlightEls: HTMLDivElement[] = []
+
+function clearHighlight() {
+  for (const b of highlightEls) b.remove()
+  highlightEls = []
+}
+
+function toggleHighlightSiblings() {
+  if (highlightEls.length) {
+    clearHighlight()
+    return
+  }
+  if (!selectedEl) return
+  const cls = Array.from(selectedEl.classList)
+  if (!cls.length) return
+  let matches: Element[] = []
+  try {
+    matches = Array.from(document.querySelectorAll('.' + cls.map((c) => CSS.escape(c)).join('.')))
+  } catch {
+    return
+  }
+  for (const m of matches) {
+    if (m === selectedEl) continue
+    const r = m.getBoundingClientRect()
+    if (r.width <= 0 || r.height <= 0) continue
+    const box = document.createElement('div')
+    Object.assign(box.style, {
+      position: 'fixed',
+      pointerEvents: 'none',
+      zIndex: '2147483645',
+      left: `${r.left}px`,
+      top: `${r.top}px`,
+      width: `${r.width}px`,
+      height: `${r.height}px`,
+      border: '1.5px dashed #8b5cf6',
+      boxSizing: 'border-box',
+      borderRadius: '2px',
+    })
+    document.documentElement.appendChild(box)
+    highlightEls.push(box)
+  }
+}
+
+// A small transient toast for keyboard-triggered actions (copy/paste style).
+let toastEl: HTMLDivElement | null = null
+
+function flashToast(text: string) {
+  if (!toastEl) {
+    toastEl = document.createElement('div')
+    Object.assign(toastEl.style, {
+      position: 'fixed',
+      top: '16px',
+      left: '16px',
+      zIndex: '2147483647',
+      background: '#171717',
+      color: '#fafafa',
+      font: '12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace',
+      padding: '6px 10px',
+      borderRadius: '6px',
+      pointerEvents: 'none',
+      display: 'none',
+    })
+    document.documentElement.appendChild(toastEl)
+  }
+  toastEl.textContent = text
+  toastEl.style.display = 'block'
+  clearTimeout((toastEl as any)._t)
+  ;(toastEl as any)._t = setTimeout(() => {
+    if (toastEl) toastEl.style.display = 'none'
+  }, 1000)
+}
+
+// "C" / "V": copy the selected element's computed style, paste it onto
+// whatever's currently hovered.
+let styleClipboard: Record<string, string> | null = null
+
+function copyStyleFromSelected() {
+  if (!selectedEl) return
+  const s = getComputedStyle(selectedEl)
+  const snap: Record<string, string> = {}
+  for (const p of STYLE_PROPS) snap[p] = s[p as any] as string
+  styleClipboard = snap
+  flashToast('Style copied — hover a target and press V')
+}
+
+function pasteStyleToHovered() {
+  if (!styleClipboard || !hoverEl) return
+  const id = registerEl(hoverEl)
+  const before = buildPayload(hoverEl)
+  const changes: { prop: string; from: string; to: string }[] = []
+  for (const [prop, value] of Object.entries(styleClipboard)) {
+    if (before.styles[prop] === value) continue
+    applyStyle(id, toKebabCase(prop), value)
+    changes.push({ prop, from: before.styles[prop], to: value })
+  }
+  if (!changes.length) return
+  chrome.runtime.sendMessage({
+    type: 'PTR_STYLE_PASTED',
+    payload: { target: buildPayload(hoverEl), changes },
+  })
+  flashToast('Style pasted')
+}
+
+// Arrow keys nudge the selected element via `transform: translate(...)`,
+// which works regardless of the underlying layout method (flex/grid/static)
+// without fighting margins the page's own CSS might rely on.
+const nudgeOffsets = new Map<number, { dx: number; dy: number }>()
+
+function nudgeSelected(dx: number, dy: number) {
+  if (!selectedEl) return
+  const id = registerEl(selectedEl)
+  const before = buildPayload(selectedEl)
+  const cur = nudgeOffsets.get(id) ?? { dx: 0, dy: 0 }
+  const next = { dx: cur.dx + dx, dy: cur.dy + dy }
+  nudgeOffsets.set(id, next)
+  const value = `translate(${next.dx}px, ${next.dy}px)`
+  applyStyle(id, 'transform', value)
+  chrome.runtime.sendMessage({
+    type: 'PTR_NUDGED',
+    payload: { elementId: id, value, target: before },
+  })
+}
+
+function selectParent() {
+  if (!selectedEl?.parentElement) return
+  if (selectedEl.parentElement === document.body) return
+  selectElement(selectedEl.parentElement)
+}
+
+function selectFirstChild() {
+  if (!selectedEl) return
+  const child = selectedEl.children[0]
+  if (child) selectElement(child)
+}
+
+function onKeyDown(e: KeyboardEvent) {
+  if (!active) return
+  const target = e.target as HTMLElement | null
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)))
+    return
+
+  if (e.key === 'Tab' && selectedEl) {
+    e.preventDefault()
+    if (e.shiftKey) selectFirstChild()
+    else selectParent()
+    return
+  }
+  if (e.key.startsWith('Arrow') && selectedEl && !e.altKey && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault()
+    const step = e.shiftKey ? 10 : 1
+    const deltas: Record<string, [number, number]> = {
+      ArrowUp: [0, -step],
+      ArrowDown: [0, step],
+      ArrowLeft: [-step, 0],
+      ArrowRight: [step, 0],
+    }
+    const d = deltas[e.key]
+    if (d) nudgeSelected(d[0], d[1])
+    return
+  }
+  if ((e.key === 'c' || e.key === 'C') && !e.metaKey && !e.ctrlKey && selectedEl) {
+    copyStyleFromSelected()
+    return
+  }
+  if ((e.key === 'v' || e.key === 'V') && !e.metaKey && !e.ctrlKey && hoverEl) {
+    pasteStyleToHovered()
+    return
+  }
+  if (e.key === 'h' || e.key === 'H') {
+    toggleHighlightSiblings()
+  }
+}
+
+function onKeyUp(e: KeyboardEvent) {
+  if (e.key === 'Alt' || e.key === 'Shift' || e.key === 'Control') hideMeasure()
+}
+
 function onMouseMove(e: MouseEvent) {
   if (!active && !commentMode) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
-  if (!el || el === hoverEl || el === hoverBox || el === hoverLabel) return
+  if (!el) return
+
+  if (active && !commentMode && e.altKey) {
+    hoverEl = el
+    hideBox(hoverLabel)
+    if (e.ctrlKey) drawViewportOverlay(el)
+    else if (e.shiftKey) drawPaddingOverlay(el)
+    else if (selectedEl && el !== selectedEl) drawDistanceOverlay(selectedEl, el)
+    else drawPaddingOverlay(el)
+    return
+  }
+  hideMeasure()
+  if (el === hoverEl || el === hoverBox || el === hoverLabel) return
   hoverEl = el
   ensureOverlay()
   positionBox(hoverBox!, el)
@@ -553,8 +1009,11 @@ function setCommentMode(on: boolean) {
 
 function onScrollOrResize() {
   if (selectedEl && selectBox) positionBox(selectBox, selectedEl)
+  if (selectedEl) drawGridOverlay(selectedEl)
+  clearHighlight()
   hideBox(hoverBox)
   hideBox(hoverLabel as any)
+  hideMeasure()
 }
 
 function setActive(on: boolean) {
@@ -564,6 +1023,8 @@ function setActive(on: boolean) {
     document.addEventListener('mousemove', onMouseMove, true)
     document.addEventListener('click', onClick, true)
     document.addEventListener('contextmenu', onContextMenu, true)
+    document.addEventListener('keydown', onKeyDown, true)
+    document.addEventListener('keyup', onKeyUp, true)
     window.addEventListener('scroll', onScrollOrResize, true)
     window.addEventListener('resize', onScrollOrResize)
     document.documentElement.style.cursor = 'crosshair'
@@ -571,11 +1032,16 @@ function setActive(on: boolean) {
     document.removeEventListener('mousemove', onMouseMove, true)
     document.removeEventListener('click', onClick, true)
     document.removeEventListener('contextmenu', onContextMenu, true)
+    document.removeEventListener('keydown', onKeyDown, true)
+    document.removeEventListener('keyup', onKeyUp, true)
     window.removeEventListener('scroll', onScrollOrResize, true)
     window.removeEventListener('resize', onScrollOrResize)
     document.documentElement.style.cursor = ''
     hideBox(hoverBox)
     hideBox(hoverLabel as any)
+    hideMeasure()
+    clearGridOverlay()
+    clearHighlight()
   }
 }
 

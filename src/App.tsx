@@ -33,9 +33,17 @@ import {
   Download,
   ArrowRight,
   Layers,
+  Keyboard,
 } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import {
   type SelectionPayload,
   type Edit,
@@ -198,6 +206,33 @@ export default function App() {
       if (msg.type === 'PTR_COMMENT_TARGET') {
         setPendingTarget(msg.payload)
         setPicking(false)
+      }
+      if (msg.type === 'PTR_NUDGED') {
+        const { elementId, value, target } = msg.payload
+        const from =
+          target.styles.transform && target.styles.transform !== 'none'
+            ? target.styles.transform
+            : 'none'
+        pushHistory({ elementId, kind: 'style', prop: 'transform', from, to: value })
+        upsertEdit(target, 'style', 'transform', from, value)
+        if (selection?.elementId === elementId) setDraft((d) => ({ ...d, transform: value }))
+      }
+      if (msg.type === 'PTR_STYLE_PASTED') {
+        const { target, changes } = msg.payload as {
+          target: SelectionPayload
+          changes: { prop: string; from: string; to: string }[]
+        }
+        for (const c of changes) {
+          pushHistory({ elementId: target.elementId, kind: 'style', prop: c.prop, from: c.from, to: c.to })
+          upsertEdit(target, 'style', c.prop, c.from, c.to)
+        }
+        if (selection?.elementId === target.elementId) {
+          setDraft((d) => {
+            const next = { ...d }
+            for (const c of changes) next[c.prop] = c.to
+            return next
+          })
+        }
       }
     }
     chrome.runtime.onMessage.addListener(listener)
@@ -786,6 +821,21 @@ export default function App() {
                 </div>
               </div>
               <Separator />
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button variant="outline" size="sm" className="w-full">
+                    <Keyboard className="size-3.5" />
+                    Keyboard shortcuts
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-h-[80vh] max-w-md overflow-y-auto">
+                  <DialogHeader>
+                    <DialogTitle>Keyboard shortcuts</DialogTitle>
+                  </DialogHeader>
+                  <ShortcutsList />
+                </DialogContent>
+              </Dialog>
+              <Separator />
               <Button variant="destructive" size="sm" className="w-full" onClick={closePointer}>
                 <X className="size-4" />
                 Close Pointer
@@ -1269,6 +1319,75 @@ export default function App() {
           Clear all
         </Button>
       </div>
+    </div>
+  )
+}
+
+type ShortcutGroup = { title: string; note?: string; items: { keys: string; desc: string }[] }
+
+const SHORTCUT_GROUPS: ShortcutGroup[] = [
+  {
+    title: 'Selecting',
+    items: [
+      { keys: 'Click', desc: "Select the element under the cursor" },
+      {
+        keys: 'Right-click (repeat on the same spot)',
+        desc: 'Cycle through elements stacked at that point, when one hides another',
+      },
+      { keys: 'Tab', desc: "Select the current element's parent" },
+      { keys: 'Shift + Tab', desc: "Select the current element's first child" },
+    ],
+  },
+  {
+    title: 'Measuring',
+    note: 'Hold while hovering — works like Figma’s measurement overlays.',
+    items: [
+      { keys: 'Alt + hover another element', desc: 'Show the gap between it and the current selection' },
+      { keys: 'Alt + Shift + hover', desc: "Show the hovered element's padding on all four sides" },
+      { keys: 'Alt + Ctrl + hover', desc: 'Show the distance from the hovered element to the viewport edges' },
+    ],
+  },
+  {
+    title: 'Editing',
+    items: [
+      { keys: 'Arrow keys', desc: 'Nudge the selected element 1px' },
+      { keys: 'Shift + Arrow keys', desc: 'Nudge the selected element 10px' },
+      { keys: 'C', desc: "Copy the selected element's style" },
+      { keys: 'V', desc: 'Paste the copied style onto whatever is hovered' },
+    ],
+  },
+  {
+    title: 'Canvas',
+    items: [
+      { keys: 'H', desc: 'Highlight every other element that shares the same classes as the selection' },
+      { keys: '(automatic)', desc: 'Selecting a CSS grid container shows its column/row lines' },
+    ],
+  },
+]
+
+function ShortcutsList() {
+  return (
+    <div className="space-y-4 text-sm">
+      <p className="text-xs text-muted-foreground">
+        These work on the page while <span className="font-medium text-foreground">Inspect</span>{' '}
+        is turned on.
+      </p>
+      {SHORTCUT_GROUPS.map((group) => (
+        <div key={group.title} className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">{group.title}</p>
+          {group.note && <p className="text-[11px] text-muted-foreground">{group.note}</p>}
+          <div className="space-y-1.5">
+            {group.items.map((item) => (
+              <div key={item.keys} className="flex items-start justify-between gap-3 text-xs">
+                <kbd className="shrink-0 rounded border bg-muted px-1.5 py-0.5 font-mono text-[11px]">
+                  {item.keys}
+                </kbd>
+                <span className="text-right text-muted-foreground">{item.desc}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   )
 }
