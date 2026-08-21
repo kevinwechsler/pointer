@@ -5,7 +5,15 @@
 
 type SourceInfo = { fileName: string; lineNumber: number } | null
 
+// With all_frames enabled, one copy of this script runs per frame (the app
+// may live inside an iframe, e.g. hosted platforms like Urdi). Each copy
+// tags what it sends with a unique token so the panel can route follow-up
+// messages (style edits, exports) back to the frame that owns the element.
+const FRAME_TOKEN = crypto.randomUUID()
+const IS_TOP = window === window.top
+
 export type SelectionPayload = {
+  frameToken: string
   elementId: number
   tag: string
   id: string
@@ -238,6 +246,7 @@ function buildPayload(el: Element): SelectionPayload {
   const { source, chain } = resolveSource(el)
   const rect = el.getBoundingClientRect()
   return {
+    frameToken: FRAME_TOKEN,
     elementId: registerEl(el),
     tag: el.tagName.toLowerCase(),
     id: el.id || '',
@@ -981,6 +990,7 @@ function onClick(e: MouseEvent) {
       type: 'PTR_COMMENT_TARGET',
       payload: {
         id: pendingId,
+        frameToken: FRAME_TOKEN,
         selector: cssSelector(el),
         descriptor: shortDescriptor(el),
       },
@@ -1250,19 +1260,55 @@ function buildFigmaSvg(root: Element): string {
 
 // ---------- messages from the side panel ----------
 
+// Messages that must run in every frame (activation, global resets). All
+// other messages are frame-scoped: only the frame whose token matches
+// responds — or the top frame when no token is given (e.g. before any
+// selection was made). Without this, every frame would answer and Chrome
+// would surface whichever response came first.
+const BROADCAST_TYPES = new Set([
+  'PTR_PING',
+  'PTR_SET_ACTIVE',
+  'PTR_COMMENT_MODE',
+  'PTR_RESET_ALL',
+  'PTR_SHOW_COMMENTS',
+])
+
 chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any) => {
+  if (BROADCAST_TYPES.has(msg.type)) {
+    switch (msg.type) {
+      case 'PTR_PING':
+        break
+      case 'PTR_SET_ACTIVE':
+        setActive(!!msg.on)
+        if (!msg.on) {
+          hideBox(selectBox)
+          selectedEl = null
+        }
+        break
+      case 'PTR_COMMENT_MODE':
+        setCommentMode(!!msg.on)
+        break
+      case 'PTR_RESET_ALL':
+        resetAll()
+        for (const name of Array.from(tokenPristine.keys())) resetToken(name)
+        break
+      case 'PTR_SHOW_COMMENTS':
+        commentsVisible = !!msg.on
+        localStorage.setItem(COMMENTS_VISIBLE_KEY, commentsVisible ? '1' : '0')
+        renderPins()
+        break
+    }
+    // Every frame executes, but only the top frame answers, so the panel
+    // gets exactly one response.
+    if (IS_TOP) sendResponse({ ok: true, active })
+    return false
+  }
+
+  // Frame-scoped messages below.
+  const mine = msg.frameToken ? msg.frameToken === FRAME_TOKEN : IS_TOP
+  if (!mine) return false
+
   switch (msg.type) {
-    case 'PTR_PING':
-      sendResponse({ ok: true, active })
-      break
-    case 'PTR_SET_ACTIVE':
-      setActive(!!msg.on)
-      if (!msg.on) {
-        hideBox(selectBox)
-        selectedEl = null
-      }
-      sendResponse({ ok: true })
-      break
     case 'PTR_APPLY_STYLE':
       sendResponse({ ok: applyStyle(msg.elementId, msg.prop, msg.value) })
       break
@@ -1284,11 +1330,6 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       sendResponse({ ok: !!el })
       break
     }
-    case 'PTR_RESET_ALL':
-      resetAll()
-      for (const name of Array.from(tokenPristine.keys())) resetToken(name)
-      sendResponse({ ok: true })
-      break
     case 'PTR_GET_TOKENS':
       sendResponse({ ok: true, tokens: getTokens() })
       break
@@ -1298,10 +1339,6 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     case 'PTR_RESET_TOKEN':
       resetToken(msg.name)
-      sendResponse({ ok: true })
-      break
-    case 'PTR_COMMENT_MODE':
-      setCommentMode(!!msg.on)
       sendResponse({ ok: true })
       break
     case 'PTR_GET_COMMENTS':
@@ -1322,12 +1359,6 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       sendResponse({ ok: true, comments })
       break
     }
-    case 'PTR_SHOW_COMMENTS':
-      commentsVisible = !!msg.on
-      localStorage.setItem(COMMENTS_VISIBLE_KEY, commentsVisible ? '1' : '0')
-      renderPins()
-      sendResponse({ ok: true })
-      break
     case 'PTR_EXPORT_SVG': {
       const el = getEl(msg.elementId)
       if (!el) {

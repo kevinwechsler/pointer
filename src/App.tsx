@@ -156,6 +156,7 @@ function formatColor(value: string, format: ColorFormat): string {
 
 // One history entry per user action, so it can be undone/redone on the page.
 type HistoryOp = {
+  frameToken: string
   elementId: number
   kind: 'style' | 'text'
   prop: string // css prop (camelCase) or 'text'
@@ -175,6 +176,10 @@ export default function App() {
   const [colorFormat, setColorFormat] = useState<ColorFormat>('hex')
   const [activeTab, setActiveTab] = useState('element')
 
+  // Last frame the user interacted with; frame-scoped requests that aren't
+  // tied to a specific element (tokens, comments) go to this frame.
+  const lastFrameRef = useRef<string | null>(null)
+
   // Undo/redo stack. historyRef holds ops; index points AFTER the last applied op.
   const historyRef = useRef<HistoryOp[]>([])
   const [historyIndex, setHistoryIndex] = useState(0)
@@ -186,6 +191,7 @@ export default function App() {
   const [picking, setPicking] = useState(false)
   const [pendingTarget, setPendingTarget] = useState<{
     id: string
+    frameToken: string
     selector: string
     descriptor: string
   } | null>(null)
@@ -199,11 +205,13 @@ export default function App() {
   useEffect(() => {
     const listener = (msg: any) => {
       if (msg.type === 'PTR_SELECTED') {
+        lastFrameRef.current = msg.payload.frameToken
         setSelection(msg.payload)
         setDraft({ ...msg.payload.styles })
         setText(msg.payload.text)
       }
       if (msg.type === 'PTR_COMMENT_TARGET') {
+        lastFrameRef.current = msg.payload.frameToken
         setPendingTarget(msg.payload)
         setPicking(false)
       }
@@ -213,7 +221,7 @@ export default function App() {
           target.styles.transform && target.styles.transform !== 'none'
             ? target.styles.transform
             : 'none'
-        pushHistory({ elementId, kind: 'style', prop: 'transform', from, to: value })
+        pushHistory({ frameToken: target.frameToken, elementId, kind: 'style', prop: 'transform', from, to: value })
         upsertEdit(target, 'style', 'transform', from, value)
         if (selection?.elementId === elementId) setDraft((d) => ({ ...d, transform: value }))
       }
@@ -223,7 +231,7 @@ export default function App() {
           changes: { prop: string; from: string; to: string }[]
         }
         for (const c of changes) {
-          pushHistory({ elementId: target.elementId, kind: 'style', prop: c.prop, from: c.from, to: c.to })
+          pushHistory({ frameToken: target.frameToken, elementId: target.elementId, kind: 'style', prop: c.prop, from: c.from, to: c.to })
           upsertEdit(target, 'style', c.prop, c.from, c.to)
         }
         if (selection?.elementId === target.elementId) {
@@ -245,10 +253,11 @@ export default function App() {
 
   async function loadCommentsAndTokens() {
     try {
-      const c = await sendToPage({ type: 'PTR_GET_COMMENTS' })
+      const frameToken = lastFrameRef.current ?? undefined
+      const c = await sendToPage({ type: 'PTR_GET_COMMENTS', frameToken })
       setComments(c.comments ?? [])
       setCommentsVisible(c.visible ?? true)
-      const t = await sendToPage({ type: 'PTR_GET_TOKENS' })
+      const t = await sendToPage({ type: 'PTR_GET_TOKENS', frameToken })
       const list = t.tokens ?? []
       setTokens(list)
       setTokenDraft((prev) => {
@@ -309,6 +318,7 @@ export default function App() {
     try {
       await sendToPage({
         type: 'PTR_APPLY_STYLE',
+        frameToken: selection.frameToken,
         elementId: selection.elementId,
         prop: toKebab(prop),
         value,
@@ -317,7 +327,7 @@ export default function App() {
       return
     }
     if (record && from !== value) {
-      pushHistory({ elementId: selection.elementId, kind: 'style', prop, from, to: value })
+      pushHistory({ frameToken: selection.frameToken, elementId: selection.elementId, kind: 'style', prop, from, to: value })
       upsertEdit(selection, 'style', prop, selection.styles[prop], value)
     }
   }
@@ -329,6 +339,7 @@ export default function App() {
     try {
       await sendToPage({
         type: 'PTR_RESET_STYLE',
+        frameToken: selection.frameToken,
         elementId: selection.elementId,
         prop: toKebab(prop),
       })
@@ -336,7 +347,7 @@ export default function App() {
       return
     }
     setDraft((d) => ({ ...d, [prop]: original }))
-    pushHistory({ elementId: selection.elementId, kind: 'style', prop, from, to: original })
+    pushHistory({ frameToken: selection.frameToken, elementId: selection.elementId, kind: 'style', prop, from, to: original })
     setEdits((prev) =>
       prev.filter(
         (e) => !(e.target.elementId === selection.elementId && e.prop === prop)
@@ -354,6 +365,7 @@ export default function App() {
     try {
       await sendToPage({
         type: 'PTR_SET_TEXT',
+        frameToken: selection.frameToken,
         elementId: selection.elementId,
         value: text,
       })
@@ -361,6 +373,7 @@ export default function App() {
       return
     }
     pushHistory({
+      frameToken: selection.frameToken,
       elementId: selection.elementId,
       kind: 'text',
       prop: 'text',
@@ -373,11 +386,12 @@ export default function App() {
   async function resetTextEdit() {
     if (!selection) return
     try {
-      await sendToPage({ type: 'PTR_RESET_TEXT', elementId: selection.elementId })
+      await sendToPage({ type: 'PTR_RESET_TEXT', frameToken: selection.frameToken, elementId: selection.elementId })
     } catch {
       return
     }
     pushHistory({
+      frameToken: selection.frameToken,
       elementId: selection.elementId,
       kind: 'text',
       prop: 'text',
@@ -398,11 +412,12 @@ export default function App() {
   async function revertEdit(edit: Edit) {
     try {
       if (edit.kind === 'text') {
-        await sendToPage({ type: 'PTR_RESET_TEXT', elementId: edit.target.elementId })
+        await sendToPage({ type: 'PTR_RESET_TEXT', frameToken: edit.target.frameToken, elementId: edit.target.elementId })
         if (selection?.elementId === edit.target.elementId) setText(edit.from)
       } else {
         await sendToPage({
           type: 'PTR_RESET_STYLE',
+          frameToken: edit.target.frameToken,
           elementId: edit.target.elementId,
           prop: toKebab(edit.prop),
         })
@@ -415,9 +430,9 @@ export default function App() {
     setEdits((prev) => prev.filter((e) => e.id !== edit.id))
   }
 
-  async function goToElement(elementId: number) {
+  async function goToElement(frameToken: string, elementId: number) {
     try {
-      await sendToPage({ type: 'PTR_RESELECT_ID', elementId })
+      await sendToPage({ type: 'PTR_RESELECT_ID', frameToken, elementId })
       setActiveTab('element')
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
@@ -428,11 +443,12 @@ export default function App() {
   async function applyOp(op: HistoryOp, value: string) {
     try {
       if (op.kind === 'text') {
-        await sendToPage({ type: 'PTR_SET_TEXT', elementId: op.elementId, value })
+        await sendToPage({ type: 'PTR_SET_TEXT', frameToken: op.frameToken, elementId: op.elementId, value })
         if (selection?.elementId === op.elementId) setText(value)
       } else {
         await sendToPage({
           type: 'PTR_APPLY_STYLE',
+          frameToken: op.frameToken,
           elementId: op.elementId,
           prop: toKebab(op.prop),
           value,
@@ -497,7 +513,7 @@ export default function App() {
   async function copyForFigma() {
     if (!selection) return
     try {
-      const r = await sendToPage({ type: 'PTR_EXPORT_SVG', elementId: selection.elementId })
+      const r = await sendToPage({ type: 'PTR_EXPORT_SVG', frameToken: selection.frameToken, elementId: selection.elementId })
       if (!r?.svg) throw new Error('no svg')
       await navigator.clipboard.writeText(r.svg)
       setFigmaCopied(true)
@@ -548,7 +564,7 @@ export default function App() {
       createdAt: Date.now(),
     }
     try {
-      const r = await sendToPage({ type: 'PTR_ADD_COMMENT', comment })
+      const r = await sendToPage({ type: 'PTR_ADD_COMMENT', frameToken: pendingTarget.frameToken, comment })
       setComments(r.comments ?? [])
     } catch {
       return
@@ -560,7 +576,7 @@ export default function App() {
 
   async function deleteComment(id: string) {
     try {
-      const r = await sendToPage({ type: 'PTR_DELETE_COMMENT', id })
+      const r = await sendToPage({ type: 'PTR_DELETE_COMMENT', frameToken: lastFrameRef.current ?? undefined, id })
       setComments(r.comments ?? [])
     } catch {}
   }
@@ -589,7 +605,7 @@ export default function App() {
     const original = tokens.find((t) => t.name === name)?.value ?? ''
     setTokenDraft((d) => ({ ...d, [name]: value }))
     try {
-      await sendToPage({ type: 'PTR_SET_TOKEN', name, value })
+      await sendToPage({ type: 'PTR_SET_TOKEN', frameToken: lastFrameRef.current ?? undefined, name, value })
     } catch {
       return
     }
@@ -607,7 +623,7 @@ export default function App() {
   async function resetTokenEdit(name: string) {
     const original = tokens.find((t) => t.name === name)?.value ?? ''
     try {
-      await sendToPage({ type: 'PTR_RESET_TOKEN', name })
+      await sendToPage({ type: 'PTR_RESET_TOKEN', frameToken: lastFrameRef.current ?? undefined, name })
     } catch {
       return
     }
@@ -972,6 +988,7 @@ export default function App() {
                         if (selection)
                           sendToPage({
                             type: 'PTR_SET_TEXT',
+                            frameToken: selection.frameToken,
                             elementId: selection.elementId,
                             value: v,
                           }).catch(() => {})
@@ -1031,7 +1048,7 @@ export default function App() {
                         size="icon"
                         className="size-6"
                         title="Go to this element"
-                        onClick={() => goToElement(group[0].target.elementId)}
+                        onClick={() => goToElement(group[0].target.frameToken, group[0].target.elementId)}
                       >
                         <ArrowRight className="size-3.5" />
                       </Button>
@@ -1154,7 +1171,7 @@ export default function App() {
                   key={c.id}
                   className="cursor-pointer"
                   onClick={() =>
-                    sendToPage({ type: 'PTR_REVEAL', id: c.id, selector: c.selector }).catch(
+                    sendToPage({ type: 'PTR_REVEAL', frameToken: lastFrameRef.current ?? undefined, id: c.id, selector: c.selector }).catch(
                       () => {}
                     )
                   }

@@ -3,6 +3,9 @@
 export type SourceInfo = { fileName: string; lineNumber: number } | null
 
 export type SelectionPayload = {
+  // Identifies which frame (top page or an iframe) owns this element, so
+  // follow-up messages route to the right copy of the content script.
+  frameToken: string
   elementId: number
   tag: string
   id: string
