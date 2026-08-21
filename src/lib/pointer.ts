@@ -21,10 +21,12 @@ export type SelectionPayload = {
 export type Edit = {
   id: string
   target: SelectionPayload
-  kind: 'style' | 'text'
+  kind: 'style' | 'text' | 'move' | 'insert'
   prop: string
   from: string
   to: string
+  // move: the containing element. insert: the new element's markup.
+  detail?: string
 }
 
 export async function activeTabId(): Promise<number | null> {
@@ -95,9 +97,22 @@ export function generatePrompt(edits: Edit[], tokenEdits: TokenEdit[] = []): str
     const loc = t.source
       ? `in \`${shortFile(t.source.fileName)}:${t.source.lineNumber}\``
       : `selector: \`${t.selector}\``
+    if (e.kind === 'insert') {
+      lines.push(`${i + 1}. Add a new element inside ${e.detail ?? 'the selected container'}:`)
+      lines.push(`   ${e.to}`)
+      lines.push(
+        '   (Inline styles are just a starting point — use the project’s own components, classes, or tokens.)'
+      )
+      lines.push('')
+      return
+    }
     lines.push(`${i + 1}. Element: ${describeTarget(t)} — ${loc}`)
     if (e.kind === 'text') {
       lines.push(`   Change the text from "${e.from}" to "${e.to}".`)
+    } else if (e.kind === 'move') {
+      lines.push(
+        `   Reorder it within ${e.detail ?? 'its parent'}: move it from position ${e.from} to position ${e.to} among its siblings.`
+      )
     } else {
       lines.push(`   Change \`${e.prop}\` from \`${e.from}\` to \`${e.to}\`.`)
     }

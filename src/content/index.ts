@@ -312,6 +312,139 @@ function resetText(id: number): boolean {
   return true
 }
 
+// ---------- reordering ----------
+// Where an element sat before Pointer moved it, so the move can be undone
+// exactly even after several shuffles.
+const movePristine = new Map<number, { parent: Element; nextSibling: Node | null }>()
+
+function siblingIndex(el: Element): number {
+  return el.parentElement ? Array.from(el.parentElement.children).indexOf(el) : -1
+}
+
+function moveElement(
+  id: number,
+  dir: 'prev' | 'next'
+): { ok: boolean; from?: number; to?: number; parentDesc?: string } {
+  const el = getEl(id)
+  const parent = el?.parentElement
+  if (!el || !parent) return { ok: false }
+  const sibling = dir === 'prev' ? el.previousElementSibling : el.nextElementSibling
+  if (!sibling) return { ok: false }
+
+  if (!movePristine.has(id)) {
+    movePristine.set(id, { parent, nextSibling: el.nextSibling })
+  }
+  const from = siblingIndex(el)
+  if (dir === 'prev') parent.insertBefore(el, sibling)
+  else parent.insertBefore(sibling, el)
+  const to = siblingIndex(el)
+
+  if (selectBox) positionBox(selectBox, el)
+  schedulePinUpdate()
+  return { ok: true, from, to, parentDesc: shortDescriptor(parent) }
+}
+
+function resetMove(id: number): boolean {
+  const el = getEl(id)
+  const rec = movePristine.get(id)
+  if (!el || !rec) return false
+  rec.parent.insertBefore(el, rec.nextSibling)
+  movePristine.delete(id)
+  if (selectBox) positionBox(selectBox, el)
+  schedulePinUpdate()
+  return true
+}
+
+// ---------- inserting new elements ----------
+// Elements Pointer itself created. They're plain DOM nodes with inline
+// styles, so they behave like any other element for selection and editing —
+// but they're tracked so they can be removed on undo and described in the
+// prompt as additions rather than edits.
+const insertedEls = new Map<number, Element>()
+
+type InsertKind = 'layout' | 'rect' | 'circle' | 'text'
+
+function buildNewElement(kind: InsertKind): HTMLElement {
+  const el = document.createElement('div')
+  switch (kind) {
+    case 'layout':
+      Object.assign(el.style, {
+        display: 'flex',
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: '12px',
+        padding: '16px',
+        minWidth: '160px',
+        minHeight: '64px',
+        border: '1px dashed #94a3b8',
+        borderRadius: '8px',
+      })
+      break
+    case 'rect':
+      Object.assign(el.style, {
+        width: '120px',
+        height: '80px',
+        background: '#3b82f6',
+        borderRadius: '8px',
+      })
+      break
+    case 'circle':
+      Object.assign(el.style, {
+        width: '80px',
+        height: '80px',
+        background: '#8b5cf6',
+        borderRadius: '50%',
+      })
+      break
+    case 'text':
+      el.textContent = 'New text'
+      Object.assign(el.style, {
+        fontSize: '16px',
+        fontWeight: '400',
+        color: '#0f172a',
+      })
+      break
+  }
+  return el
+}
+
+function insertElement(
+  kind: InsertKind,
+  targetId: number | null,
+  position: 'inside' | 'after'
+): { ok: boolean; payload?: SelectionPayload; html?: string; parentDesc?: string } {
+  const anchor = targetId != null ? getEl(targetId) : document.body
+  if (!anchor) return { ok: false }
+
+  const el = buildNewElement(kind)
+  el.setAttribute('data-pointer-new', kind)
+
+  if (position === 'inside') anchor.appendChild(el)
+  else anchor.parentElement?.insertBefore(el, anchor.nextSibling)
+
+  const id = registerEl(el)
+  insertedEls.set(id, el)
+  selectElement(el)
+  return {
+    ok: true,
+    payload: buildPayload(el),
+    html: el.outerHTML,
+    parentDesc: shortDescriptor(el.parentElement ?? document.body),
+  }
+}
+
+function removeInserted(id: number): boolean {
+  const el = insertedEls.get(id)
+  if (!el) return false
+  el.remove()
+  insertedEls.delete(id)
+  if (selectedEl === el) {
+    selectedEl = null
+    hideBox(selectBox)
+  }
+  return true
+}
+
 function resetAll() {
   for (const [id, p] of pristine) {
     const el = getEl(id)
@@ -323,6 +456,8 @@ function resetAll() {
     if (p.text != null) el.innerText = p.text
   }
   pristine.clear()
+  for (const id of Array.from(movePristine.keys())) resetMove(id)
+  for (const id of Array.from(insertedEls.keys())) removeInserted(id)
   if (selectedEl && selectBox) positionBox(selectBox, selectedEl)
 }
 
@@ -434,6 +569,8 @@ function resolveCommentEl(c: PointerComment): Element | null {
   }
 }
 
+let selectedCommentId: string | null = null
+
 function renderPins() {
   clearPins()
   if (!commentsVisible) return
@@ -443,23 +580,40 @@ function renderPins() {
     if (!el) return
     if (!el.hasAttribute('data-pointer-cid')) el.setAttribute('data-pointer-cid', c.id)
     const r = el.getBoundingClientRect()
+    const isSelected = c.id === selectedCommentId
     const pin = document.createElement('div')
     pin.textContent = String(i + 1)
     pin.title = `${c.author}: ${c.text}`
+    pin.dataset.pointerPin = c.id
+    const size = isSelected ? 26 : 20
     Object.assign(pin.style, {
       position: 'fixed',
-      top: `${r.top - 10}px`,
-      left: `${r.left + r.width - 10}px`,
+      top: `${r.top - size / 2}px`,
+      left: `${r.left + r.width - size / 2}px`,
       zIndex: '2147483647',
-      width: '20px',
-      height: '20px',
+      width: `${size}px`,
+      height: `${size}px`,
       borderRadius: '50% 50% 50% 4px',
-      background: '#7c3aed',
+      background: isSelected ? '#5b21b6' : '#7c3aed',
       color: '#fff',
-      font: 'bold 11px/20px system-ui, sans-serif',
+      font: `bold ${isSelected ? 13 : 11}px/${size}px system-ui, sans-serif`,
       textAlign: 'center',
-      pointerEvents: 'none',
-      boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
+      // Clickable so a pin can open its comment in the panel.
+      pointerEvents: 'auto',
+      cursor: 'pointer',
+      boxShadow: isSelected
+        ? '0 0 0 3px rgba(124,58,237,0.35), 0 1px 4px rgba(0,0,0,0.3)'
+        : '0 1px 4px rgba(0,0,0,0.3)',
+    })
+    pin.addEventListener('click', (ev) => {
+      ev.preventDefault()
+      ev.stopPropagation()
+      selectedCommentId = c.id
+      renderPins()
+      chrome.runtime.sendMessage({
+        type: 'PTR_COMMENT_CLICKED',
+        payload: { id: c.id, frameToken: FRAME_TOKEN },
+      })
     })
     document.documentElement.appendChild(pin)
     pinEls.push(pin)
@@ -913,6 +1067,21 @@ function onKeyDown(e: KeyboardEvent) {
   }
   if (e.key === 'h' || e.key === 'H') {
     toggleHighlightSiblings()
+    return
+  }
+  // Reorder the selection among its siblings, which is how you move an
+  // element left/right (or up/down) inside a flex or grid layout.
+  if ((e.key === '[' || e.key === ']') && selectedEl) {
+    e.preventDefault()
+    const id = registerEl(selectedEl)
+    const target = buildPayload(selectedEl)
+    const r = moveElement(id, e.key === '[' ? 'prev' : 'next')
+    if (r.ok) {
+      chrome.runtime.sendMessage({
+        type: 'PTR_MOVED',
+        payload: { elementId: id, target, from: r.from, to: r.to, parentDesc: r.parentDesc },
+      })
+    }
   }
 }
 
@@ -924,6 +1093,7 @@ function onMouseMove(e: MouseEvent) {
   if (!active && !commentMode) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
   if (!el) return
+  if (el instanceof HTMLElement && el.dataset.pointerPin) return
 
   if (active && !commentMode && e.altKey) {
     hoverEl = el
@@ -974,10 +1144,12 @@ function onContextMenu(e: MouseEvent) {
 
 function onClick(e: MouseEvent) {
   if (!active && !commentMode) return
+  const el = document.elementFromPoint(e.clientX, e.clientY)
+  // Pins have their own click handler; let it run instead of selecting.
+  if (el instanceof HTMLElement && el.dataset.pointerPin) return
   e.preventDefault()
   e.stopPropagation()
   stackPoint = null
-  const el = document.elementFromPoint(e.clientX, e.clientY)
   if (!el) return
   if (commentMode) {
     // Picking a target for a new comment: tag the exact node right away so
@@ -1396,6 +1568,26 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
         selectElement(el)
       }
       sendResponse({ ok: !!el })
+      break
+    }
+    case 'PTR_MOVE_ELEMENT':
+      sendResponse(moveElement(msg.elementId, msg.dir))
+      break
+    case 'PTR_RESET_MOVE':
+      sendResponse({ ok: resetMove(msg.elementId) })
+      break
+    case 'PTR_INSERT_ELEMENT':
+      sendResponse(insertElement(msg.kind, msg.targetId ?? null, msg.position))
+      break
+    case 'PTR_REMOVE_INSERTED':
+      sendResponse({ ok: removeInserted(msg.elementId) })
+      break
+    case 'PTR_SELECT_COMMENT': {
+      selectedCommentId = msg.id ?? null
+      renderPins()
+      const el = msg.id ? document.querySelector(`[data-pointer-cid="${msg.id}"]`) : null
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      sendResponse({ ok: true })
       break
     }
     case 'PTR_GET_TOKENS':

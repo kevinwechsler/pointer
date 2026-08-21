@@ -34,6 +34,12 @@ import {
   ArrowRight,
   Layers,
   Keyboard,
+  ChevronLeft,
+  ChevronRight,
+  Square,
+  Circle,
+  Type,
+  Rows3,
 } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -158,8 +164,8 @@ function formatColor(value: string, format: ColorFormat): string {
 type HistoryOp = {
   frameToken: string
   elementId: number
-  kind: 'style' | 'text'
-  prop: string // css prop (camelCase) or 'text'
+  kind: 'style' | 'text' | 'move'
+  prop: string // css prop (camelCase), 'text', or 'order'
   from: string
   to: string
 }
@@ -196,11 +202,19 @@ export default function App() {
     descriptor: string
   } | null>(null)
   const [newCommentText, setNewCommentText] = useState('')
+  const [selectedCommentId, setSelectedCommentId] = useState<string | null>(null)
 
   // Design tokens
   const [tokens, setTokens] = useState<{ name: string; value: string }[]>([])
   const [tokenDraft, setTokenDraft] = useState<Record<string, string>>({})
   const [tokenEdits, setTokenEdits] = useState<TokenEdit[]>([])
+
+  // Keep a port open to the background for as long as this panel lives, so
+  // it can switch inspect off when the panel closes by any means.
+  useEffect(() => {
+    const port = chrome.runtime.connect({ name: 'pointer-panel' })
+    return () => port.disconnect()
+  }, [])
 
   useEffect(() => {
     const listener = (msg: any) => {
@@ -209,6 +223,24 @@ export default function App() {
         setSelection(msg.payload)
         setDraft({ ...msg.payload.styles })
         setText(msg.payload.text)
+      }
+      if (msg.type === 'PTR_COMMENT_CLICKED') {
+        lastFrameRef.current = msg.payload.frameToken
+        setSelectedCommentId(msg.payload.id)
+        setActiveTab('comments')
+        loadCommentsAndTokens()
+      }
+      if (msg.type === 'PTR_MOVED') {
+        const { elementId, target, from, to, parentDesc } = msg.payload
+        pushHistory({
+          frameToken: target.frameToken,
+          elementId,
+          kind: 'move',
+          prop: 'order',
+          from: String(from),
+          to: String(to),
+        })
+        upsertEdit(target, 'move', 'order', String(from), String(to), parentDesc)
       }
       if (msg.type === 'PTR_COMMENT_TARGET') {
         lastFrameRef.current = msg.payload.frameToken
@@ -292,7 +324,14 @@ export default function App() {
     setHistoryIndex(historyRef.current.length)
   }
 
-  function upsertEdit(target: SelectionPayload, kind: 'style' | 'text', prop: string, from: string, to: string) {
+  function upsertEdit(
+    target: SelectionPayload,
+    kind: Edit['kind'],
+    prop: string,
+    from: string,
+    to: string,
+    detail?: string
+  ) {
     setEdits((prev) => {
       const key = target.elementId + '|' + prop
       const existing = prev.find((e) => e.target.elementId + '|' + e.prop === key)
@@ -306,7 +345,7 @@ export default function App() {
       if (from === to) return prev
       return [
         ...prev,
-        { id: crypto.randomUUID(), target, kind, prop, from, to },
+        { id: crypto.randomUUID(), target, kind, prop, from, to, detail },
       ]
     })
   }
@@ -411,7 +450,20 @@ export default function App() {
   // which only work against the live `selection`).
   async function revertEdit(edit: Edit) {
     try {
-      if (edit.kind === 'text') {
+      if (edit.kind === 'insert') {
+        await sendToPage({
+          type: 'PTR_REMOVE_INSERTED',
+          frameToken: edit.target.frameToken,
+          elementId: edit.target.elementId,
+        })
+        if (selection?.elementId === edit.target.elementId) setSelection(null)
+      } else if (edit.kind === 'move') {
+        await sendToPage({
+          type: 'PTR_RESET_MOVE',
+          frameToken: edit.target.frameToken,
+          elementId: edit.target.elementId,
+        })
+      } else if (edit.kind === 'text') {
         await sendToPage({ type: 'PTR_RESET_TEXT', frameToken: edit.target.frameToken, elementId: edit.target.elementId })
         if (selection?.elementId === edit.target.elementId) setText(edit.from)
       } else {
@@ -430,6 +482,61 @@ export default function App() {
     setEdits((prev) => prev.filter((e) => e.id !== edit.id))
   }
 
+  async function moveSelected(dir: 'prev' | 'next') {
+    if (!selection) return
+    try {
+      const r = await sendToPage({
+        type: 'PTR_MOVE_ELEMENT',
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+        dir,
+      })
+      if (!r?.ok) return
+      pushHistory({
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+        kind: 'move',
+        prop: 'order',
+        from: String(r.from),
+        to: String(r.to),
+      })
+      upsertEdit(selection, 'move', 'order', String(r.from), String(r.to), r.parentDesc)
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  async function insertNew(kind: 'layout' | 'rect' | 'circle' | 'text', position: 'inside' | 'after') {
+    try {
+      const r = await sendToPage({
+        type: 'PTR_INSERT_ELEMENT',
+        frameToken: selection?.frameToken ?? lastFrameRef.current ?? undefined,
+        targetId: selection?.elementId ?? null,
+        kind,
+        position,
+      })
+      if (!r?.ok || !r.payload) return
+      // Inserts are tracked as their own edit kind and reverted from the
+      // Changes tab; they deliberately stay out of undo/redo, which would
+      // otherwise need to resurrect a destroyed node.
+      upsertEdit(r.payload, 'insert', 'element', '', r.html, r.parentDesc)
+      setActiveTab('element')
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  async function selectComment(id: string | null) {
+    setSelectedCommentId(id)
+    try {
+      await sendToPage({
+        type: 'PTR_SELECT_COMMENT',
+        frameToken: lastFrameRef.current ?? undefined,
+        id,
+      })
+    } catch {}
+  }
+
   async function goToElement(frameToken: string, elementId: number) {
     try {
       await sendToPage({ type: 'PTR_RESELECT_ID', frameToken, elementId })
@@ -442,7 +549,19 @@ export default function App() {
   // Apply one history op in a given direction and sync panel state.
   async function applyOp(op: HistoryOp, value: string) {
     try {
-      if (op.kind === 'text') {
+      if (op.kind === 'move') {
+        // Undo/redo of a reorder is just the same step in the other
+        // direction — derived from whether we're heading back to `from`.
+        const undoing = value === op.from
+        const wentForward = Number(op.to) > Number(op.from)
+        const dir = undoing === wentForward ? 'prev' : 'next'
+        await sendToPage({
+          type: 'PTR_MOVE_ELEMENT',
+          frameToken: op.frameToken,
+          elementId: op.elementId,
+          dir,
+        })
+      } else if (op.kind === 'text') {
         await sendToPage({ type: 'PTR_SET_TEXT', frameToken: op.frameToken, elementId: op.elementId, value })
         if (selection?.elementId === op.elementId) setText(value)
       } else {
@@ -578,6 +697,7 @@ export default function App() {
     try {
       const r = await sendToPage({ type: 'PTR_DELETE_COMMENT', frameToken: lastFrameRef.current ?? undefined, id })
       setComments(r.comments ?? [])
+      if (selectedCommentId === id) setSelectedCommentId(null)
     } catch {}
   }
 
@@ -882,6 +1002,9 @@ export default function App() {
           <TabsTrigger value="element" className="shrink-0">
             Element
           </TabsTrigger>
+          <TabsTrigger value="insert" className="shrink-0">
+            Insert
+          </TabsTrigger>
           <TabsTrigger value="changes" className="shrink-0">
             Changes
             {edits.length + tokenEdits.length > 0 && (
@@ -946,6 +1069,31 @@ export default function App() {
                         .{selection.classes.slice(0, 6).join(' .')}
                       </p>
                     )}
+                    <div className="space-y-1">
+                      <Label className="text-[11px] text-muted-foreground">
+                        Reorder within parent
+                      </Label>
+                      <div className="flex gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-1"
+                          onClick={() => moveSelected('prev')}
+                        >
+                          <ChevronLeft className="size-3.5" />
+                          Earlier
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-1"
+                          onClick={() => moveSelected('next')}
+                        >
+                          Later
+                          <ChevronRight className="size-3.5" />
+                        </Button>
+                      </div>
+                    </div>
                     <Button
                       size="sm"
                       variant="outline"
@@ -1020,6 +1168,65 @@ export default function App() {
         </ScrollArea>
       </TabsContent>
 
+      <TabsContent value="insert" className="min-h-0 flex-1">
+        <ScrollArea className="h-full">
+          <div className="space-y-4 p-4">
+            <div className="space-y-1">
+              <p className="text-xs text-muted-foreground">
+                {selection
+                  ? 'New elements are added inside the selected element, or right after it.'
+                  : 'Nothing selected — new elements will be added at the end of the page. Select an element first to place them precisely.'}
+              </p>
+              {selection && (
+                <p className="truncate font-mono text-[11px] text-muted-foreground">
+                  {selection.componentChain[0] ?? `<${selection.tag}>`}
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-[11px] text-muted-foreground">Add</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    { kind: 'layout', label: 'Layout', icon: Rows3 },
+                    { kind: 'rect', label: 'Rectangle', icon: Square },
+                    { kind: 'circle', label: 'Circle', icon: Circle },
+                    { kind: 'text', label: 'Text', icon: Type },
+                  ] as const
+                ).map((item) => (
+                  <div key={item.kind} className="space-y-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="w-full"
+                      onClick={() => insertNew(item.kind, 'inside')}
+                    >
+                      <item.icon className="size-3.5" />
+                      {item.label}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 w-full text-[11px] text-muted-foreground"
+                      disabled={!selection}
+                      onClick={() => insertNew(item.kind, 'after')}
+                    >
+                      after selection
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <p className="text-[11px] text-muted-foreground">
+              Added elements are real, selectable elements — style them in the Element tab, then
+              send everything to Claude with Copy prompt.
+            </p>
+          </div>
+        </ScrollArea>
+      </TabsContent>
+
       <TabsContent value="changes" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
           <div className="space-y-3 p-4">
@@ -1057,9 +1264,23 @@ export default function App() {
                       {group.map((e) => (
                         <div key={e.id} className="flex items-center justify-between gap-2 text-xs">
                           <p className="min-w-0 truncate text-muted-foreground">
-                            {e.kind === 'text' ? 'text' : e.prop}:{' '}
-                            <span className="line-through">{e.from}</span> →{' '}
-                            <span className="font-medium text-foreground">{e.to}</span>
+                            {e.kind === 'insert' ? (
+                              <span className="font-medium text-foreground">
+                                added new element
+                              </span>
+                            ) : e.kind === 'move' ? (
+                              <>
+                                order:{' '}
+                                <span className="line-through">{e.from}</span> →{' '}
+                                <span className="font-medium text-foreground">{e.to}</span>
+                              </>
+                            ) : (
+                              <>
+                                {e.kind === 'text' ? 'text' : e.prop}:{' '}
+                                <span className="line-through">{e.from}</span> →{' '}
+                                <span className="font-medium text-foreground">{e.to}</span>
+                              </>
+                            )}
                           </p>
                           <Button
                             variant="ghost"
@@ -1169,17 +1390,25 @@ export default function App() {
               comments.map((c, i) => (
                 <Card
                   key={c.id}
-                  className="cursor-pointer"
-                  onClick={() =>
-                    sendToPage({ type: 'PTR_REVEAL', frameToken: lastFrameRef.current ?? undefined, id: c.id, selector: c.selector }).catch(
-                      () => {}
-                    )
+                  ref={(node) => {
+                    // Bring the pin's comment into view when a pin was clicked
+                    // on the page rather than here in the list.
+                    if (node && c.id === selectedCommentId)
+                      node.scrollIntoView({ block: 'nearest' })
+                  }}
+                  className={
+                    'cursor-pointer' +
+                    (c.id === selectedCommentId ? ' border-primary bg-primary/5' : '')
                   }
+                  onClick={() => selectComment(c.id)}
                 >
                   <CardContent className="flex items-start justify-between gap-2 p-3">
                     <div className="min-w-0 flex-1 space-y-1 text-xs">
                       <div className="flex min-w-0 items-center gap-1.5">
-                        <Badge variant="secondary" className="shrink-0">
+                        <Badge
+                          variant={c.id === selectedCommentId ? 'default' : 'secondary'}
+                          className="shrink-0"
+                        >
                           {i + 1}
                         </Badge>
                         <span className="shrink-0 font-medium">{c.author}</span>
@@ -1372,6 +1601,14 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { keys: 'Arrow keys', desc: 'Nudge the selected element 1px' },
       { keys: 'Shift + Arrow keys', desc: 'Nudge the selected element 10px' },
+      {
+        keys: '[',
+        desc: 'Move the selected element earlier among its siblings (left/up in a layout)',
+      },
+      {
+        keys: ']',
+        desc: 'Move the selected element later among its siblings (right/down in a layout)',
+      },
       { keys: 'C', desc: "Copy the selected element's style" },
       { keys: 'V', desc: 'Paste the copied style onto whatever is hovered' },
     ],
