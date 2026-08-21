@@ -1140,23 +1140,44 @@ function fontWeightNumber(computed: string): number {
   return Number.isNaN(n) ? 400 : n
 }
 
+// Real font metrics via a hidden canvas, so text can be positioned by its
+// actual baseline. Figma's SVG importer anchors <text> strictly at the
+// baseline and ignores dominant-baseline, so guessing (or relying on that
+// attribute) shifts every text layer and makes the whole paste look like
+// its spacing is wrong.
+let metricsCtx: CanvasRenderingContext2D | null = null
+
+function baselineWithinLine(style: CSSStyleDeclaration, lineBoxHeight: number): number {
+  const fontSize = parseFloat(style.fontSize) || 16
+  if (!metricsCtx) metricsCtx = document.createElement('canvas').getContext('2d')
+  let ascent = fontSize * 0.8
+  let descent = fontSize * 0.2
+  if (metricsCtx) {
+    try {
+      metricsCtx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+      const m = metricsCtx.measureText('Mg')
+      if (m.fontBoundingBoxAscent) ascent = m.fontBoundingBoxAscent
+      if (m.fontBoundingBoxDescent) descent = m.fontBoundingBoxDescent
+    } catch {
+      // keep the estimate
+    }
+  }
+  // The line box may be taller than the glyphs (line-height leading);
+  // browsers center the glyph box inside it.
+  const leading = Math.max(0, lineBoxHeight - (ascent + descent))
+  return leading / 2 + ascent
+}
+
 function svgTextElement(
   text: string,
   x: number,
-  y: number,
+  baselineY: number,
   style: CSSStyleDeclaration
 ): string {
   const color = parseCssColor(style.color) ?? { hex: '#000000', alpha: 1 }
   const fontSize = parseFloat(style.fontSize) || 16
   const family = style.fontFamily.split(',')[0].replace(/["']/g, '').trim()
   const weight = fontWeightNumber(style.fontWeight)
-  const anchorMap: Record<string, string> = {
-    center: 'middle',
-    right: 'end',
-    left: 'start',
-    justify: 'start',
-  }
-  const anchor = anchorMap[style.textAlign] || 'start'
   // Bake in text-transform: it only changes rendering, not textContent, so
   // without this the exported layer would show the original casing instead
   // of what's actually visible on the page (e.g. an uppercase button label).
@@ -1165,14 +1186,27 @@ function svgTextElement(
   else if (style.textTransform === 'lowercase') display = display.toLowerCase()
   else if (style.textTransform === 'capitalize')
     display = display.replace(/\b\w/g, (c) => c.toUpperCase())
-  // y is the top of the line box (from getClientRects), so anchor text
-  // there directly instead of guessing a baseline offset per font.
-  return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" dominant-baseline="text-before-edge" font-family="${esc(
-    family
-  )}" font-size="${fontSize.toFixed(1)}" font-weight="${weight}" fill="${color.hex}" fill-opacity="${color.alpha}" text-anchor="${anchor}">${esc(display)}</text>`
+  const attrs = [
+    `x="${x.toFixed(1)}"`,
+    `y="${baselineY.toFixed(1)}"`,
+    `font-family="${esc(family)}"`,
+    `font-size="${fontSize.toFixed(1)}"`,
+    `font-weight="${weight}"`,
+    `fill="${color.hex}"`,
+    `fill-opacity="${color.alpha}"`,
+  ]
+  const ls = parseFloat(style.letterSpacing)
+  if (!Number.isNaN(ls) && ls !== 0) attrs.push(`letter-spacing="${ls.toFixed(2)}"`)
+  return `<text ${attrs.join(' ')}>${esc(display)}</text>`
 }
 
-function elementToSvg(el: Element, originX: number, originY: number, out: string[]) {
+function elementToSvg(
+  el: Element,
+  originX: number,
+  originY: number,
+  out: string[],
+  imgData: Map<string, string>
+) {
   if (!(el instanceof HTMLElement) && !(el instanceof SVGElement)) return
   const style = getComputedStyle(el)
   if (style.display === 'none' || style.visibility === 'hidden') return
@@ -1189,10 +1223,13 @@ function elementToSvg(el: Element, originX: number, originY: number, out: string
   }
 
   if (el instanceof HTMLImageElement && el.src) {
+    // Figma won't fetch external URLs when pasting an SVG, so images must
+    // travel embedded as data URIs (fetched beforehand by inlineImages).
+    const href = imgData.get(el.src) ?? el.src
     out.push(
       `<image x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${rect.width.toFixed(
         1
-      )}" height="${rect.height.toFixed(1)}" href="${esc(el.src)}" preserveAspectRatio="none" />`
+      )}" height="${rect.height.toFixed(1)}" href="${esc(href)}" preserveAspectRatio="none" />`
     )
     return
   }
@@ -1228,29 +1265,60 @@ function elementToSvg(el: Element, originX: number, originY: number, out: string
   }
 
   // Direct text nodes only (not text belonging to nested elements, which
-  // get handled when we recurse into them below).
+  // get handled when we recurse into them below). Each rendered line is
+  // placed at its measured left edge with a baseline computed from real
+  // font metrics — the alignment is already baked into where the line
+  // rect sits, so no SVG text-anchor tricks are needed.
   for (const child of Array.from(el.childNodes)) {
     if (child.nodeType === Node.TEXT_NODE && (child.textContent || '').trim()) {
       for (const line of getTextLines(child as Text)) {
         const lineX = line.rect.left - originX
-        const lineY = line.rect.top - originY
-        let textX = lineX
-        if (style.textAlign === 'center') textX = lineX + line.rect.width / 2
-        else if (style.textAlign === 'right') textX = lineX + line.rect.width
-        out.push(svgTextElement(line.text.trim(), textX, lineY, style))
+        const baselineY =
+          line.rect.top - originY + baselineWithinLine(style, line.rect.height)
+        out.push(svgTextElement(line.text.trim(), lineX, baselineY, style))
       }
     }
   }
 
   for (const child of Array.from(el.children)) {
-    elementToSvg(child, originX, originY, out)
+    elementToSvg(child, originX, originY, out, imgData)
   }
 }
 
-function buildFigmaSvg(root: Element): string {
+// Fetch every <img> in the subtree and convert it to a data URI. Same-origin
+// (localhost) images always work; cross-origin ones without CORS headers are
+// left as URLs (Figma will drop them, but nothing else breaks).
+async function inlineImages(root: Element): Promise<Map<string, string>> {
+  const map = new Map<string, string>()
+  const imgs: HTMLImageElement[] = []
+  if (root instanceof HTMLImageElement) imgs.push(root)
+  imgs.push(...Array.from(root.querySelectorAll('img')))
+  await Promise.all(
+    imgs.map(async (img) => {
+      const src = img.src
+      if (!src || src.startsWith('data:') || map.has(src)) return
+      try {
+        const blob = await (await fetch(src)).blob()
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const fr = new FileReader()
+          fr.onload = () => resolve(fr.result as string)
+          fr.onerror = reject
+          fr.readAsDataURL(blob)
+        })
+        map.set(src, dataUrl)
+      } catch {
+        // leave as URL
+      }
+    })
+  )
+  return map
+}
+
+async function buildFigmaSvg(root: Element): Promise<string> {
   const rect = root.getBoundingClientRect()
+  const imgData = await inlineImages(root)
   const out: string[] = []
-  elementToSvg(root, rect.left, rect.top, out)
+  elementToSvg(root, rect.left, rect.top, out, imgData)
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${rect.width.toFixed(
     1
   )}" height="${rect.height.toFixed(1)}" viewBox="0 0 ${rect.width.toFixed(
@@ -1365,8 +1433,10 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
         sendResponse({ ok: false })
         break
       }
-      sendResponse({ ok: true, svg: buildFigmaSvg(el) })
-      break
+      buildFigmaSvg(el)
+        .then((svg) => sendResponse({ ok: true, svg }))
+        .catch(() => sendResponse({ ok: false }))
+      return true // keep the channel open for the async response
     }
     case 'PTR_REVEAL': {
       const el =
