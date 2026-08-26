@@ -36,6 +36,7 @@ import {
   Keyboard,
   ChevronLeft,
   ChevronRight,
+  CopyPlus,
   Square,
   Circle,
   Type,
@@ -64,6 +65,8 @@ type StyleField = {
   label: string
   type: 'color' | 'text' | 'select' | 'unit'
   options?: string[]
+  /** Keyword the browser reports that really means zero (e.g. letter-spacing: normal). */
+  zeroKeyword?: string
 }
 
 const UNITS = ['px', 'rem', 'em', '%']
@@ -101,7 +104,12 @@ const GROUPS: { title: string; fields: StyleField[] }[] = [
         type: 'select',
         options: ['normal', '1', '1.1', '1.2', '1.3', '1.4', '1.5', '1.6', '1.75', '2'],
       },
-      { prop: 'letterSpacing', label: 'Letter spacing', type: 'unit' },
+      {
+        prop: 'letterSpacing',
+        label: 'Letter spacing',
+        type: 'unit',
+        zeroKeyword: 'normal',
+      },
       {
         prop: 'textAlign',
         label: 'Align',
@@ -131,33 +139,159 @@ const GROUPS: { title: string; fields: StyleField[] }[] = [
 
 const toKebab = (p: string) => p.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
 
-function rgbToHex(value: string): string {
-  const v = value.trim()
-  if (/^#[0-9a-f]{6}$/i.test(v)) return v
-  const m = v.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/)
-  if (!m) return '#000000'
-  return (
-    '#' +
-    [m[1], m[2], m[3]]
-      .map((n) => Number(n).toString(16).padStart(2, '0'))
-      .join('')
-  )
-}
-
-function hexToRgbString(value: string): string {
-  const m = value.trim().match(/^#?([0-9a-f]{6})$/i)
-  if (!m) return value
-  const n = m[1]
-  const r = parseInt(n.slice(0, 2), 16)
-  const g = parseInt(n.slice(2, 4), 16)
-  const b = parseInt(n.slice(4, 6), 16)
-  return `rgb(${r}, ${g}, ${b})`
-}
-
 type ColorFormat = 'hex' | 'rgb'
 
+type ParsedColor = {
+  r: number
+  g: number
+  b: number
+  alpha: number
+  /** No paint at all — must not be shown as a solid color. */
+  transparent: boolean
+  /** Value we couldn't interpret (gradients, images, unusual syntaxes). */
+  unknown: boolean
+}
+
+const NO_COLOR: ParsedColor = { r: 0, g: 0, b: 0, alpha: 0, transparent: true, unknown: false }
+
+function parseColor(value: string): ParsedColor {
+  const v = (value || '').trim()
+  if (!v || v === 'transparent' || v === 'none') return NO_COLOR
+
+  const hex = v.match(/^#([0-9a-f]{3,8})$/i)
+  if (hex) {
+    let h = hex[1]
+    if (h.length === 3 || h.length === 4) h = h.split('').map((c) => c + c).join('')
+    const r = parseInt(h.slice(0, 2), 16)
+    const g = parseInt(h.slice(2, 4), 16)
+    const b = parseInt(h.slice(4, 6), 16)
+    const alpha = h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1
+    return { r, g, b, alpha, transparent: alpha === 0, unknown: false }
+  }
+
+  // getComputedStyle normalizes to rgb()/rgba(); modern space-separated
+  // syntax (`rgb(0 0 0 / 50%)`) is handled by the loose split below.
+  const rgb = v.match(/^rgba?\(([^)]+)\)$/i)
+  if (rgb) {
+    const parts = rgb[1].split(/[,\s/]+/).filter(Boolean)
+    const r = parseFloat(parts[0])
+    const g = parseFloat(parts[1])
+    const b = parseFloat(parts[2])
+    let alpha = 1
+    if (parts[3] != null) {
+      alpha = parts[3].endsWith('%') ? parseFloat(parts[3]) / 100 : parseFloat(parts[3])
+    }
+    if ([r, g, b].some(Number.isNaN)) return { ...NO_COLOR, unknown: true, transparent: false }
+    return { r, g, b, alpha, transparent: alpha === 0, unknown: false }
+  }
+
+  return { r: 0, g: 0, b: 0, alpha: 1, transparent: false, unknown: true }
+}
+
+function toHex(c: ParsedColor): string {
+  const h = (n: number) => Math.round(n).toString(16).padStart(2, '0')
+  return `#${h(c.r)}${h(c.g)}${h(c.b)}`
+}
+
+/** Hex for <input type="color">, which only accepts 6-digit hex. */
+function swatchHex(value: string): string {
+  const c = parseColor(value)
+  return c.transparent || c.unknown ? '#ffffff' : toHex(c)
+}
+
+/**
+ * What the text field shows. Transparent and unrecognized values are shown
+ * verbatim rather than coerced into a color — showing `#000000` for an
+ * element that has no background is what made selections look wrong.
+ */
 function formatColor(value: string, format: ColorFormat): string {
-  return format === 'rgb' ? hexToRgbString(rgbToHex(value)) : rgbToHex(value)
+  const c = parseColor(value)
+  if (c.transparent) return 'transparent'
+  if (c.unknown) return value
+  if (format === 'rgb') {
+    return c.alpha < 1
+      ? `rgba(${c.r}, ${c.g}, ${c.b}, ${Number(c.alpha.toFixed(3))})`
+      : `rgb(${c.r}, ${c.g}, ${c.b})`
+  }
+  if (c.alpha < 1) {
+    return toHex(c) + Math.round(c.alpha * 255).toString(16).padStart(2, '0')
+  }
+  return toHex(c)
+}
+
+// Checkerboard behind the swatch so "no color" reads as empty, not black.
+const CHECKER =
+  'repeating-conic-gradient(#cbd5e1 0% 25%, #ffffff 0% 50%) 50% / 8px 8px'
+
+type Token = { name: string; value: string }
+
+/** `--card-bg` → `Card bg`, so the list reads like a palette, not like CSS. */
+function tokenLabel(name: string): string {
+  const clean = name.replace(/^--/, '').replace(/[-_]/g, ' ').trim()
+  return clean.charAt(0).toUpperCase() + clean.slice(1)
+}
+
+function groupTokens(tokens: Token[]): { title: string; items: Token[] }[] {
+  const groups: Record<string, Token[]> = {
+    Colors: [],
+    Spacing: [],
+    Radius: [],
+    Typography: [],
+    Other: [],
+  }
+  for (const t of tokens) {
+    const n = t.name.toLowerCase()
+    const parsed = parseColor(t.value)
+    if (!parsed.unknown && !parsed.transparent) groups.Colors.push(t)
+    else if (/radius|rounded/.test(n)) groups.Radius.push(t)
+    else if (/font|text|leading|tracking|letter/.test(n)) groups.Typography.push(t)
+    else if (/space|spacing|gap|gutter|size|width|height|padding|margin/.test(n))
+      groups.Spacing.push(t)
+    else groups.Other.push(t)
+  }
+  return Object.entries(groups)
+    .filter(([, items]) => items.length > 0)
+    .map(([title, items]) => ({ title, items }))
+}
+
+function ColorField({
+  value,
+  format,
+  edited,
+  onChange,
+}: {
+  value: string
+  format: ColorFormat
+  edited: boolean
+  onChange: (v: string) => void
+}) {
+  const parsed = parseColor(value)
+  return (
+    <div className="flex items-center gap-1.5">
+      <div
+        className="relative size-8 shrink-0 overflow-hidden rounded border"
+        style={{ background: CHECKER }}
+        title={parsed.transparent ? 'No color set' : value}
+      >
+        <div className="absolute inset-0" style={{ background: parsed.transparent ? 'transparent' : value }} />
+        <input
+          type="color"
+          value={swatchHex(value)}
+          onChange={(e) => onChange(e.target.value)}
+          className="absolute inset-0 cursor-pointer opacity-0"
+        />
+      </div>
+      <Input
+        value={formatColor(value, format)}
+        onChange={(e) => onChange(e.target.value)}
+        className={
+          'h-8 font-mono text-xs' +
+          (edited ? ' border-primary bg-primary/5' : '') +
+          (parsed.transparent ? ' text-muted-foreground' : '')
+        }
+      />
+    </div>
+  )
 }
 
 // One history entry per user action, so it can be undone/redone on the page.
@@ -208,6 +342,7 @@ export default function App() {
   const [tokens, setTokens] = useState<{ name: string; value: string }[]>([])
   const [tokenDraft, setTokenDraft] = useState<Record<string, string>>({})
   const [tokenEdits, setTokenEdits] = useState<TokenEdit[]>([])
+  const [advancedTokens, setAdvancedTokens] = useState(false)
 
   // Keep a port open to the background for as long as this panel lives, so
   // it can switch inspect off when the panel closes by any means.
@@ -229,6 +364,21 @@ export default function App() {
         setSelectedCommentId(msg.payload.id)
         setActiveTab('comments')
         loadCommentsAndTokens()
+      }
+      if (msg.type === 'PTR_DELETED') {
+        const { elementId, target, inserted } = msg.payload
+        if (inserted) {
+          // It was an element Pointer added; drop its insert edit instead of
+          // recording a deletion the codebase knows nothing about.
+          setEdits((prev) => prev.filter((e) => e.target.elementId !== elementId))
+        } else {
+          upsertEdit(target, 'remove', 'element', 'present', 'removed')
+        }
+        setSelection(null)
+      }
+      if (msg.type === 'PTR_DUPLICATED') {
+        const { payload, html, parentDesc } = msg.payload
+        if (payload) upsertEdit(payload, 'insert', 'element', '', html, parentDesc)
       }
       if (msg.type === 'PTR_MOVED') {
         const { elementId, target, from, to, parentDesc } = msg.payload
@@ -506,6 +656,40 @@ export default function App() {
     }
   }
 
+  async function deleteSelected() {
+    if (!selection) return
+    try {
+      const r = await sendToPage({
+        type: 'PTR_DELETE_ELEMENT',
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+      })
+      if (!r?.ok) return
+      if (r.inserted) {
+        setEdits((prev) => prev.filter((e) => e.target.elementId !== selection.elementId))
+      } else {
+        upsertEdit(selection, 'remove', 'element', 'present', 'removed')
+      }
+      setSelection(null)
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  async function duplicateSelected() {
+    if (!selection) return
+    try {
+      const r = await sendToPage({
+        type: 'PTR_DUPLICATE_ELEMENT',
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+      })
+      if (r?.ok && r.payload) upsertEdit(r.payload, 'insert', 'element', '', r.html, r.parentDesc)
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
   async function insertNew(kind: 'layout' | 'rect' | 'circle' | 'text', position: 'inside' | 'after') {
     try {
       const r = await sendToPage({
@@ -717,10 +901,6 @@ export default function App() {
 
   // ----- design tokens -----
 
-  // Only plain hex/rgb can be previewed in a native <input type="color">;
-  // oklch/hsl and other modern syntaxes are edited as text only.
-  const isPreviewableColor = (v: string) => /^#|^rgb/.test(v.trim())
-
   async function applyToken(name: string, value: string) {
     const original = tokens.find((t) => t.name === name)?.value ?? ''
     setTokenDraft((d) => ({ ...d, [name]: value }))
@@ -779,22 +959,12 @@ export default function App() {
           )}
         </div>
         {f.type === 'color' ? (
-          <div className="flex items-center gap-1.5">
-            <input
-              type="color"
-              value={rgbToHex(value)}
-              onChange={(e) => applyStyle(f.prop, e.target.value)}
-              className="size-8 shrink-0 cursor-pointer rounded border bg-transparent p-0.5"
-            />
-            <Input
-              value={formatColor(value, colorFormat)}
-              onChange={(e) => applyStyle(f.prop, e.target.value)}
-              className={
-                'h-8 font-mono text-xs' +
-                (edited ? ' border-primary bg-primary/5' : '')
-              }
-            />
-          </div>
+          <ColorField
+            value={value}
+            format={colorFormat}
+            edited={edited}
+            onChange={(v) => applyStyle(f.prop, v)}
+          />
         ) : f.type === 'select' ? (
           <Select value={value} onValueChange={(v) => applyStyle(f.prop, v)}>
             <SelectTrigger
@@ -821,9 +991,13 @@ export default function App() {
           </Select>
         ) : f.type === 'unit' ? (
           (() => {
-            const parsed = parseUnit(value)
-            // Values like "normal" can't be split into number+unit; fall back
-            // to a plain text input for those.
+            // A keyword like letter-spacing's "normal" means zero, so show a
+            // numeric control seeded at 0 instead of dropping to free text.
+            const parsed =
+              f.zeroKeyword && value.trim() === f.zeroKeyword
+                ? { num: '0', unit: 'px' }
+                : parseUnit(value)
+            // Anything else we can't split into number+unit stays free text.
             if (!parsed)
               return (
                 <Input
@@ -1070,14 +1244,20 @@ export default function App() {
                       </p>
                     )}
                     <div className="space-y-1">
-                      <Label className="text-[11px] text-muted-foreground">
-                        Reorder within parent
-                      </Label>
+                      <div className="flex items-center justify-between">
+                        <Label className="text-[11px] text-muted-foreground">
+                          Order among siblings
+                        </Label>
+                        <span className="font-mono text-[11px] text-muted-foreground">
+                          {selection.index + 1} of {selection.siblingCount}
+                        </span>
+                      </div>
                       <div className="flex gap-1">
                         <Button
                           size="sm"
                           variant="outline"
                           className="flex-1"
+                          disabled={selection.index === 0}
                           onClick={() => moveSelected('prev')}
                         >
                           <ChevronLeft className="size-3.5" />
@@ -1087,12 +1267,34 @@ export default function App() {
                           size="sm"
                           variant="outline"
                           className="flex-1"
+                          disabled={selection.index >= selection.siblingCount - 1}
                           onClick={() => moveSelected('next')}
                         >
                           Later
                           <ChevronRight className="size-3.5" />
                         </Button>
                       </div>
+                    </div>
+
+                    <div className="flex gap-1">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="flex-1"
+                        onClick={duplicateSelected}
+                      >
+                        <CopyPlus className="size-3.5" />
+                        Duplicate
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="flex-1 text-destructive hover:text-destructive"
+                        onClick={deleteSelected}
+                      >
+                        <Trash2 className="size-3.5" />
+                        Delete
+                      </Button>
                     </div>
                     <Button
                       size="sm"
@@ -1150,6 +1352,101 @@ export default function App() {
                     />
                   </div>
                 )}
+
+                <div className="space-y-2">
+                  <Separator />
+                  <p className="text-xs font-medium text-muted-foreground">
+                    Layout of this container
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Controls how this element arranges its children — use it to try a row, a
+                    column, or a wrapped grid.
+                  </p>
+
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">Arrangement</Label>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(
+                        [
+                          { label: 'Row', display: 'flex', dir: 'row', wrap: 'nowrap' },
+                          { label: 'Column', display: 'flex', dir: 'column', wrap: 'nowrap' },
+                          { label: 'Wrap', display: 'flex', dir: 'row', wrap: 'wrap' },
+                        ] as const
+                      ).map((opt) => {
+                        const isActive =
+                          draft.display?.includes('flex') &&
+                          draft.flexDirection === opt.dir &&
+                          (opt.wrap === 'wrap'
+                            ? draft.flexWrap === 'wrap'
+                            : draft.flexWrap !== 'wrap')
+                        return (
+                          <Button
+                            key={opt.label}
+                            size="sm"
+                            variant={isActive ? 'default' : 'outline'}
+                            className="h-7 text-xs"
+                            onClick={() => {
+                              applyStyle('display', opt.display)
+                              applyStyle('flexDirection', opt.dir)
+                              applyStyle('flexWrap', opt.wrap)
+                            }}
+                          >
+                            {opt.label}
+                          </Button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">
+                      Grid columns — split children into rows
+                    </Label>
+                    <div className="grid grid-cols-6 gap-1">
+                      {[1, 2, 3, 4, 5, 6].map((n) => {
+                        const isActive =
+                          draft.display?.includes('grid') &&
+                          (draft.gridTemplateColumns ?? '').split(' ').length === n
+                        return (
+                          <Button
+                            key={n}
+                            size="sm"
+                            variant={isActive ? 'default' : 'outline'}
+                            className="h-7 px-0 text-xs"
+                            onClick={() => {
+                              applyStyle('display', 'grid')
+                              applyStyle('gridTemplateColumns', `repeat(${n}, minmax(0, 1fr))`)
+                            }}
+                          >
+                            {n}
+                          </Button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    {renderField({
+                      prop: 'justifyContent',
+                      label: 'Justify',
+                      type: 'select',
+                      options: [
+                        'flex-start',
+                        'center',
+                        'flex-end',
+                        'space-between',
+                        'space-around',
+                        'space-evenly',
+                      ],
+                    })}
+                    {renderField({
+                      prop: 'alignItems',
+                      label: 'Align',
+                      type: 'select',
+                      options: ['stretch', 'flex-start', 'center', 'flex-end', 'baseline'],
+                    })}
+                  </div>
+                </div>
 
                 {GROUPS.map((group) => (
                   <div key={group.title} className="space-y-2">
@@ -1267,6 +1564,10 @@ export default function App() {
                             {e.kind === 'insert' ? (
                               <span className="font-medium text-foreground">
                                 added new element
+                              </span>
+                            ) : e.kind === 'remove' ? (
+                              <span className="font-medium text-destructive">
+                                removed element
                               </span>
                             ) : e.kind === 'move' ? (
                               <>
@@ -1442,102 +1743,154 @@ export default function App() {
 
       <TabsContent value="tokens" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
-          <div className="space-y-2 p-4">
+          <div className="space-y-4 p-4">
             {tokens.length === 0 ? (
               <p className="pt-6 text-center text-sm text-muted-foreground">
                 No CSS variables found on :root of this page.
               </p>
             ) : (
-              tokens.map((t) => {
-                const value = tokenDraft[t.name] ?? t.value
-                const edited = tokenEdits.some((e) => e.name === t.name)
-                return (
-                  <div key={t.name} className="space-y-1">
-                    <div className="flex items-center justify-between">
-                      <Label className="truncate font-mono text-[11px] text-muted-foreground">
-                        {t.name}
-                      </Label>
-                      {edited && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-5"
-                          title="Reset this change"
-                          onClick={() => resetTokenEdit(t.name)}
-                        >
-                          <RotateCcw className="size-3" />
-                        </Button>
-                      )}
-                    </div>
-                    {isPreviewableColor(value) ? (
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="color"
-                          value={value.startsWith('#') ? value.slice(0, 7) : rgbToHex(value)}
-                          onChange={(e) => applyToken(t.name, e.target.value)}
-                          className="size-8 shrink-0 cursor-pointer rounded border bg-transparent p-0.5"
-                        />
-                        <Input
-                          value={formatColor(value, colorFormat)}
-                          onChange={(e) => applyToken(t.name, e.target.value)}
-                          className={
-                            'h-8 font-mono text-xs' +
-                            (edited ? ' border-primary bg-primary/5' : '')
-                          }
-                        />
+              <>
+                <div className="flex items-center justify-between">
+                  <p className="text-xs text-muted-foreground">
+                    {tokens.length} tokens
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="adv-tokens" className="text-[11px] text-muted-foreground">
+                      Show names
+                    </Label>
+                    <Switch
+                      id="adv-tokens"
+                      checked={advancedTokens}
+                      onCheckedChange={setAdvancedTokens}
+                    />
+                  </div>
+                </div>
+
+                {groupTokens(tokens).map((group) => (
+                  <div key={group.title} className="space-y-2">
+                    <Separator />
+                    <p className="text-xs font-medium text-muted-foreground">{group.title}</p>
+
+                    {group.title === 'Colors' ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        {group.items.map((t) => {
+                          const value = tokenDraft[t.name] ?? t.value
+                          const edited = tokenEdits.some((e) => e.name === t.name)
+                          return (
+                            <div
+                              key={t.name}
+                              className={
+                                'flex items-center gap-2 rounded-md border p-1.5' +
+                                (edited ? ' border-primary bg-primary/5' : '')
+                              }
+                            >
+                              <div
+                                className="relative size-8 shrink-0 overflow-hidden rounded border"
+                                style={{ background: CHECKER }}
+                              >
+                                <div className="absolute inset-0" style={{ background: value }} />
+                                <input
+                                  type="color"
+                                  value={swatchHex(value)}
+                                  onChange={(e) => applyToken(t.name, e.target.value)}
+                                  className="absolute inset-0 cursor-pointer opacity-0"
+                                />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-xs font-medium">
+                                  {advancedTokens ? t.name : tokenLabel(t.name)}
+                                </p>
+                                <p className="truncate font-mono text-[10px] text-muted-foreground">
+                                  {value}
+                                </p>
+                              </div>
+                              {edited && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-5 shrink-0"
+                                  title="Reset this change"
+                                  onClick={() => resetTokenEdit(t.name)}
+                                >
+                                  <RotateCcw className="size-3" />
+                                </Button>
+                              )}
+                            </div>
+                          )
+                        })}
                       </div>
                     ) : (
-                      (() => {
+                      group.items.map((t) => {
+                        const value = tokenDraft[t.name] ?? t.value
+                        const edited = tokenEdits.some((e) => e.name === t.name)
                         const parsed = parseUnit(value)
-                        if (!parsed)
-                          return (
-                            <Input
-                              value={value}
-                              onChange={(e) => applyToken(t.name, e.target.value)}
-                              className={
-                                'h-8 font-mono text-xs' +
-                                (edited ? ' border-primary bg-primary/5' : '')
-                              }
-                            />
-                          )
                         return (
-                          <div className="flex items-center gap-1">
-                            <Input
-                              type="number"
-                              step="any"
-                              value={parsed.num}
-                              onChange={(e) => {
-                                const n = e.target.value
-                                if (n !== '' && !Number.isNaN(Number(n)))
-                                  applyToken(t.name, `${n}${parsed.unit}`)
-                              }}
-                              className={
-                                'h-8 min-w-0 flex-1 font-mono text-xs' +
-                                (edited ? ' border-primary bg-primary/5' : '')
-                              }
-                            />
-                            <Select
-                              value={parsed.unit}
-                              onValueChange={(u) => applyToken(t.name, `${parsed.num}${u}`)}
-                            >
-                              <SelectTrigger className="h-8 w-[64px] shrink-0 px-2 font-mono text-xs">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {UNITS.map((u) => (
-                                  <SelectItem key={u} value={u} className="font-mono text-xs">
-                                    {u}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
+                          <div key={t.name} className="space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <Label className="min-w-0 truncate text-[11px] text-muted-foreground">
+                                {advancedTokens ? t.name : tokenLabel(t.name)}
+                              </Label>
+                              {edited && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-5 shrink-0"
+                                  title="Reset this change"
+                                  onClick={() => resetTokenEdit(t.name)}
+                                >
+                                  <RotateCcw className="size-3" />
+                                </Button>
+                              )}
+                            </div>
+                            {parsed ? (
+                              <div className="flex items-center gap-1">
+                                <Input
+                                  type="number"
+                                  step="any"
+                                  value={parsed.num}
+                                  onChange={(e) => {
+                                    const n = e.target.value
+                                    if (n !== '' && !Number.isNaN(Number(n)))
+                                      applyToken(t.name, `${n}${parsed.unit}`)
+                                  }}
+                                  className={
+                                    'h-8 min-w-0 flex-1 font-mono text-xs' +
+                                    (edited ? ' border-primary bg-primary/5' : '')
+                                  }
+                                />
+                                <Select
+                                  value={parsed.unit}
+                                  onValueChange={(u) => applyToken(t.name, `${parsed.num}${u}`)}
+                                >
+                                  <SelectTrigger className="h-8 w-[64px] shrink-0 px-2 font-mono text-xs">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {UNITS.map((u) => (
+                                      <SelectItem key={u} value={u} className="font-mono text-xs">
+                                        {u}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                            ) : (
+                              <Input
+                                value={value}
+                                onChange={(e) => applyToken(t.name, e.target.value)}
+                                className={
+                                  'h-8 font-mono text-xs' +
+                                  (edited ? ' border-primary bg-primary/5' : '')
+                                }
+                              />
+                            )}
                           </div>
                         )
-                      })()
+                      })
                     )}
                   </div>
-                )
-              })
+                ))}
+              </>
             )}
           </div>
         </ScrollArea>
@@ -1609,6 +1962,9 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
         keys: ']',
         desc: 'Move the selected element later among its siblings (right/down in a layout)',
       },
+      { keys: 'Drag', desc: 'Drag the selected element to move it freely' },
+      { keys: 'Delete / Backspace', desc: 'Remove the selected element' },
+      { keys: 'Cmd/Ctrl + D', desc: 'Duplicate the selected element' },
       { keys: 'C', desc: "Copy the selected element's style" },
       { keys: 'V', desc: 'Paste the copied style onto whatever is hovered' },
     ],

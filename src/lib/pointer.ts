@@ -16,12 +16,17 @@ export type SelectionPayload = {
   source: SourceInfo
   styles: Record<string, string>
   rect: { width: number; height: number }
+  /** Position among siblings, so reordering controls can show "2 of 5". */
+  index: number
+  siblingCount: number
+  /** True for elements Pointer created (insert or duplicate). */
+  isNew: boolean
 }
 
 export type Edit = {
   id: string
   target: SelectionPayload
-  kind: 'style' | 'text' | 'move' | 'insert'
+  kind: 'style' | 'text' | 'move' | 'insert' | 'remove'
   prop: string
   from: string
   to: string
@@ -107,7 +112,9 @@ export function generatePrompt(edits: Edit[], tokenEdits: TokenEdit[] = []): str
       return
     }
     lines.push(`${i + 1}. Element: ${describeTarget(t)} — ${loc}`)
-    if (e.kind === 'text') {
+    if (e.kind === 'remove') {
+      lines.push('   Remove this element.')
+    } else if (e.kind === 'text') {
       lines.push(`   Change the text from "${e.from}" to "${e.to}".`)
     } else if (e.kind === 'move') {
       lines.push(

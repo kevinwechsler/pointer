@@ -24,6 +24,11 @@ export type SelectionPayload = {
   source: SourceInfo
   styles: Record<string, string>
   rect: { width: number; height: number }
+  /** Position among siblings, so reordering controls can show "2 of 5". */
+  index: number
+  siblingCount: number
+  /** True for elements Pointer created (insert or duplicate). */
+  isNew: boolean
 }
 
 const STYLE_PROPS = [
@@ -57,6 +62,10 @@ const STYLE_PROPS = [
   'width',
   'height',
   'transform',
+  'flexWrap',
+  'gridTemplateColumns',
+  'alignSelf',
+  'flexGrow',
 ] as const
 
 let active = false
@@ -248,6 +257,9 @@ function buildPayload(el: Element): SelectionPayload {
   return {
     frameToken: FRAME_TOKEN,
     elementId: registerEl(el),
+    index: el.parentElement ? Array.from(el.parentElement.children).indexOf(el) : 0,
+    siblingCount: el.parentElement ? el.parentElement.children.length : 1,
+    isNew: el.hasAttribute('data-pointer-new'),
     tag: el.tagName.toLowerCase(),
     id: el.id || '',
     classes: Array.from(el.classList),
@@ -445,6 +457,62 @@ function removeInserted(id: number): boolean {
   return true
 }
 
+// ---------- delete / duplicate ----------
+// Deleting keeps the node around (detached) so it can be put back exactly
+// where it was; Pointer never destroys page content irreversibly.
+const deletedEls = new Map<number, { el: Element; parent: Element; nextSibling: Node | null }>()
+
+function deleteElement(id: number): { ok: boolean; desc?: string; inserted?: boolean } {
+  // Elements Pointer itself added are simply dropped — there's nothing in
+  // the real page to restore.
+  if (insertedEls.has(id)) {
+    const desc = shortDescriptor(insertedEls.get(id)!)
+    return { ok: removeInserted(id), desc, inserted: true }
+  }
+  const el = getEl(id)
+  if (!el?.parentElement) return { ok: false }
+  deletedEls.set(id, { el, parent: el.parentElement, nextSibling: el.nextSibling })
+  const desc = shortDescriptor(el)
+  el.remove()
+  if (selectedEl === el) {
+    selectedEl = null
+    hideBox(selectBox)
+  }
+  schedulePinUpdate()
+  return { ok: true, desc }
+}
+
+function restoreElement(id: number): boolean {
+  const rec = deletedEls.get(id)
+  if (!rec) return false
+  rec.parent.insertBefore(rec.el, rec.nextSibling)
+  deletedEls.delete(id)
+  schedulePinUpdate()
+  return true
+}
+
+function duplicateElement(
+  id: number
+): { ok: boolean; payload?: SelectionPayload; html?: string; parentDesc?: string } {
+  const el = getEl(id)
+  if (!el?.parentElement) return { ok: false }
+  const clone = el.cloneNode(true) as Element
+  // Comment anchors are per-element; a copy must not claim the original's.
+  clone.removeAttribute('data-pointer-cid')
+  clone.querySelectorAll('[data-pointer-cid]').forEach((n) => n.removeAttribute('data-pointer-cid'))
+  clone.setAttribute('data-pointer-new', 'duplicate')
+  el.parentElement.insertBefore(clone, el.nextSibling)
+  const cloneId = registerEl(clone)
+  insertedEls.set(cloneId, clone)
+  selectElement(clone)
+  return {
+    ok: true,
+    payload: buildPayload(clone),
+    html: clone.outerHTML,
+    parentDesc: shortDescriptor(el.parentElement),
+  }
+}
+
 function resetAll() {
   for (const [id, p] of pristine) {
     const el = getEl(id)
@@ -457,6 +525,7 @@ function resetAll() {
   }
   pristine.clear()
   for (const id of Array.from(movePristine.keys())) resetMove(id)
+  for (const id of Array.from(deletedEls.keys())) restoreElement(id)
   for (const id of Array.from(insertedEls.keys())) removeInserted(id)
   if (selectedEl && selectBox) positionBox(selectBox, selectedEl)
 }
@@ -1016,7 +1085,12 @@ function nudgeSelected(dx: number, dy: number) {
   applyStyle(id, 'transform', value)
   chrome.runtime.sendMessage({
     type: 'PTR_NUDGED',
-    payload: { elementId: id, value, target: before },
+    payload: {
+      elementId: id,
+      value,
+      from: cur.dx === 0 && cur.dy === 0 ? 'none' : `translate(${cur.dx}px, ${cur.dy}px)`,
+      target: before,
+    },
   })
 }
 
@@ -1067,6 +1141,30 @@ function onKeyDown(e: KeyboardEvent) {
   }
   if (e.key === 'h' || e.key === 'H') {
     toggleHighlightSiblings()
+    return
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedEl) {
+    e.preventDefault()
+    const id = registerEl(selectedEl)
+    const target = buildPayload(selectedEl)
+    const r = deleteElement(id)
+    if (r.ok) {
+      chrome.runtime.sendMessage({
+        type: 'PTR_DELETED',
+        payload: { elementId: id, target, desc: r.desc, inserted: r.inserted },
+      })
+    }
+    return
+  }
+  if ((e.key === 'd' || e.key === 'D') && (e.metaKey || e.ctrlKey) && selectedEl) {
+    e.preventDefault()
+    const r = duplicateElement(registerEl(selectedEl))
+    if (r.ok) {
+      chrome.runtime.sendMessage({
+        type: 'PTR_DUPLICATED',
+        payload: { payload: r.payload, html: r.html, parentDesc: r.parentDesc },
+      })
+    }
     return
   }
   // Reorder the selection among its siblings, which is how you move an
@@ -1142,6 +1240,75 @@ function onContextMenu(e: MouseEvent) {
   if (el) selectElement(el)
 }
 
+// ---------- free drag ----------
+// Dragging the already-selected element moves it with `transform`, the same
+// mechanism as arrow-key nudging, so both share one offset per element and
+// one revert path. A small threshold keeps ordinary clicks from registering
+// as drags.
+const DRAG_THRESHOLD = 3
+let dragState: {
+  id: number
+  startX: number
+  startY: number
+  baseX: number
+  baseY: number
+  moved: boolean
+} | null = null
+
+function onMouseDown(e: MouseEvent) {
+  if (!active || commentMode || e.button !== 0 || e.altKey) return
+  if (!selectedEl) return
+  const el = document.elementFromPoint(e.clientX, e.clientY)
+  if (!el || (el !== selectedEl && !selectedEl.contains(el))) return
+  const id = registerEl(selectedEl)
+  const base = nudgeOffsets.get(id) ?? { dx: 0, dy: 0 }
+  dragState = {
+    id,
+    startX: e.clientX,
+    startY: e.clientY,
+    baseX: base.dx,
+    baseY: base.dy,
+    moved: false,
+  }
+}
+
+function onDragMove(e: MouseEvent) {
+  if (!dragState) return
+  const dx = e.clientX - dragState.startX
+  const dy = e.clientY - dragState.startY
+  if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
+  dragState.moved = true
+  e.preventDefault()
+  const next = { dx: dragState.baseX + dx, dy: dragState.baseY + dy }
+  nudgeOffsets.set(dragState.id, next)
+  applyStyle(dragState.id, 'transform', `translate(${next.dx}px, ${next.dy}px)`)
+  if (selectBox && selectedEl) positionBox(selectBox, selectedEl)
+}
+
+function onMouseUp() {
+  if (!dragState) return
+  const { id, moved, baseX, baseY } = dragState
+  dragState = null
+  if (!moved) return
+  const offset = nudgeOffsets.get(id) ?? { dx: 0, dy: 0 }
+  const el = getEl(id)
+  if (!el) return
+  chrome.runtime.sendMessage({
+    type: 'PTR_NUDGED',
+    payload: {
+      elementId: id,
+      value: `translate(${offset.dx}px, ${offset.dy}px)`,
+      from: baseX === 0 && baseY === 0 ? 'none' : `translate(${baseX}px, ${baseY}px)`,
+      target: buildPayload(el),
+    },
+  })
+  // Swallow the click that ends the drag so it doesn't re-select.
+  document.addEventListener('click', (ev) => ev.stopPropagation(), {
+    capture: true,
+    once: true,
+  })
+}
+
 function onClick(e: MouseEvent) {
   if (!active && !commentMode) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
@@ -1203,6 +1370,9 @@ function setActive(on: boolean) {
   if (on) {
     ensureOverlay()
     document.addEventListener('mousemove', onMouseMove, true)
+    document.addEventListener('mousemove', onDragMove, true)
+    document.addEventListener('mousedown', onMouseDown, true)
+    document.addEventListener('mouseup', onMouseUp, true)
     document.addEventListener('click', onClick, true)
     document.addEventListener('contextmenu', onContextMenu, true)
     document.addEventListener('keydown', onKeyDown, true)
@@ -1212,10 +1382,14 @@ function setActive(on: boolean) {
     document.documentElement.style.cursor = 'crosshair'
   } else {
     document.removeEventListener('mousemove', onMouseMove, true)
+    document.removeEventListener('mousemove', onDragMove, true)
+    document.removeEventListener('mousedown', onMouseDown, true)
+    document.removeEventListener('mouseup', onMouseUp, true)
     document.removeEventListener('click', onClick, true)
     document.removeEventListener('contextmenu', onContextMenu, true)
     document.removeEventListener('keydown', onKeyDown, true)
     document.removeEventListener('keyup', onKeyUp, true)
+    dragState = null
     window.removeEventListener('scroll', onScrollOrResize, true)
     window.removeEventListener('resize', onScrollOrResize)
     document.documentElement.style.cursor = ''
@@ -1581,6 +1755,15 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     case 'PTR_REMOVE_INSERTED':
       sendResponse({ ok: removeInserted(msg.elementId) })
+      break
+    case 'PTR_DELETE_ELEMENT':
+      sendResponse(deleteElement(msg.elementId))
+      break
+    case 'PTR_RESTORE_ELEMENT':
+      sendResponse({ ok: restoreElement(msg.elementId) })
+      break
+    case 'PTR_DUPLICATE_ELEMENT':
+      sendResponse(duplicateElement(msg.elementId))
       break
     case 'PTR_SELECT_COMMENT': {
       selectedCommentId = msg.id ?? null
