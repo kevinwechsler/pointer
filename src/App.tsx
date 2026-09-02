@@ -213,6 +213,71 @@ function FieldRow({ label, children }: { label: string; children: React.ReactNod
   )
 }
 
+/**
+ * A number <Input> that stays editable while its text is momentarily
+ * invalid (empty, a bare "-") instead of a controlled value snapping back
+ * on every keystroke — which made deleting the last digit to retype it
+ * impossible, since the input would immediately refill with the old value.
+ * Blurring with nothing left types 0, same as retyping mid-edit is free to
+ * override before that happens.
+ */
+function NumericInput({
+  value,
+  onChange,
+  className,
+  blank,
+  ...rest
+}: {
+  value: number
+  onChange: (n: number) => void
+  className?: string
+  /** Show empty (so a `placeholder` like "Mixed" reads through) instead of `value`. */
+  blank?: boolean
+} & Omit<React.ComponentProps<typeof Input>, 'value' | 'onChange' | 'type'>) {
+  const [raw, setRaw] = useState(blank ? '' : String(value))
+  const focused = useRef(false)
+  // A field left blank on purpose (e.g. "Mixed" padding values) shouldn't
+  // snap to 0 just for being blurred untouched — only once the user has
+  // actually edited it.
+  const dirty = useRef(false)
+
+  useEffect(() => {
+    if (!focused.current) {
+      setRaw(blank ? '' : String(value))
+      dirty.current = false
+    }
+  }, [value, blank])
+
+  return (
+    <Input
+      type="number"
+      step="any"
+      value={raw}
+      onFocus={() => {
+        focused.current = true
+      }}
+      onChange={(e) => {
+        const v = e.target.value
+        setRaw(v)
+        dirty.current = true
+        if (v !== '' && v !== '-' && !Number.isNaN(Number(v))) onChange(Number(v))
+      }}
+      onBlur={() => {
+        focused.current = false
+        if (!dirty.current) return
+        if (raw === '' || raw === '-' || Number.isNaN(Number(raw))) {
+          setRaw('0')
+          onChange(0)
+        } else {
+          setRaw(String(value))
+        }
+      }}
+      className={className}
+      {...rest}
+    />
+  )
+}
+
 function NumberField({
   label,
   value,
@@ -228,16 +293,7 @@ function NumberField({
     <div className="space-y-1">
       <Label className="text-[11px] text-muted-foreground">{label}</Label>
       <div className="relative">
-        <Input
-          type="number"
-          step="any"
-          value={value}
-          onChange={(e) => {
-            const n = Number(e.target.value)
-            if (e.target.value !== '' && !Number.isNaN(n)) onChange(n)
-          }}
-          className="h-8 font-mono text-xs"
-        />
+        <NumericInput value={value} onChange={onChange} className="h-8 font-mono text-xs" />
         {suffix && (
           <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
             {suffix}
@@ -268,15 +324,11 @@ function PaddingPairField({
     <div className="space-y-1">
       <Label className="text-[11px] text-muted-foreground">{label}</Label>
       <div className="relative">
-        <Input
-          type="number"
-          step="any"
-          value={same ? pa!.num : ''}
+        <NumericInput
+          value={same ? Number(pa!.num) : 0}
+          blank={!same}
           placeholder={same ? undefined : 'Mixed'}
-          onChange={(e) => {
-            const n = e.target.value
-            if (n !== '' && !Number.isNaN(Number(n))) onChange(`${n}${unit}`)
-          }}
+          onChange={(n) => onChange(`${n}${unit}`)}
           className="h-8 pr-7 font-mono text-xs"
         />
         <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
@@ -293,16 +345,11 @@ function OpacityField({ value, onChange }: { value: string; onChange: (v: string
     <div className="space-y-1">
       <Label className="text-[11px] text-muted-foreground">Opacity</Label>
       <div className="relative">
-        <Input
-          type="number"
+        <NumericInput
           min={0}
           max={100}
           value={pct}
-          onChange={(e) => {
-            const n = Number(e.target.value)
-            if (e.target.value !== '' && !Number.isNaN(n))
-              onChange(String(Math.min(100, Math.max(0, n)) / 100))
-          }}
+          onChange={(n) => onChange(String(Math.min(100, Math.max(0, n)) / 100))}
           className="h-8 font-mono text-xs"
         />
         <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
@@ -478,16 +525,11 @@ function DimensionField({
   return (
     <div className="flex h-8 items-center rounded-md border bg-background pl-2 focus-within:ring-1 focus-within:ring-ring">
       <span className="w-4 font-mono text-[11px] text-muted-foreground">{label}</span>
-      <input
-        type="number"
-        step="any"
+      <NumericInput
         value={shown}
         disabled={mode !== 'fixed'}
-        onChange={(e) => {
-          const n = e.target.value
-          if (n !== '' && !Number.isNaN(Number(n))) onApply(axis, `${n}px`)
-        }}
-        className="min-w-0 flex-1 bg-transparent font-mono text-xs outline-none disabled:text-muted-foreground"
+        onChange={(n) => onApply(axis, `${n}px`)}
+        className="h-full min-w-0 flex-1 border-0 bg-transparent p-0 font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
       />
       <Select
         value={mode}
@@ -767,16 +809,11 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (css: strin
           className="h-8 min-w-0 flex-1 font-mono text-xs uppercase"
         />
         <div className="relative w-[58px] shrink-0">
-          <Input
-            type="number"
+          <NumericInput
             min={0}
             max={100}
             value={Math.round(alpha * 100)}
-            onChange={(e) => {
-              const n = Number(e.target.value)
-              if (e.target.value !== '' && !Number.isNaN(n))
-                emit(hsv, Math.min(1, Math.max(0, n / 100)))
-            }}
+            onChange={(n) => emit(hsv, Math.min(1, Math.max(0, n / 100)))}
             className="h-8 pr-5 font-mono text-xs"
           />
           <span className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2 text-[11px] text-muted-foreground">
@@ -840,18 +877,13 @@ function ColorRow({
         }}
         className="min-w-0 flex-1 bg-transparent font-mono text-xs uppercase outline-none"
       />
-      <input
-        type="number"
+      <NumericInput
         min={0}
         max={100}
         value={visible ? Math.round(parsed.alpha * 100) : 0}
         disabled={!visible}
-        onChange={(e) => {
-          const n = Number(e.target.value)
-          if (e.target.value === '' || Number.isNaN(n)) return
-          onChange(composeColor(parsed, Math.min(1, Math.max(0, n / 100))))
-        }}
-        className="w-8 bg-transparent text-right font-mono text-xs outline-none disabled:text-muted-foreground"
+        onChange={(n) => onChange(composeColor(parsed, Math.min(1, Math.max(0, n / 100))))}
+        className="h-auto w-8 border-0 bg-transparent p-0 text-right font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
       />
       <span className="text-[11px] text-muted-foreground">%</span>
       <button
@@ -1829,15 +1861,9 @@ export default function App() {
               )
             return (
               <div className="flex items-center gap-1">
-                <Input
-                  type="number"
-                  step="any"
-                  value={parsed.num}
-                  onChange={(e) => {
-                    const n = e.target.value
-                    if (n !== '' && !Number.isNaN(Number(n)))
-                      applyStyle(f.prop, `${n}${parsed.unit}`)
-                  }}
+                <NumericInput
+                  value={Number(parsed.num)}
+                  onChange={(n) => applyStyle(f.prop, `${n}${parsed.unit}`)}
                   className={
                     'h-8 min-w-0 flex-1 font-mono text-xs' +
                     (edited ? ' border-primary bg-primary/5' : '')
@@ -2834,15 +2860,9 @@ export default function App() {
                             </div>
                             {parsed ? (
                               <div className="flex items-center gap-1">
-                                <Input
-                                  type="number"
-                                  step="any"
-                                  value={parsed.num}
-                                  onChange={(e) => {
-                                    const n = e.target.value
-                                    if (n !== '' && !Number.isNaN(Number(n)))
-                                      applyToken(t.name, `${n}${parsed.unit}`)
-                                  }}
+                                <NumericInput
+                                  value={Number(parsed.num)}
+                                  onChange={(n) => applyToken(t.name, `${n}${parsed.unit}`)}
                                   className={
                                     'h-8 min-w-0 flex-1 font-mono text-xs' +
                                     (edited ? ' border-primary bg-primary/5' : '')
