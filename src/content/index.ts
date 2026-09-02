@@ -246,9 +246,15 @@ function getFiber(el: Element): any {
 // come from the React component that rendered the node when available,
 // otherwise from the tag plus its first class. Capped so a huge page can't
 // flood the panel.
+// What the layer *is*, so the panel can show the same icon vocabulary
+// Figma uses: T for text, a diamond for components, a square/circle for
+// leaf shapes with visible paint, a frame icon for plain containers.
+export type LayerKind = 'text' | 'image' | 'vector' | 'circle' | 'rect' | 'component' | 'frame'
+
 export type LayerNode = {
   id: number
   name: string
+  kind: LayerKind
   tag: string
   text: string
   children: LayerNode[]
@@ -258,18 +264,41 @@ const TREE_MAX_DEPTH = 14
 const TREE_MAX_NODES = 2500
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'NOSCRIPT', 'TEMPLATE', 'BR'])
 
-function layerName(el: Element): string {
+function layerName(el: Element): { name: string; isComponent: boolean } {
   const fiber = getFiber(el)
   // Nearest component that owns this host node, without walking far.
   let f = fiber
   for (let i = 0; f && i < 6; i++) {
     const n = fiberName(f)
-    if (n) return n
+    if (n) return { name: n, isComponent: true }
     f = f._debugOwner || f.return
   }
   const tag = el.tagName.toLowerCase()
   const cls = Array.from(el.classList).find((c) => !/^\d|\[|:|\//.test(c) && c.length < 32)
-  return cls ? `${tag}.${cls}` : tag
+  return { name: cls ? `${tag}.${cls}` : tag, isComponent: false }
+}
+
+function classifyLayer(
+  el: Element,
+  hasChildren: boolean,
+  ownText: string,
+  isComponent: boolean
+): LayerKind {
+  const tag = el.tagName.toLowerCase()
+  if (tag === 'img' || tag === 'picture') return 'image'
+  if (tag === 'svg') return 'vector'
+  if (!hasChildren && ownText) return 'text'
+  if (hasChildren) return isComponent ? 'component' : 'frame'
+  // Childless, textless: a shape if it visibly paints something, otherwise
+  // an empty frame (Figma shows plain empty frames the same way).
+  const cs = getComputedStyle(el)
+  const bg = parseCssColor(cs.backgroundColor)
+  const hasBorder = (parseFloat(cs.borderTopWidth) || 0) > 0 && cs.borderTopStyle !== 'none'
+  if (!bg && !hasBorder) return 'frame'
+  const radius = parseFloat(cs.borderTopLeftRadius) || 0
+  const rect = el.getBoundingClientRect()
+  const isCircle = radius > 0 && radius >= Math.min(rect.width, rect.height) / 2 - 1
+  return isCircle ? 'circle' : 'rect'
 }
 
 function buildLayerTree(): LayerNode[] {
@@ -293,9 +322,11 @@ function buildLayerTree(): LayerNode[] {
       .filter(Boolean)
       .join(' ')
       .slice(0, 40)
+    const { name, isComponent } = layerName(el)
     return {
       id: registerEl(el),
-      name: layerName(el),
+      name,
+      kind: classifyLayer(el, children.length > 0, ownText, isComponent),
       tag: el.tagName.toLowerCase(),
       text: ownText,
       children,
@@ -459,6 +490,27 @@ function moveElement(
   if (dir === 'prev') parent.insertBefore(el, sibling)
   else parent.insertBefore(sibling, el)
   const to = siblingIndex(el)
+
+  if (selectBox) positionBox(selectBox, el)
+  schedulePinUpdate()
+  return { ok: true, from, to, parentDesc: shortDescriptor(parent) }
+}
+
+function moveToEdge(
+  id: number,
+  edge: 'front' | 'back'
+): { ok: boolean; from?: number; to?: number; parentDesc?: string } {
+  const el = getEl(id)
+  const parent = el?.parentElement
+  if (!el || !parent) return { ok: false }
+  const from = siblingIndex(el)
+  if (!movePristine.has(id)) {
+    movePristine.set(id, { parent, nextSibling: el.nextSibling })
+  }
+  if (edge === 'front') parent.appendChild(el)
+  else parent.insertBefore(el, parent.firstChild)
+  const to = siblingIndex(el)
+  if (from === to) return { ok: false }
 
   if (selectBox) positionBox(selectBox, el)
   schedulePinUpdate()
@@ -1217,12 +1269,22 @@ function nudgeSelected(dx: number, dy: number) {
   })
 }
 
-function selectParent() {
-  if (!selectedEl?.parentElement) return
-  if (selectedEl.parentElement === document.body) return
-  selectElement(selectedEl.parentElement)
+// Figma's Escape: step up one level, then deselect once you're at the top —
+// so repeated presses walk out of the hierarchy and finally clear selection.
+function selectParentOrDeselect() {
+  if (!selectedEl) return
+  const parent = selectedEl.parentElement
+  if (parent && parent !== document.body) {
+    selectElement(parent)
+    return
+  }
+  selectedEl = null
+  hideBox(selectBox)
+  clearGridOverlay()
+  chrome.runtime.sendMessage({ type: 'PTR_DESELECTED' })
 }
 
+// Figma's Enter/Return: dive into the first child of the current selection.
 function selectFirstChild() {
   if (!selectedEl) return
   const child = selectedEl.children[0]
@@ -1235,10 +1297,17 @@ function onKeyDown(e: KeyboardEvent) {
   if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)))
     return
 
-  if (e.key === 'Tab' && selectedEl) {
+  // Figma: Return dives into the first child, Escape steps back up (and
+  // eventually deselects). Bare Tab is left alone — in real Figma it
+  // toggles the UI chrome, so Pointer doesn't repurpose it.
+  if (e.key === 'Enter' && selectedEl) {
     e.preventDefault()
-    if (e.shiftKey) selectFirstChild()
-    else selectParent()
+    selectFirstChild()
+    return
+  }
+  if (e.key === 'Escape' && selectedEl) {
+    e.preventDefault()
+    selectParentOrDeselect()
     return
   }
   if (e.key.startsWith('Arrow') && selectedEl && !e.altKey && !e.metaKey && !e.ctrlKey) {
@@ -1254,15 +1323,22 @@ function onKeyDown(e: KeyboardEvent) {
     if (d) nudgeSelected(d[0], d[1])
     return
   }
-  if ((e.key === 'c' || e.key === 'C') && !e.metaKey && !e.ctrlKey && selectedEl) {
+  // Figma's actual "copy/paste properties" shortcut — bare C and V are its
+  // Comment and Move tool shortcuts, so those stay untouched.
+  if (e.key.toLowerCase() === 'c' && (e.metaKey || e.ctrlKey) && e.altKey && selectedEl) {
+    e.preventDefault()
     copyStyleFromSelected()
     return
   }
-  if ((e.key === 'v' || e.key === 'V') && !e.metaKey && !e.ctrlKey && hoverEl) {
+  if (e.key.toLowerCase() === 'v' && (e.metaKey || e.ctrlKey) && e.altKey && hoverEl) {
+    e.preventDefault()
     pasteStyleToHovered()
     return
   }
-  if (e.key === 'h' || e.key === 'H') {
+  // Bare H is Figma's Hand tool, so "highlight elements like this one" —
+  // which has no Figma equivalent — lives on Alt+H instead.
+  if (e.key.toLowerCase() === 'h' && e.altKey && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault()
     toggleHighlightSiblings()
     return
   }
@@ -1290,13 +1366,16 @@ function onKeyDown(e: KeyboardEvent) {
     }
     return
   }
-  // Reorder the selection among its siblings, which is how you move an
-  // element left/right (or up/down) inside a flex or grid layout.
-  if ((e.key === '[' || e.key === ']') && selectedEl) {
+  // Figma's send-backward/bring-forward (Cmd+[ / Cmd+]) and send-to-back/
+  // bring-to-front (Cmd+Shift+[ / Cmd+Shift+]), repurposed as sibling
+  // reordering since Pointer has no z-index stacking of its own.
+  if ((e.key === '[' || e.key === ']') && (e.metaKey || e.ctrlKey) && selectedEl) {
     e.preventDefault()
     const id = registerEl(selectedEl)
     const target = buildPayload(selectedEl)
-    const r = moveElement(id, e.key === '[' ? 'prev' : 'next')
+    const r = e.shiftKey
+      ? moveToEdge(id, e.key === '[' ? 'back' : 'front')
+      : moveElement(id, e.key === '[' ? 'prev' : 'next')
     if (r.ok) {
       chrome.runtime.sendMessage({
         type: 'PTR_MOVED',

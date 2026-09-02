@@ -75,9 +75,12 @@ export function describeTarget(t: SelectionPayload): string {
   return parts.join(' ')
 }
 
+export type LayerKind = 'text' | 'image' | 'vector' | 'circle' | 'rect' | 'component' | 'frame'
+
 export type LayerNode = {
   id: number
   name: string
+  kind: LayerKind
   tag: string
   text: string
   children: LayerNode[]

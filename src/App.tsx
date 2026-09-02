@@ -30,7 +30,10 @@ import {
   Trash2,
   MoreHorizontal,
   Image,
-  Minus,
+  PenTool,
+  Frame,
+  Diamond,
+  ChevronDown,
   X,
   Download,
   ArrowRight,
@@ -889,6 +892,28 @@ function pathToNode(nodes: LayerNode[], targetId: number, trail: number[] = []):
   return null
 }
 
+// Figma's layer-panel icon vocabulary: T for text, a diamond for
+// components, shape outlines for leaf shapes, a frame icon for containers.
+function LayerIcon({ kind }: { kind: LayerNode['kind'] }) {
+  const cls = 'size-3 shrink-0 text-muted-foreground'
+  switch (kind) {
+    case 'text':
+      return <Type className={cls} />
+    case 'image':
+      return <Image className={cls} />
+    case 'vector':
+      return <PenTool className={cls} />
+    case 'circle':
+      return <Circle className={cls} />
+    case 'rect':
+      return <Square className={cls} />
+    case 'component':
+      return <Diamond className={cls} />
+    case 'frame':
+      return <Frame className={cls} />
+  }
+}
+
 function LayerTree({
   nodes,
   depth,
@@ -944,15 +969,7 @@ function LayerTree({
                   className={'size-3 transition-transform ' + (open ? 'rotate-90' : '')}
                 />
               </button>
-              {n.tag === 'img' ? (
-                <Image className="size-3 shrink-0 text-muted-foreground" />
-              ) : n.text && !hasChildren ? (
-                <Type className="size-3 shrink-0 text-muted-foreground" />
-              ) : hasChildren ? (
-                <Square className="size-3 shrink-0 text-muted-foreground" />
-              ) : (
-                <Minus className="size-3 shrink-0 text-muted-foreground" />
-              )}
+              <LayerIcon kind={n.kind} />
               <span className="truncate">{n.name}</span>
               {n.text && (
                 <span className="truncate text-muted-foreground">{n.text}</span>
@@ -1085,6 +1102,9 @@ export default function App() {
         setDraft({ ...msg.payload.styles })
         setText(msg.payload.text)
       }
+      if (msg.type === 'PTR_DESELECTED') {
+        setSelection(null)
+      }
       if (msg.type === 'PTR_COMMENT_CLICKED') {
         lastFrameRef.current = msg.payload.frameToken
         setSelectedCommentId(msg.payload.id)
@@ -1117,6 +1137,7 @@ export default function App() {
           to: String(to),
         })
         upsertEdit(target, 'move', 'order', String(from), String(to), parentDesc)
+        if (selection?.elementId === elementId) setSelection((s) => (s ? { ...s, index: to } : s))
       }
       if (msg.type === 'PTR_COMMENT_TARGET') {
         lastFrameRef.current = msg.payload.frameToken
@@ -1403,6 +1424,10 @@ export default function App() {
         to: String(r.to),
       })
       upsertEdit(selection, 'move', 'order', String(r.from), String(r.to), r.parentDesc)
+      // The Back/Forward buttons read selection.index to decide when to
+      // disable — without this they'd keep judging by the pre-move
+      // position and could stay stuck disabled on the wrong side.
+      setSelection((s) => (s ? { ...s, index: r.to } : s))
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -1956,8 +1981,12 @@ export default function App() {
           ref={tabsListRef}
           variant="line"
           // Gray baseline under every tab so the row reads as continuing past
-          // the edge; the active tab's black underline sits right on it.
-          className="mx-4 mt-2 h-auto w-auto cursor-grab justify-start gap-0 overflow-x-auto border-b px-0 pt-0 pb-[5px] active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          // the edge. Drawn at the same offset as the active tab's black
+          // indicator (an ::after at bottom:-5px on the trigger); that only
+          // lines up if every trigger is the same height, which needs the
+          // list's own height to stay a real value (triggers size to
+          // `calc(100% - 1px)`) instead of auto.
+          className="relative mx-4 mt-2 mb-1.5 w-auto cursor-grab justify-start gap-0 overflow-x-auto px-0 py-0 active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           onPointerDown={(e) => {
             const el = tabsListRef.current
             if (!el) return
@@ -2011,6 +2040,7 @@ export default function App() {
           <TabsTrigger value="tokens" className="shrink-0 px-2">
             Tokens
           </TabsTrigger>
+          <div className="pointer-events-none absolute inset-x-0 -bottom-[5px] h-0.5 bg-border" />
         </TabsList>
 
       <TabsContent value="element" className="min-h-0 flex-1">
@@ -2051,6 +2081,7 @@ export default function App() {
                       <Button size="sm" variant="outline" className="flex-1">
                         <Plus className="size-3.5" />
                         Insert
+                        <ChevronDown className="size-3.5 text-muted-foreground" />
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start" className="w-52">
@@ -2861,19 +2892,20 @@ type ShortcutGroup = { title: string; note?: string; items: { keys: string; desc
 const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: 'Selecting',
+    note: 'Matches Figma: Enter dives into a group, Escape steps back out.',
     items: [
-      { keys: 'Click', desc: "Select the element under the cursor" },
+      { keys: 'Click', desc: 'Select the element under the cursor' },
       {
         keys: 'Right-click (repeat on the same spot)',
         desc: 'Cycle through elements stacked at that point, when one hides another',
       },
-      { keys: 'Tab', desc: "Select the current element's parent" },
-      { keys: 'Shift + Tab', desc: "Select the current element's first child" },
+      { keys: 'Return / Enter', desc: "Select the current element's first child" },
+      { keys: 'Escape', desc: "Select the parent, or deselect once you're at the top" },
     ],
   },
   {
     title: 'Measuring',
-    note: 'Hold while hovering — works like Figma’s measurement overlays.',
+    note: 'Hold while hovering — the same Alt-based measurement Figma uses on its canvas.',
     items: [
       { keys: 'Alt + hover another element', desc: 'Show the gap between it and the current selection' },
       { keys: 'Alt + Shift + hover', desc: "Show the hovered element's padding on all four sides" },
@@ -2885,25 +2917,22 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { keys: 'Arrow keys', desc: 'Nudge the selected element 1px' },
       { keys: 'Shift + Arrow keys', desc: 'Nudge the selected element 10px' },
-      {
-        keys: '[',
-        desc: 'Move the selected element earlier among its siblings (left/up in a layout)',
-      },
-      {
-        keys: ']',
-        desc: 'Move the selected element later among its siblings (right/down in a layout)',
-      },
+      { keys: 'Cmd + [', desc: 'Move the selected element earlier among its siblings' },
+      { keys: 'Cmd + ]', desc: 'Move the selected element later among its siblings' },
+      { keys: 'Cmd + Shift + [', desc: 'Move it to the very start among its siblings' },
+      { keys: 'Cmd + Shift + ]', desc: 'Move it to the very end among its siblings' },
       { keys: 'Drag', desc: 'Drag the selected element to move it freely' },
       { keys: 'Delete / Backspace', desc: 'Remove the selected element' },
-      { keys: 'Cmd/Ctrl + D', desc: 'Duplicate the selected element' },
-      { keys: 'C', desc: "Copy the selected element's style" },
-      { keys: 'V', desc: 'Paste the copied style onto whatever is hovered' },
+      { keys: 'Cmd + D', desc: 'Duplicate the selected element' },
+      { keys: 'Cmd + Alt + C', desc: "Copy the selected element's style" },
+      { keys: 'Cmd + Alt + V', desc: 'Paste the copied style onto whatever is hovered' },
     ],
   },
   {
     title: 'Canvas',
+    note: 'Alt + H, not bare H — H alone is Figma\'s Hand tool.',
     items: [
-      { keys: 'H', desc: 'Highlight every other element that shares the same classes as the selection' },
+      { keys: 'Alt + H', desc: 'Highlight every other element that shares the same classes as the selection' },
       { keys: '(automatic)', desc: 'Selecting a CSS grid container shows its column/row lines' },
     ],
   },
