@@ -1971,6 +1971,12 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       sendResponse({ ok: true })
       break
     }
+    case 'PTR_DESELECT':
+      selectedEl = null
+      hideBox(selectBox)
+      clearGridOverlay()
+      sendResponse({ ok: true })
+      break
     case 'PTR_RESELECT_ID': {
       const el = getEl(msg.elementId)
       if (el) {

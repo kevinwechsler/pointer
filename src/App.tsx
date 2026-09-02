@@ -1528,6 +1528,17 @@ export default function App() {
     } catch {}
   }
 
+  // Matches pressing Escape at the top of the hierarchy on the page — but
+  // reachable from the panel itself, since Escape only fires when the page
+  // (not the panel) has keyboard focus.
+  async function deselect() {
+    if (!selection) return
+    try {
+      await sendToPage({ type: 'PTR_DESELECT', frameToken: selection.frameToken })
+    } catch {}
+    setSelection(null)
+  }
+
   async function goToElement(frameToken: string, elementId: number) {
     try {
       await sendToPage({ type: 'PTR_RESELECT_ID', frameToken, elementId })
@@ -2117,6 +2128,9 @@ export default function App() {
                   <Button size="sm" variant="outline" onClick={copyForFigma} title="Copy for Figma">
                     {figmaCopied ? <Check className="size-3.5" /> : <Layers className="size-3.5" />}
                   </Button>
+                  <Button size="sm" variant="outline" onClick={deselect} title="Deselect (Esc)">
+                    <X className="size-3.5" />
+                  </Button>
                 </div>
               </div>
 
@@ -2447,7 +2461,15 @@ export default function App() {
 
       <TabsContent value="layers" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
-          <div className="p-2">
+          <div
+            className="min-h-full p-2"
+            // Clicking blank space below/around the rows deselects, like
+            // clicking empty canvas in Figma. e.target === e.currentTarget
+            // means the click landed on this wrapper directly, not a row.
+            onClick={(e) => {
+              if (e.target === e.currentTarget) deselect()
+            }}
+          >
             {tree.length === 0 ? (
               <p className="p-2 pt-8 text-center text-sm text-muted-foreground">
                 No layers yet — make sure the tab is a localhost app.
@@ -2467,6 +2489,12 @@ export default function App() {
                   })
                 }
                 onSelect={(id) => {
+                  // Clicking the already-selected layer toggles it off,
+                  // same as clicking empty canvas space in Figma.
+                  if (id === selection?.elementId) {
+                    deselect()
+                    return
+                  }
                   sendToPage({
                     type: 'PTR_RESELECT_ID',
                     frameToken: lastFrameRef.current ?? undefined,
