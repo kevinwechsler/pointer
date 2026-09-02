@@ -15,7 +15,14 @@ export type SelectionPayload = {
   componentChain: string[]
   source: SourceInfo
   styles: Record<string, string>
-  rect: { width: number; height: number }
+  rect: { width: number; height: number; left: number; top: number }
+  /**
+   * Author-set inline values. Computed styles always resolve to pixels, so
+   * these are what tell Hug/Fixed/Fill apart.
+   */
+  inline: Record<string, string>
+  /** Decomposed transform, so position and rotation can be edited separately. */
+  transform: { dx: number; dy: number; rotate: number }
   /** Position among siblings, so reordering controls can show "2 of 5". */
   index: number
   siblingCount: number
@@ -66,6 +73,14 @@ export function describeTarget(t: SelectionPayload): string {
   if (t.componentChain.length)
     parts.push(`(rendered by the \`${t.componentChain[0]}\` component)`)
   return parts.join(' ')
+}
+
+export type LayerNode = {
+  id: number
+  name: string
+  tag: string
+  text: string
+  children: LayerNode[]
 }
 
 export type TokenEdit = { name: string; from: string; to: string }

@@ -28,7 +28,9 @@ import {
   RotateCcw,
   MessageSquarePlus,
   Trash2,
-  Settings,
+  MoreHorizontal,
+  Image,
+  Minus,
   X,
   Download,
   ArrowRight,
@@ -41,7 +43,28 @@ import {
   Circle,
   Type,
   Rows3,
+  Plus,
+  WrapText,
+  AlignStartVertical,
+  AlignCenterVertical,
+  AlignEndVertical,
+  AlignStartHorizontal,
+  AlignCenterHorizontal,
+  AlignEndHorizontal,
+  ArrowDown,
+  LayoutGrid,
+  Eye,
+  EyeOff,
 } from 'lucide-react'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -56,6 +79,7 @@ import {
   type Edit,
   type TokenEdit,
   type PointerComment,
+  type LayerNode,
   sendToPage,
   generatePrompt,
 } from '@/lib/pointer'
@@ -79,63 +103,6 @@ function parseUnit(value: string): { num: string; unit: string } | null {
   return { num: m[1], unit: m[2] ?? 'px' }
 }
 
-const GROUPS: { title: string; fields: StyleField[] }[] = [
-  {
-    title: 'Color',
-    fields: [
-      { prop: 'color', label: 'Text color', type: 'color' },
-      { prop: 'backgroundColor', label: 'Background', type: 'color' },
-      { prop: 'borderColor', label: 'Border color', type: 'color' },
-    ],
-  },
-  {
-    title: 'Typography',
-    fields: [
-      { prop: 'fontSize', label: 'Size', type: 'unit' },
-      {
-        prop: 'fontWeight',
-        label: 'Weight',
-        type: 'select',
-        options: ['100', '200', '300', '400', '500', '600', '700', '800', '900'],
-      },
-      {
-        prop: 'lineHeight',
-        label: 'Line height',
-        type: 'select',
-        options: ['normal', '1', '1.1', '1.2', '1.3', '1.4', '1.5', '1.6', '1.75', '2'],
-      },
-      {
-        prop: 'letterSpacing',
-        label: 'Letter spacing',
-        type: 'unit',
-        zeroKeyword: 'normal',
-      },
-      {
-        prop: 'textAlign',
-        label: 'Align',
-        type: 'select',
-        options: ['left', 'center', 'right', 'justify'],
-      },
-    ],
-  },
-  {
-    title: 'Spacing',
-    fields: [
-      { prop: 'paddingTop', label: 'Padding top', type: 'unit' },
-      { prop: 'paddingRight', label: 'Padding right', type: 'unit' },
-      { prop: 'paddingBottom', label: 'Padding bottom', type: 'unit' },
-      { prop: 'paddingLeft', label: 'Padding left', type: 'unit' },
-      { prop: 'gap', label: 'Gap', type: 'unit' },
-    ],
-  },
-  {
-    title: 'Border',
-    fields: [
-      { prop: 'borderRadius', label: 'Radius', type: 'unit' },
-      { prop: 'borderWidth', label: 'Width', type: 'unit' },
-    ],
-  },
-]
 
 const toKebab = (p: string) => p.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
 
@@ -223,6 +190,792 @@ function formatColor(value: string, format: ColorFormat): string {
 const CHECKER =
   'repeating-conic-gradient(#cbd5e1 0% 25%, #ffffff 0% 50%) 50% / 8px 8px'
 
+// ---------- Figma-style panel building blocks ----------
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-2 p-4">
+      <p className="text-xs font-semibold">{title}</p>
+      {children}
+    </div>
+  )
+}
+
+function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-1">
+      <Label className="text-[11px] text-muted-foreground">{label}</Label>
+      {children}
+    </div>
+  )
+}
+
+function NumberField({
+  label,
+  value,
+  suffix,
+  onChange,
+}: {
+  label: string
+  value: number
+  suffix?: string
+  onChange: (v: number) => void
+}) {
+  return (
+    <div className="space-y-1">
+      <Label className="text-[11px] text-muted-foreground">{label}</Label>
+      <div className="relative">
+        <Input
+          type="number"
+          step="any"
+          value={value}
+          onChange={(e) => {
+            const n = Number(e.target.value)
+            if (e.target.value !== '' && !Number.isNaN(n)) onChange(n)
+          }}
+          className="h-8 font-mono text-xs"
+        />
+        {suffix && (
+          <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
+            {suffix}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Two sides at once (Figma's default padding view); shows "mixed" if they differ. */
+function PaddingPairField({
+  label,
+  a,
+  b,
+  onChange,
+}: {
+  label: string
+  a?: string
+  b?: string
+  onChange: (v: string) => void
+}) {
+  const pa = parseUnit(a ?? '')
+  const pb = parseUnit(b ?? '')
+  const same = pa && pb && pa.num === pb.num && pa.unit === pb.unit
+  const unit = pa?.unit ?? 'px'
+  return (
+    <div className="space-y-1">
+      <Label className="text-[11px] text-muted-foreground">{label}</Label>
+      <div className="relative">
+        <Input
+          type="number"
+          step="any"
+          value={same ? pa!.num : ''}
+          placeholder={same ? undefined : 'Mixed'}
+          onChange={(e) => {
+            const n = e.target.value
+            if (n !== '' && !Number.isNaN(Number(n))) onChange(`${n}${unit}`)
+          }}
+          className="h-8 pr-7 font-mono text-xs"
+        />
+        <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
+          {unit}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function OpacityField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const pct = Math.round((parseFloat(value) || 1) * 100)
+  return (
+    <div className="space-y-1">
+      <Label className="text-[11px] text-muted-foreground">Opacity</Label>
+      <div className="relative">
+        <Input
+          type="number"
+          min={0}
+          max={100}
+          value={pct}
+          onChange={(e) => {
+            const n = Number(e.target.value)
+            if (e.target.value !== '' && !Number.isNaN(n))
+              onChange(String(Math.min(100, Math.max(0, n)) / 100))
+          }}
+          className="h-8 font-mono text-xs"
+        />
+        <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
+          %
+        </span>
+      </div>
+    </div>
+  )
+}
+
+const INSERT_KINDS = [
+  { kind: 'layout', label: 'Auto layout', icon: Rows3 },
+  { kind: 'rect', label: 'Rectangle', icon: Square },
+  { kind: 'circle', label: 'Ellipse', icon: Circle },
+  { kind: 'text', label: 'Text', icon: Type },
+] as const
+
+type ApplyFn = (prop: string, value: string) => void
+
+// ---------- Position: align within parent ----------
+// Figma's six alignment buttons. Horizontal alignment uses auto margins,
+// which work for block children and for items in a horizontal auto layout;
+// vertical alignment uses align-self, which works inside any flex container.
+const H_ALIGN = [
+  {
+    label: 'Align left',
+    icon: AlignStartVertical,
+    isActive: (d: Record<string, string>) =>
+      d.marginLeft !== 'auto' && d.marginRight === 'auto',
+    apply: (a: ApplyFn) => {
+      a('marginLeft', '0px')
+      a('marginRight', 'auto')
+    },
+  },
+  {
+    label: 'Align horizontal center',
+    icon: AlignCenterVertical,
+    isActive: (d: Record<string, string>) => d.marginLeft === 'auto' && d.marginRight === 'auto',
+    apply: (a: ApplyFn) => {
+      a('marginLeft', 'auto')
+      a('marginRight', 'auto')
+    },
+  },
+  {
+    label: 'Align right',
+    icon: AlignEndVertical,
+    isActive: (d: Record<string, string>) => d.marginLeft === 'auto' && d.marginRight !== 'auto',
+    apply: (a: ApplyFn) => {
+      a('marginLeft', 'auto')
+      a('marginRight', '0px')
+    },
+  },
+] as const
+
+const V_ALIGN = [
+  { label: 'Align top', icon: AlignStartHorizontal, value: 'flex-start' },
+  { label: 'Align vertical center', icon: AlignCenterHorizontal, value: 'center' },
+  { label: 'Align bottom', icon: AlignEndHorizontal, value: 'flex-end' },
+] as const
+
+// ---------- Layout: flow ----------
+type Flow = 'vertical' | 'horizontal' | 'wrap' | 'grid' | 'none'
+
+function currentFlow(d: Record<string, string>): Flow {
+  if (d.display?.includes('grid')) return 'grid'
+  if (!d.display?.includes('flex')) return 'none'
+  if (d.flexWrap === 'wrap') return 'wrap'
+  return d.flexDirection?.startsWith('column') ? 'vertical' : 'horizontal'
+}
+
+const FLOW_OPTIONS: { flow: Flow; label: string; icon: typeof ArrowDown }[] = [
+  { flow: 'vertical', label: 'Vertical', icon: ArrowDown },
+  { flow: 'horizontal', label: 'Horizontal', icon: ArrowRight },
+  { flow: 'wrap', label: 'Wrap', icon: WrapText },
+  { flow: 'grid', label: 'Grid', icon: LayoutGrid },
+]
+
+function applyFlow(flow: Flow, a: ApplyFn, d: Record<string, string>) {
+  switch (flow) {
+    case 'vertical':
+      a('display', 'flex')
+      a('flexDirection', 'column')
+      a('flexWrap', 'nowrap')
+      break
+    case 'horizontal':
+      a('display', 'flex')
+      a('flexDirection', 'row')
+      a('flexWrap', 'nowrap')
+      break
+    case 'wrap':
+      a('display', 'flex')
+      a('flexDirection', 'row')
+      a('flexWrap', 'wrap')
+      break
+    case 'grid': {
+      a('display', 'grid')
+      const cols = trackCount(d.gridTemplateColumns)
+      a('gridTemplateColumns', `repeat(${cols || 2}, minmax(0, 1fr))`)
+      break
+    }
+    case 'none':
+      a('display', 'block')
+  }
+}
+
+/** Number of tracks in a resolved grid-template value ("100px 100px" → 2). */
+function trackCount(value: string | undefined): number {
+  if (!value || value === 'none') return 0
+  return value.split(' ').filter(Boolean).length
+}
+
+const TYPOGRAPHY_FIELDS: StyleField[] = [
+  { prop: 'fontSize', label: 'Size', type: 'unit' },
+  {
+    prop: 'fontWeight',
+    label: 'Weight',
+    type: 'select',
+    options: ['100', '200', '300', '400', '500', '600', '700', '800', '900'],
+  },
+  {
+    prop: 'lineHeight',
+    label: 'Line height',
+    type: 'select',
+    options: ['normal', '1', '1.1', '1.2', '1.3', '1.4', '1.5', '1.6', '1.75', '2'],
+  },
+  { prop: 'letterSpacing', label: 'Letter spacing', type: 'unit', zeroKeyword: 'normal' },
+  {
+    prop: 'textAlign',
+    label: 'Align',
+    type: 'select',
+    options: ['left', 'center', 'right', 'justify'],
+  },
+  {
+    prop: 'textTransform',
+    label: 'Case',
+    type: 'select',
+    options: ['none', 'uppercase', 'lowercase', 'capitalize'],
+  },
+]
+
+// ---------- Layout: dimensions with Hug / Fixed / Fill ----------
+type SizeMode = 'fixed' | 'hug' | 'fill'
+
+/** Figma's Hug/Fixed/Fill, read back from the CSS that produces each. */
+function currentSizeMode(axis: 'width' | 'height', inline: Record<string, string>): SizeMode {
+  const v = (inline[axis] || '').trim()
+  if (inline.flexGrow === '1' || inline.alignSelf === 'stretch' || v === '100%') return 'fill'
+  if (v === 'fit-content' || v === 'max-content' || v === 'auto') return 'hug'
+  if (v) return 'fixed'
+  return 'hug'
+}
+
+/**
+ * One Figma-style dimension control: the value on the left, the sizing
+ * mode on the right, in a single field.
+ */
+function DimensionField({
+  axis,
+  label,
+  selection,
+  draft,
+  onApply,
+}: {
+  axis: 'width' | 'height'
+  label: string
+  selection: SelectionPayload
+  draft: Record<string, string>
+  onApply: ApplyFn
+}) {
+  const mode = currentSizeMode(axis, selection.inline)
+  const px = axis === 'width' ? selection.rect.width : selection.rect.height
+  const shown = Math.round(parseFloat(draft[axis] ?? '') || px)
+  return (
+    <div className="flex h-8 items-center rounded-md border bg-background pl-2 focus-within:ring-1 focus-within:ring-ring">
+      <span className="w-4 font-mono text-[11px] text-muted-foreground">{label}</span>
+      <input
+        type="number"
+        step="any"
+        value={shown}
+        disabled={mode !== 'fixed'}
+        onChange={(e) => {
+          const n = e.target.value
+          if (n !== '' && !Number.isNaN(Number(n))) onApply(axis, `${n}px`)
+        }}
+        className="min-w-0 flex-1 bg-transparent font-mono text-xs outline-none disabled:text-muted-foreground"
+      />
+      <Select
+        value={mode}
+        onValueChange={(m: SizeMode) => {
+          if (m === 'hug') {
+            onApply(axis, 'fit-content')
+            onApply('flexGrow', '0')
+            if (axis === 'height') onApply('alignSelf', 'auto')
+          } else if (m === 'fill') {
+            // Fill along the parent's main axis is flex-grow; across it,
+            // it's stretch. We set both so it reads as "fill" either way.
+            onApply('flexGrow', '1')
+            onApply('alignSelf', 'stretch')
+            onApply(axis, 'auto')
+          } else {
+            onApply('flexGrow', '0')
+            onApply('alignSelf', 'auto')
+            onApply(axis, `${Math.round(px)}px`)
+          }
+        }}
+      >
+        <SelectTrigger className="h-full w-[68px] shrink-0 rounded-l-none border-0 border-l px-2 text-[11px] shadow-none">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="fixed" className="text-xs">
+            Fixed
+          </SelectItem>
+          <SelectItem value="hug" className="text-xs">
+            Hug
+          </SelectItem>
+          <SelectItem value="fill" className="text-xs">
+            Fill
+          </SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
+
+/** Figma's 3x3 alignment pad, driving justify-content + align-items. */
+function AlignmentGrid({ draft, onApply }: { draft: Record<string, string>; onApply: ApplyFn }) {
+  const isColumn = draft.flexDirection?.startsWith('column')
+  const values = ['flex-start', 'center', 'flex-end']
+  // On a column, the main axis runs vertically, so the pad's rows drive
+  // justify-content and its columns drive align-items.
+  const rowProp = isColumn ? 'justifyContent' : 'alignItems'
+  const colProp = isColumn ? 'alignItems' : 'justifyContent'
+  return (
+    <div className="grid h-[76px] w-[76px] shrink-0 grid-cols-3 rounded-md border bg-muted/40 p-1">
+      {values.map((rowVal) =>
+        values.map((colVal) => {
+          const isActive = draft[rowProp] === rowVal && draft[colProp] === colVal
+          return (
+            <button
+              key={`${rowVal}-${colVal}`}
+              type="button"
+              onClick={() => {
+                onApply(rowProp, rowVal)
+                onApply(colProp, colVal)
+              }}
+              className="flex items-center justify-center rounded hover:bg-muted"
+              title={`${colVal} / ${rowVal}`}
+            >
+              {isActive ? (
+                <span className="flex gap-px">
+                  <span className="h-3 w-0.5 rounded-full bg-primary" />
+                  <span className="h-4 w-0.5 rounded-full bg-primary" />
+                  <span className="h-3 w-0.5 rounded-full bg-primary" />
+                </span>
+              ) : (
+                <span className="size-1 rounded-full bg-muted-foreground/40" />
+              )}
+            </button>
+          )
+        })
+      )}
+    </div>
+  )
+}
+
+// ---------- Color: Figma-style picker ----------
+type HSV = { h: number; s: number; v: number }
+
+function rgbToHsv(r: number, g: number, b: number): HSV {
+  const rn = r / 255
+  const gn = g / 255
+  const bn = b / 255
+  const max = Math.max(rn, gn, bn)
+  const min = Math.min(rn, gn, bn)
+  const d = max - min
+  let h = 0
+  if (d) {
+    if (max === rn) h = ((gn - bn) / d) % 6
+    else if (max === gn) h = (bn - rn) / d + 2
+    else h = (rn - gn) / d + 4
+    h *= 60
+    if (h < 0) h += 360
+  }
+  return { h, s: max ? d / max : 0, v: max }
+}
+
+function hsvToRgb({ h, s, v }: HSV): { r: number; g: number; b: number } {
+  const c = v * s
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1))
+  const m = v - c
+  let r = 0
+  let g = 0
+  let b = 0
+  if (h < 60) [r, g, b] = [c, x, 0]
+  else if (h < 120) [r, g, b] = [x, c, 0]
+  else if (h < 180) [r, g, b] = [0, c, x]
+  else if (h < 240) [r, g, b] = [0, x, c]
+  else if (h < 300) [r, g, b] = [x, 0, c]
+  else [r, g, b] = [c, 0, x]
+  return { r: Math.round((r + m) * 255), g: Math.round((g + m) * 255), b: Math.round((b + m) * 255) }
+}
+
+type ColorFmt = 'hex' | 'rgb' | 'hsl'
+
+function rgbToHslString(r: number, g: number, b: number): string {
+  const rn = r / 255
+  const gn = g / 255
+  const bn = b / 255
+  const max = Math.max(rn, gn, bn)
+  const min = Math.min(rn, gn, bn)
+  const l = (max + min) / 2
+  let h = 0
+  let s = 0
+  if (max !== min) {
+    const d = max - min
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
+    if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) * 60
+    else if (max === gn) h = ((bn - rn) / d + 2) * 60
+    else h = ((rn - gn) / d + 4) * 60
+  }
+  return `${Math.round(h)}, ${Math.round(s * 100)}%, ${Math.round(l * 100)}%`
+}
+
+/** Compose the CSS value Pointer applies: opaque → hex, otherwise rgba(). */
+function composeColor(rgb: { r: number; g: number; b: number }, alpha: number): string {
+  if (alpha >= 1) return toHex({ ...rgb, alpha: 1, transparent: false, unknown: false })
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${Number(alpha.toFixed(3))})`
+}
+
+/** Drag-to-pick surface: reports a 0–1 position on pointer down and move. */
+function useDragPick(onPick: (x: number, y: number) => void) {
+  const ref = useRef<HTMLDivElement>(null)
+  const pick = (e: React.PointerEvent) => {
+    const r = ref.current!.getBoundingClientRect()
+    onPick(
+      Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+      Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))
+    )
+  }
+  return {
+    ref,
+    onPointerDown: (e: React.PointerEvent) => {
+      e.currentTarget.setPointerCapture(e.pointerId)
+      pick(e)
+    },
+    onPointerMove: (e: React.PointerEvent) => {
+      if (e.buttons & 1) pick(e)
+    },
+  }
+}
+
+function ColorPicker({ value, onChange }: { value: string; onChange: (css: string) => void }) {
+  const parsed = parseColor(value)
+  const [hsv, setHsv] = useState<HSV>(() =>
+    parsed.transparent || parsed.unknown ? { h: 0, s: 0, v: 1 } : rgbToHsv(parsed.r, parsed.g, parsed.b)
+  )
+  const [alpha, setAlpha] = useState(parsed.transparent ? 1 : parsed.alpha)
+  const [fmt, setFmt] = useState<ColorFmt>('hex')
+  const [textDraft, setTextDraft] = useState<string | null>(null)
+
+  const rgb = hsvToRgb(hsv)
+  const emit = (next: HSV, a: number) => {
+    setHsv(next)
+    setAlpha(a)
+    onChange(composeColor(hsvToRgb(next), a))
+  }
+
+  const sv = useDragPick((x, y) => emit({ ...hsv, s: x, v: 1 - y }, alpha))
+  const hue = useDragPick((x) => emit({ ...hsv, h: x * 360 }, alpha))
+  const al = useDragPick((x) => emit(hsv, Number(x.toFixed(2))))
+
+  const hueCss = `hsl(${hsv.h} 100% 50%)`
+  const solid = `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`
+  const textValue =
+    textDraft ??
+    (fmt === 'hex'
+      ? toHex({ ...rgb, alpha: 1, transparent: false, unknown: false }).slice(1).toUpperCase()
+      : fmt === 'rgb'
+        ? `${rgb.r}, ${rgb.g}, ${rgb.b}`
+        : rgbToHslString(rgb.r, rgb.g, rgb.b))
+
+  const commitText = () => {
+    if (textDraft == null) return
+    const raw = textDraft.trim()
+    let css = raw
+    if (fmt === 'hex') css = '#' + raw.replace(/^#/, '')
+    else if (fmt === 'rgb') css = `rgb(${raw})`
+    else css = `hsl(${raw})`
+    // Let the browser normalize whatever the user typed.
+    const probe = document.createElement('span')
+    probe.style.color = css
+    if (probe.style.color) {
+      document.body.appendChild(probe)
+      const c = parseColor(getComputedStyle(probe).color)
+      probe.remove()
+      if (!c.unknown) emit(rgbToHsv(c.r, c.g, c.b), alpha)
+    }
+    setTextDraft(null)
+  }
+
+  return (
+    <div className="w-60 space-y-2">
+      <div
+        {...sv}
+        className="relative h-40 w-full cursor-crosshair touch-none rounded-md"
+        style={{
+          background: `linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, ${hueCss})`,
+        }}
+      >
+        <span
+          className="pointer-events-none absolute size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow ring-1 ring-black/30"
+          style={{ left: `${hsv.s * 100}%`, top: `${(1 - hsv.v) * 100}%`, background: solid }}
+        />
+      </div>
+
+      <div
+        {...hue}
+        className="relative h-3 w-full cursor-pointer touch-none rounded-full"
+        style={{
+          background:
+            'linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00)',
+        }}
+      >
+        <span
+          className="pointer-events-none absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow ring-1 ring-black/30"
+          style={{ left: `${(hsv.h / 360) * 100}%`, background: hueCss }}
+        />
+      </div>
+
+      <div
+        {...al}
+        className="relative h-3 w-full cursor-pointer touch-none rounded-full"
+        style={{ background: CHECKER }}
+      >
+        <div
+          className="absolute inset-0 rounded-full"
+          style={{ background: `linear-gradient(to right, transparent, ${solid})` }}
+        />
+        <span
+          className="pointer-events-none absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow ring-1 ring-black/30"
+          style={{ left: `${alpha * 100}%`, background: composeColor(rgb, alpha) }}
+        />
+      </div>
+
+      <div className="flex items-center gap-1">
+        <Select value={fmt} onValueChange={(f: ColorFmt) => { setFmt(f); setTextDraft(null) }}>
+          <SelectTrigger className="h-8 w-[64px] shrink-0 px-2 text-[11px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="hex" className="text-xs">Hex</SelectItem>
+            <SelectItem value="rgb" className="text-xs">RGB</SelectItem>
+            <SelectItem value="hsl" className="text-xs">HSL</SelectItem>
+          </SelectContent>
+        </Select>
+        <Input
+          value={textValue}
+          onChange={(e) => setTextDraft(e.target.value)}
+          onBlur={commitText}
+          onKeyDown={(e) => e.key === 'Enter' && commitText()}
+          className="h-8 min-w-0 flex-1 font-mono text-xs uppercase"
+        />
+        <div className="relative w-[58px] shrink-0">
+          <Input
+            type="number"
+            min={0}
+            max={100}
+            value={Math.round(alpha * 100)}
+            onChange={(e) => {
+              const n = Number(e.target.value)
+              if (e.target.value !== '' && !Number.isNaN(n))
+                emit(hsv, Math.min(1, Math.max(0, n / 100)))
+            }}
+            className="h-8 pr-5 font-mono text-xs"
+          />
+          <span className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2 text-[11px] text-muted-foreground">
+            %
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Figma's fill/stroke row: swatch (opens the picker), value, opacity, and an
+ * eye to toggle the paint off without losing the color.
+ */
+function ColorRow({
+  value,
+  edited,
+  onChange,
+}: {
+  value: string
+  edited: boolean
+  onChange: (v: string) => void
+}) {
+  const parsed = parseColor(value)
+  const lastVisible = useRef<string>('#000000')
+  if (!parsed.transparent && !parsed.unknown) lastVisible.current = value
+  const visible = !parsed.transparent
+
+  return (
+    <div
+      className={
+        'flex h-8 items-center gap-1.5 rounded-md border bg-background px-1.5' +
+        (edited ? ' border-primary bg-primary/5' : '')
+      }
+    >
+      <Popover>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="relative size-5 shrink-0 overflow-hidden rounded-sm border"
+            style={{ background: CHECKER }}
+            title={visible ? value : 'No color'}
+          >
+            <span
+              className="absolute inset-0"
+              style={{ background: visible ? value : 'transparent' }}
+            />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent align="start" side="left" className="w-auto p-3">
+          <ColorPicker key={visible ? 'on' : 'off'} value={visible ? value : lastVisible.current} onChange={onChange} />
+        </PopoverContent>
+      </Popover>
+      <input
+        value={visible ? formatColor(value, 'hex').replace(/^#/, '').toUpperCase() : '—'}
+        readOnly={!visible}
+        onChange={(e) => {
+          const raw = e.target.value.trim()
+          if (/^[0-9a-f]{6}([0-9a-f]{2})?$/i.test(raw)) onChange('#' + raw)
+        }}
+        className="min-w-0 flex-1 bg-transparent font-mono text-xs uppercase outline-none"
+      />
+      <input
+        type="number"
+        min={0}
+        max={100}
+        value={visible ? Math.round(parsed.alpha * 100) : 0}
+        disabled={!visible}
+        onChange={(e) => {
+          const n = Number(e.target.value)
+          if (e.target.value === '' || Number.isNaN(n)) return
+          onChange(composeColor(parsed, Math.min(1, Math.max(0, n / 100))))
+        }}
+        className="w-8 bg-transparent text-right font-mono text-xs outline-none disabled:text-muted-foreground"
+      />
+      <span className="text-[11px] text-muted-foreground">%</span>
+      <button
+        type="button"
+        className="shrink-0 text-muted-foreground hover:text-foreground"
+        title={visible ? 'Hide' : 'Show'}
+        onClick={() => onChange(visible ? 'transparent' : lastVisible.current)}
+      >
+        {visible ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />}
+      </button>
+    </div>
+  )
+}
+
+/** Compact color control for places that aren't a Fill/Stroke row (text color). */
+function ColorField({
+  value,
+  edited,
+  onChange,
+}: {
+  value: string
+  format?: ColorFormat
+  edited: boolean
+  onChange: (v: string) => void
+}) {
+  return <ColorRow value={value} edited={edited} onChange={onChange} />
+}
+
+// ---------- Layers ----------
+
+/** Ids of every ancestor of `targetId` (root → parent), or null if absent. */
+function pathToNode(nodes: LayerNode[], targetId: number, trail: number[] = []): number[] | null {
+  for (const n of nodes) {
+    if (n.id === targetId) return trail
+    const found = pathToNode(n.children, targetId, [...trail, n.id])
+    if (found) return found
+  }
+  return null
+}
+
+function LayerTree({
+  nodes,
+  depth,
+  expanded,
+  selectedId,
+  onToggle,
+  onSelect,
+  onHover,
+}: {
+  nodes: LayerNode[]
+  depth: number
+  expanded: Set<number>
+  selectedId: number | null
+  onToggle: (id: number) => void
+  onSelect: (id: number) => void
+  onHover: (id: number | null) => void
+}) {
+  return (
+    <>
+      {nodes.map((n) => {
+        const hasChildren = n.children.length > 0
+        const open = expanded.has(n.id)
+        const isSelected = n.id === selectedId
+        return (
+          <div key={n.id}>
+            <div
+              role="button"
+              tabIndex={0}
+              ref={(node) => {
+                if (node && isSelected) node.scrollIntoView({ block: 'nearest' })
+              }}
+              onClick={() => onSelect(n.id)}
+              onMouseEnter={() => onHover(n.id)}
+              onMouseLeave={() => onHover(null)}
+              className={
+                'flex h-7 cursor-default items-center gap-1 rounded-sm pr-2 text-xs select-none ' +
+                (isSelected ? 'bg-primary/10 text-foreground' : 'hover:bg-muted')
+              }
+              style={{ paddingLeft: 4 + depth * 14 }}
+            >
+              <button
+                type="button"
+                className={
+                  'flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground ' +
+                  (hasChildren ? '' : 'invisible')
+                }
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onToggle(n.id)
+                }}
+              >
+                <ChevronRight
+                  className={'size-3 transition-transform ' + (open ? 'rotate-90' : '')}
+                />
+              </button>
+              {n.tag === 'img' ? (
+                <Image className="size-3 shrink-0 text-muted-foreground" />
+              ) : n.text && !hasChildren ? (
+                <Type className="size-3 shrink-0 text-muted-foreground" />
+              ) : hasChildren ? (
+                <Square className="size-3 shrink-0 text-muted-foreground" />
+              ) : (
+                <Minus className="size-3 shrink-0 text-muted-foreground" />
+              )}
+              <span className="truncate">{n.name}</span>
+              {n.text && (
+                <span className="truncate text-muted-foreground">{n.text}</span>
+              )}
+            </div>
+            {hasChildren && open && (
+              <LayerTree
+                nodes={n.children}
+                depth={depth + 1}
+                expanded={expanded}
+                selectedId={selectedId}
+                onToggle={onToggle}
+                onSelect={onSelect}
+                onHover={onHover}
+              />
+            )}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
 type Token = { name: string; value: string }
 
 /** `--card-bg` → `Card bg`, so the list reads like a palette, not like CSS. */
@@ -254,46 +1007,6 @@ function groupTokens(tokens: Token[]): { title: string; items: Token[] }[] {
     .map(([title, items]) => ({ title, items }))
 }
 
-function ColorField({
-  value,
-  format,
-  edited,
-  onChange,
-}: {
-  value: string
-  format: ColorFormat
-  edited: boolean
-  onChange: (v: string) => void
-}) {
-  const parsed = parseColor(value)
-  return (
-    <div className="flex items-center gap-1.5">
-      <div
-        className="relative size-8 shrink-0 overflow-hidden rounded border"
-        style={{ background: CHECKER }}
-        title={parsed.transparent ? 'No color set' : value}
-      >
-        <div className="absolute inset-0" style={{ background: parsed.transparent ? 'transparent' : value }} />
-        <input
-          type="color"
-          value={swatchHex(value)}
-          onChange={(e) => onChange(e.target.value)}
-          className="absolute inset-0 cursor-pointer opacity-0"
-        />
-      </div>
-      <Input
-        value={formatColor(value, format)}
-        onChange={(e) => onChange(e.target.value)}
-        className={
-          'h-8 font-mono text-xs' +
-          (edited ? ' border-primary bg-primary/5' : '') +
-          (parsed.transparent ? ' text-muted-foreground' : '')
-        }
-      />
-    </div>
-  )
-}
-
 // One history entry per user action, so it can be undone/redone on the page.
 type HistoryOp = {
   frameToken: string
@@ -315,6 +1028,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [colorFormat, setColorFormat] = useState<ColorFormat>('hex')
   const [activeTab, setActiveTab] = useState('element')
+
+  // Layers
+  const [tree, setTree] = useState<LayerNode[]>([])
+  const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const tabsListRef = useRef<HTMLDivElement>(null)
+  const tabsDrag = useRef<{ x: number; left: number; moved: boolean } | null>(null)
 
   // Last frame the user interacted with; frame-scoped requests that aren't
   // tied to a specific element (tokens, comments) go to this frame.
@@ -343,11 +1062,18 @@ export default function App() {
   const [tokenDraft, setTokenDraft] = useState<Record<string, string>>({})
   const [tokenEdits, setTokenEdits] = useState<TokenEdit[]>([])
   const [advancedTokens, setAdvancedTokens] = useState(false)
+  const [paddingExpanded, setPaddingExpanded] = useState(false)
 
   // Keep a port open to the background for as long as this panel lives, so
   // it can switch inspect off when the panel closes by any means.
   useEffect(() => {
     const port = chrome.runtime.connect({ name: 'pointer-panel' })
+    // Inspect on by default — opening the panel means you're about to
+    // inspect something. Silent on failure: the tab may not be a localhost
+    // app, and the switch is right there to retry.
+    sendToPage({ type: 'PTR_SET_ACTIVE', on: true })
+      .then(() => setActive(true))
+      .catch(() => {})
     return () => port.disconnect()
   }, [])
 
@@ -454,6 +1180,32 @@ export default function App() {
       )
     }
   }
+
+  async function loadTree() {
+    try {
+      const r = await sendToPage({ type: 'PTR_GET_TREE', frameToken: lastFrameRef.current ?? undefined })
+      const nodes: LayerNode[] = r.tree ?? []
+      setTree(nodes)
+      setExpanded((prev) => {
+        const next = new Set(prev)
+        // First load: open the top level so the tree isn't a single row.
+        if (prev.size === 0) nodes.forEach((n) => next.add(n.id))
+        if (selection) pathToNode(nodes, selection.elementId)?.forEach((id) => next.add(id))
+        return next
+      })
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  // Keep the selected layer revealed as selection changes on the page.
+  useEffect(() => {
+    if (activeTab !== 'layers' || !selection) return
+    const path = pathToNode(tree, selection.elementId)
+    if (path) setExpanded((prev) => new Set([...prev, ...path]))
+    else loadTree() // selection isn't in the tree we have (new element, other frame)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection?.elementId, activeTab])
 
   async function toggleActive(on: boolean) {
     try {
@@ -651,6 +1403,36 @@ export default function App() {
         to: String(r.to),
       })
       upsertEdit(selection, 'move', 'order', String(r.from), String(r.to), r.parentDesc)
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  // Position and rotation are stored decomposed in the content script; the
+  // panel sends only the parts it changed.
+  async function setTransformPart(parts: { dx?: number; dy?: number; rotate?: number }) {
+    if (!selection) return
+    try {
+      const r = await sendToPage({
+        type: 'PTR_SET_TRANSFORM',
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+        parts,
+      })
+      if (!r?.ok) return
+      pushHistory({
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+        kind: 'style',
+        prop: 'transform',
+        from: r.from,
+        to: r.to,
+      })
+      upsertEdit(selection, 'style', 'transform', r.from, r.to)
+      setDraft((d) => ({ ...d, transform: r.to }))
+      setSelection((s) =>
+        s ? { ...s, transform: { ...s.transform, ...parts } } : s
+      )
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -1091,7 +1873,7 @@ export default function App() {
           <Popover>
             <PopoverTrigger asChild>
               <Button variant="ghost" size="icon" className="size-7" title="Settings">
-                <Settings className="size-4" />
+                <MoreHorizontal className="size-4" />
               </Button>
             </PopoverTrigger>
             <PopoverContent align="end" className="w-64 space-y-4">
@@ -1167,19 +1949,50 @@ export default function App() {
         onValueChange={(v) => {
           setActiveTab(v)
           if (v !== 'element') loadCommentsAndTokens()
+          if (v === 'layers') loadTree()
         }}
       >
         <TabsList
+          ref={tabsListRef}
           variant="line"
-          className="mx-4 mt-2 h-auto w-auto justify-start gap-2 overflow-x-auto px-0 pt-0 pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          // Gray baseline under every tab so the row reads as continuing past
+          // the edge; the active tab's black underline sits right on it.
+          className="mx-4 mt-2 h-auto w-auto cursor-grab justify-start gap-0 overflow-x-auto border-b px-0 pt-0 pb-[5px] active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          onPointerDown={(e) => {
+            const el = tabsListRef.current
+            if (!el) return
+            tabsDrag.current = { x: e.clientX, left: el.scrollLeft, moved: false }
+          }}
+          onPointerMove={(e) => {
+            const el = tabsListRef.current
+            const d = tabsDrag.current
+            if (!el || !d || !(e.buttons & 1)) return
+            const dx = e.clientX - d.x
+            if (Math.abs(dx) > 4) d.moved = true
+            if (d.moved) el.scrollLeft = d.left - dx
+          }}
+          onPointerUp={() => {
+            const d = tabsDrag.current
+            tabsDrag.current = null
+            // A real drag shouldn't also switch tabs on release.
+            if (d?.moved)
+              tabsListRef.current?.addEventListener(
+                'click',
+                (ev) => {
+                  ev.stopPropagation()
+                  ev.preventDefault()
+                },
+                { capture: true, once: true }
+              )
+          }}
         >
-          <TabsTrigger value="element" className="shrink-0">
+          <TabsTrigger value="element" className="shrink-0 px-2">
             Element
           </TabsTrigger>
-          <TabsTrigger value="insert" className="shrink-0">
-            Insert
+          <TabsTrigger value="layers" className="shrink-0 px-2">
+            Layers
           </TabsTrigger>
-          <TabsTrigger value="changes" className="shrink-0">
+          <TabsTrigger value="changes" className="shrink-0 px-2">
             Changes
             {edits.length + tokenEdits.length > 0 && (
               <Badge variant="secondary" className="ml-1.5">
@@ -1187,7 +2000,7 @@ export default function App() {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="comments" className="shrink-0">
+          <TabsTrigger value="comments" className="shrink-0 px-2">
             Comments
             {comments.length > 0 && (
               <Badge variant="secondary" className="ml-1.5">
@@ -1195,331 +2008,449 @@ export default function App() {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="tokens" className="shrink-0">
+          <TabsTrigger value="tokens" className="shrink-0 px-2">
             Tokens
           </TabsTrigger>
         </TabsList>
 
       <TabsContent value="element" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
-          <div className="space-y-4 p-4">
-            {!selection ? (
-              <p className="pt-8 text-center text-sm text-muted-foreground">
-                {active
-                  ? 'Click an element on the page to select it. If elements overlap, right-click the same spot repeatedly to cycle through them.'
-                  : 'Turn on Inspect, then click an element on your localhost app.'}
-              </p>
-            ) : (
-              <>
-                <Card>
-                  <CardHeader className="pb-2">
-                    <CardTitle className="font-mono text-sm">
-                      &lt;{selection.tag}&gt;
-                      {selection.id ? `#${selection.id}` : ''}
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-2 text-xs">
-                    {selection.componentChain.length > 0 && (
-                      <div className="flex flex-wrap gap-1">
-                        {selection.componentChain.map((c) => (
-                          <Badge key={c} variant="outline">
-                            {c}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                    {selection.source ? (
-                      <p className="font-mono text-muted-foreground break-all">
-                        {selection.source.fileName.split('/').slice(-2).join('/')}:
-                        {selection.source.lineNumber}
-                      </p>
-                    ) : (
-                      <p className="text-muted-foreground">
-                        No source info — will reference by selector.
-                      </p>
-                    )}
-                    {selection.classes.length > 0 && (
-                      <p className="font-mono text-muted-foreground break-all">
-                        .{selection.classes.slice(0, 6).join(' .')}
-                      </p>
-                    )}
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-[11px] text-muted-foreground">
-                          Order among siblings
-                        </Label>
-                        <span className="font-mono text-[11px] text-muted-foreground">
-                          {selection.index + 1} of {selection.siblingCount}
-                        </span>
-                      </div>
-                      <div className="flex gap-1">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="flex-1"
-                          disabled={selection.index === 0}
-                          onClick={() => moveSelected('prev')}
-                        >
-                          <ChevronLeft className="size-3.5" />
-                          Earlier
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="flex-1"
-                          disabled={selection.index >= selection.siblingCount - 1}
-                          onClick={() => moveSelected('next')}
-                        >
-                          Later
-                          <ChevronRight className="size-3.5" />
-                        </Button>
-                      </div>
-                    </div>
+          {!selection ? (
+            <p className="p-4 pt-8 text-center text-sm text-muted-foreground">
+              {active
+                ? 'Click an element on the page to select it. If elements overlap, right-click the same spot repeatedly to cycle through them.'
+                : 'Turn on Inspect, then click an element on your localhost app.'}
+            </p>
+          ) : (
+            <div className="divide-y">
+              {/* Identity + actions */}
+              <div className="space-y-3 p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">
+                      {selection.componentChain[0] ?? `<${selection.tag}>`}
+                    </p>
+                    <p className="truncate font-mono text-[11px] text-muted-foreground">
+                      {selection.source
+                        ? `${selection.source.fileName.split('/').slice(-2).join('/')}:${selection.source.lineNumber}`
+                        : selection.classes.length
+                          ? '.' + selection.classes.slice(0, 3).join(' .')
+                          : selection.selector}
+                    </p>
+                  </div>
+                  {selection.isNew && (
+                    <Badge variant="secondary" className="shrink-0">
+                      New
+                    </Badge>
+                  )}
+                </div>
 
+                <div className="flex gap-1">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button size="sm" variant="outline" className="flex-1">
+                        <Plus className="size-3.5" />
+                        Insert
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start" className="w-52">
+                      <DropdownMenuLabel className="text-[11px]">Inside this element</DropdownMenuLabel>
+                      {INSERT_KINDS.map((k) => (
+                        <DropdownMenuItem key={`in-${k.kind}`} onClick={() => insertNew(k.kind, 'inside')}>
+                          <k.icon className="size-3.5" />
+                          {k.label}
+                        </DropdownMenuItem>
+                      ))}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuLabel className="text-[11px]">After this element</DropdownMenuLabel>
+                      {INSERT_KINDS.map((k) => (
+                        <DropdownMenuItem key={`af-${k.kind}`} onClick={() => insertNew(k.kind, 'after')}>
+                          <k.icon className="size-3.5" />
+                          {k.label}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <Button size="sm" variant="outline" onClick={duplicateSelected} title="Duplicate">
+                    <CopyPlus className="size-3.5" />
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-destructive hover:text-destructive"
+                    onClick={deleteSelected}
+                    title="Delete"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={copyForFigma} title="Copy for Figma">
+                    {figmaCopied ? <Check className="size-3.5" /> : <Layers className="size-3.5" />}
+                  </Button>
+                </div>
+              </div>
+
+              {/* Position */}
+              <Section title="Position">
+                <FieldRow label="Alignment">
+                  <div className="flex gap-2">
+                    <div className="flex flex-1 gap-0.5 rounded-md border p-0.5">
+                      {H_ALIGN.map((opt) => (
+                        <Button
+                          key={opt.label}
+                          size="sm"
+                          variant={opt.isActive(draft) ? 'secondary' : 'ghost'}
+                          className="h-6 flex-1 px-0"
+                          title={opt.label}
+                          onClick={() => opt.apply(applyStyle)}
+                        >
+                          <opt.icon className="size-3.5" />
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="flex flex-1 gap-0.5 rounded-md border p-0.5">
+                      {V_ALIGN.map((opt) => (
+                        <Button
+                          key={opt.label}
+                          size="sm"
+                          variant={draft.alignSelf === opt.value ? 'secondary' : 'ghost'}
+                          className="h-6 flex-1 px-0"
+                          title={opt.label}
+                          onClick={() => applyStyle('alignSelf', opt.value)}
+                        >
+                          <opt.icon className="size-3.5" />
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                </FieldRow>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <NumberField
+                    label="X"
+                    value={selection.rect.left}
+                    onChange={(v) =>
+                      setTransformPart({ dx: selection.transform.dx + (v - selection.rect.left) })
+                    }
+                  />
+                  <NumberField
+                    label="Y"
+                    value={selection.rect.top}
+                    onChange={(v) =>
+                      setTransformPart({ dy: selection.transform.dy + (v - selection.rect.top) })
+                    }
+                  />
+                  <NumberField
+                    label="Rotation"
+                    suffix="°"
+                    value={selection.transform.rotate}
+                    onChange={(v) => setTransformPart({ rotate: v })}
+                  />
+                  <FieldRow label={`Order · ${selection.index + 1} of ${selection.siblingCount}`}>
                     <div className="flex gap-1">
                       <Button
                         size="sm"
                         variant="outline"
-                        className="flex-1"
-                        onClick={duplicateSelected}
+                        className="h-8 flex-1 px-0"
+                        title="Send backward"
+                        disabled={selection.index === 0}
+                        onClick={() => moveSelected('prev')}
                       >
-                        <CopyPlus className="size-3.5" />
-                        Duplicate
+                        <ChevronLeft className="size-3.5" />
                       </Button>
                       <Button
                         size="sm"
                         variant="outline"
-                        className="flex-1 text-destructive hover:text-destructive"
-                        onClick={deleteSelected}
+                        className="h-8 flex-1 px-0"
+                        title="Bring forward"
+                        disabled={selection.index >= selection.siblingCount - 1}
+                        onClick={() => moveSelected('next')}
                       >
-                        <Trash2 className="size-3.5" />
-                        Delete
+                        <ChevronRight className="size-3.5" />
                       </Button>
                     </div>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="w-full"
-                      onClick={copyForFigma}
-                    >
-                      {figmaCopied ? (
-                        <Check className="size-3.5" />
-                      ) : (
-                        <Layers className="size-3.5" />
-                      )}
-                      {figmaCopied ? 'Copied — paste in Figma' : 'Copy for Figma'}
-                    </Button>
-                  </CardContent>
-                </Card>
-
-                {selection.text && (
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-xs">Text</Label>
-                      {textEdited && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-5"
-                          title="Reset this change"
-                          onClick={resetTextEdit}
-                        >
-                          <RotateCcw className="size-3" />
-                        </Button>
-                      )}
-                    </div>
-                    <Textarea
-                      value={text}
-                      onChange={(e) => {
-                        const v = e.target.value
-                        setText(v)
-                        // Live preview on every keystroke; the change is
-                        // committed to history/prompt on blur (applyText).
-                        if (selection)
-                          sendToPage({
-                            type: 'PTR_SET_TEXT',
-                            frameToken: selection.frameToken,
-                            elementId: selection.elementId,
-                            value: v,
-                          }).catch(() => {})
-                      }}
-                      onBlur={applyText}
-                      rows={2}
-                      className={
-                        'text-sm' +
-                        (textEdited ? ' border-primary bg-primary/5' : '')
-                      }
-                    />
-                  </div>
-                )}
-
-                <div className="space-y-2">
-                  <Separator />
-                  <p className="text-xs font-medium text-muted-foreground">
-                    Layout of this container
-                  </p>
-                  <p className="text-[11px] text-muted-foreground">
-                    Controls how this element arranges its children — use it to try a row, a
-                    column, or a wrapped grid.
-                  </p>
-
-                  <div className="space-y-1">
-                    <Label className="text-[11px] text-muted-foreground">Arrangement</Label>
-                    <div className="grid grid-cols-3 gap-1">
-                      {(
-                        [
-                          { label: 'Row', display: 'flex', dir: 'row', wrap: 'nowrap' },
-                          { label: 'Column', display: 'flex', dir: 'column', wrap: 'nowrap' },
-                          { label: 'Wrap', display: 'flex', dir: 'row', wrap: 'wrap' },
-                        ] as const
-                      ).map((opt) => {
-                        const isActive =
-                          draft.display?.includes('flex') &&
-                          draft.flexDirection === opt.dir &&
-                          (opt.wrap === 'wrap'
-                            ? draft.flexWrap === 'wrap'
-                            : draft.flexWrap !== 'wrap')
-                        return (
-                          <Button
-                            key={opt.label}
-                            size="sm"
-                            variant={isActive ? 'default' : 'outline'}
-                            className="h-7 text-xs"
-                            onClick={() => {
-                              applyStyle('display', opt.display)
-                              applyStyle('flexDirection', opt.dir)
-                              applyStyle('flexWrap', opt.wrap)
-                            }}
-                          >
-                            {opt.label}
-                          </Button>
-                        )
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="space-y-1">
-                    <Label className="text-[11px] text-muted-foreground">
-                      Grid columns — split children into rows
-                    </Label>
-                    <div className="grid grid-cols-6 gap-1">
-                      {[1, 2, 3, 4, 5, 6].map((n) => {
-                        const isActive =
-                          draft.display?.includes('grid') &&
-                          (draft.gridTemplateColumns ?? '').split(' ').length === n
-                        return (
-                          <Button
-                            key={n}
-                            size="sm"
-                            variant={isActive ? 'default' : 'outline'}
-                            className="h-7 px-0 text-xs"
-                            onClick={() => {
-                              applyStyle('display', 'grid')
-                              applyStyle('gridTemplateColumns', `repeat(${n}, minmax(0, 1fr))`)
-                            }}
-                          >
-                            {n}
-                          </Button>
-                        )
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    {renderField({
-                      prop: 'justifyContent',
-                      label: 'Justify',
-                      type: 'select',
-                      options: [
-                        'flex-start',
-                        'center',
-                        'flex-end',
-                        'space-between',
-                        'space-around',
-                        'space-evenly',
-                      ],
-                    })}
-                    {renderField({
-                      prop: 'alignItems',
-                      label: 'Align',
-                      type: 'select',
-                      options: ['stretch', 'flex-start', 'center', 'flex-end', 'baseline'],
-                    })}
-                  </div>
+                  </FieldRow>
                 </div>
+              </Section>
 
-                {GROUPS.map((group) => (
-                  <div key={group.title} className="space-y-2">
-                    <Separator />
-                    <p className="text-xs font-medium text-muted-foreground">
-                      {group.title}
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      {group.fields.map(renderField)}
+              {/* Layout */}
+              <Section title="Layout">
+                {(() => {
+                  const flow = currentFlow(draft)
+                  const cols = trackCount(draft.gridTemplateColumns)
+                  const rows = trackCount(draft.gridTemplateRows)
+                  return (
+                    <>
+                      <FieldRow label="Flow">
+                        <div className="flex gap-2">
+                          <div className="flex flex-1 gap-0.5 rounded-md border p-0.5">
+                            {FLOW_OPTIONS.map((opt) => (
+                              <Button
+                                key={opt.flow}
+                                size="sm"
+                                variant={flow === opt.flow ? 'secondary' : 'ghost'}
+                                className="h-6 flex-1 px-0"
+                                title={opt.label}
+                                onClick={() => applyFlow(opt.flow, applyStyle, draft)}
+                              >
+                                <opt.icon className="size-3.5" />
+                              </Button>
+                            ))}
+                          </div>
+                          {flow !== 'none' && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 w-7 shrink-0 px-0"
+                              title="Remove auto layout"
+                              onClick={() => applyFlow('none', applyStyle, draft)}
+                            >
+                              <X className="size-3.5" />
+                            </Button>
+                          )}
+                        </div>
+                      </FieldRow>
+
+                      {flow === 'grid' && (
+                        <div className="grid grid-cols-2 gap-2">
+                          <NumberField
+                            label="Columns"
+                            value={cols}
+                            onChange={(n) =>
+                              applyStyle(
+                                'gridTemplateColumns',
+                                `repeat(${Math.max(1, Math.round(n))}, minmax(0, 1fr))`
+                              )
+                            }
+                          />
+                          <NumberField
+                            label="Rows"
+                            value={rows}
+                            onChange={(n) =>
+                              applyStyle(
+                                'gridTemplateRows',
+                                n >= 1 ? `repeat(${Math.round(n)}, auto)` : 'none'
+                              )
+                            }
+                          />
+                        </div>
+                      )}
+
+                      <FieldRow label="Dimensions">
+                        <div className="grid grid-cols-2 gap-2">
+                          <DimensionField
+                            axis="width"
+                            label="W"
+                            selection={selection}
+                            draft={draft}
+                            onApply={applyStyle}
+                          />
+                          <DimensionField
+                            axis="height"
+                            label="H"
+                            selection={selection}
+                            draft={draft}
+                            onApply={applyStyle}
+                          />
+                        </div>
+                      </FieldRow>
+
+                      {flow !== 'none' && (
+                        <div className="flex gap-3">
+                          {flow !== 'grid' && (
+                            <FieldRow label="Alignment">
+                              <AlignmentGrid draft={draft} onApply={applyStyle} />
+                            </FieldRow>
+                          )}
+                          <div className="min-w-0 flex-1 space-y-2">
+                            {renderField({ prop: 'gap', label: 'Gap', type: 'unit' })}
+                          </div>
+                        </div>
+                      )}
+
+                      <FieldRow label="Padding">
+                        {paddingExpanded ? (
+                          <div className="grid grid-cols-2 gap-2">
+                            {renderField({ prop: 'paddingTop', label: 'Top', type: 'unit' })}
+                            {renderField({ prop: 'paddingRight', label: 'Right', type: 'unit' })}
+                            {renderField({ prop: 'paddingBottom', label: 'Bottom', type: 'unit' })}
+                            {renderField({ prop: 'paddingLeft', label: 'Left', type: 'unit' })}
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-2 gap-2">
+                            <PaddingPairField
+                              label="Horizontal"
+                              a={draft.paddingLeft}
+                              b={draft.paddingRight}
+                              onChange={(v) => {
+                                applyStyle('paddingLeft', v)
+                                applyStyle('paddingRight', v)
+                              }}
+                            />
+                            <PaddingPairField
+                              label="Vertical"
+                              a={draft.paddingTop}
+                              b={draft.paddingBottom}
+                              onChange={(v) => {
+                                applyStyle('paddingTop', v)
+                                applyStyle('paddingBottom', v)
+                              }}
+                            />
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          className="mt-1 text-[11px] text-muted-foreground hover:text-foreground"
+                          onClick={() => setPaddingExpanded((v) => !v)}
+                        >
+                          {paddingExpanded ? 'Use horizontal / vertical' : 'Edit each side'}
+                        </button>
+                      </FieldRow>
+
+                      <label className="flex items-center gap-2 text-xs">
+                        <Checkbox
+                          checked={draft.overflow === 'hidden'}
+                          onCheckedChange={(c) => applyStyle('overflow', c ? 'hidden' : 'visible')}
+                        />
+                        Clip content
+                      </label>
+                    </>
+                  )
+                })()}
+              </Section>
+
+              {/* Appearance */}
+              <Section title="Appearance">
+                <div className="grid grid-cols-2 gap-2">
+                  <OpacityField
+                    value={draft.opacity ?? '1'}
+                    onChange={(v) => applyStyle('opacity', v)}
+                  />
+                  {renderField({ prop: 'borderRadius', label: 'Corner radius', type: 'unit' })}
+                </div>
+              </Section>
+
+              {/* Fill */}
+              <Section title="Fill">
+                <ColorRow
+                  value={draft.backgroundColor ?? ''}
+                  edited={isEdited('backgroundColor')}
+                  onChange={(v) => applyStyle('backgroundColor', v)}
+                />
+              </Section>
+
+              {/* Stroke */}
+              <Section title="Stroke">
+                <ColorRow
+                  value={draft.borderColor ?? ''}
+                  edited={isEdited('borderColor')}
+                  onChange={(v) => {
+                    applyStyle('borderColor', v)
+                    // A stroke with no style or weight is invisible; give it
+                    // sensible defaults the first time a color is chosen.
+                    if (draft.borderStyle === 'none') applyStyle('borderStyle', 'solid')
+                    if (!parseFloat(draft.borderWidth ?? '0')) applyStyle('borderWidth', '1px')
+                  }}
+                />
+                <div className="grid grid-cols-2 gap-2">
+                  {renderField({ prop: 'borderWidth', label: 'Weight', type: 'unit' })}
+                  {renderField({
+                    prop: 'borderStyle',
+                    label: 'Style',
+                    type: 'select',
+                    options: ['none', 'solid', 'dashed', 'dotted'],
+                  })}
+                </div>
+              </Section>
+
+              {/* Typography */}
+              <Section title="Typography">
+                {selection.text && (
+                  <FieldRow label="Content">
+                    <div className="space-y-1">
+                      {textEdited && (
+                        <div className="flex justify-end">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-5"
+                            title="Reset this change"
+                            onClick={resetTextEdit}
+                          >
+                            <RotateCcw className="size-3" />
+                          </Button>
+                        </div>
+                      )}
+                      <Textarea
+                        value={text}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setText(v)
+                          // Live preview on every keystroke; the change is
+                          // committed to history/prompt on blur (applyText).
+                          if (selection)
+                            sendToPage({
+                              type: 'PTR_SET_TEXT',
+                              frameToken: selection.frameToken,
+                              elementId: selection.elementId,
+                              value: v,
+                            }).catch(() => {})
+                        }}
+                        onBlur={applyText}
+                        rows={2}
+                        className={
+                          'text-sm' + (textEdited ? ' border-primary bg-primary/5' : '')
+                        }
+                      />
                     </div>
-                  </div>
-                ))}
-              </>
-            )}
-          </div>
+                  </FieldRow>
+                )}
+                <div className="grid grid-cols-2 gap-2">
+                  {TYPOGRAPHY_FIELDS.map(renderField)}
+                </div>
+                {renderField({ prop: 'color', label: 'Color', type: 'color' })}
+              </Section>
+            </div>
+          )}
         </ScrollArea>
       </TabsContent>
 
-      <TabsContent value="insert" className="min-h-0 flex-1">
+      <TabsContent value="layers" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
-          <div className="space-y-4 p-4">
-            <div className="space-y-1">
-              <p className="text-xs text-muted-foreground">
-                {selection
-                  ? 'New elements are added inside the selected element, or right after it.'
-                  : 'Nothing selected — new elements will be added at the end of the page. Select an element first to place them precisely.'}
+          <div className="p-2">
+            {tree.length === 0 ? (
+              <p className="p-2 pt-8 text-center text-sm text-muted-foreground">
+                No layers yet — make sure the tab is a localhost app.
               </p>
-              {selection && (
-                <p className="truncate font-mono text-[11px] text-muted-foreground">
-                  {selection.componentChain[0] ?? `<${selection.tag}>`}
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-[11px] text-muted-foreground">Add</Label>
-              <div className="grid grid-cols-2 gap-2">
-                {(
-                  [
-                    { kind: 'layout', label: 'Layout', icon: Rows3 },
-                    { kind: 'rect', label: 'Rectangle', icon: Square },
-                    { kind: 'circle', label: 'Circle', icon: Circle },
-                    { kind: 'text', label: 'Text', icon: Type },
-                  ] as const
-                ).map((item) => (
-                  <div key={item.kind} className="space-y-1">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="w-full"
-                      onClick={() => insertNew(item.kind, 'inside')}
-                    >
-                      <item.icon className="size-3.5" />
-                      {item.label}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 w-full text-[11px] text-muted-foreground"
-                      disabled={!selection}
-                      onClick={() => insertNew(item.kind, 'after')}
-                    >
-                      after selection
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <p className="text-[11px] text-muted-foreground">
-              Added elements are real, selectable elements — style them in the Element tab, then
-              send everything to Claude with Copy prompt.
-            </p>
+            ) : (
+              <LayerTree
+                nodes={tree}
+                depth={0}
+                expanded={expanded}
+                selectedId={selection?.elementId ?? null}
+                onToggle={(id) =>
+                  setExpanded((prev) => {
+                    const next = new Set(prev)
+                    if (next.has(id)) next.delete(id)
+                    else next.add(id)
+                    return next
+                  })
+                }
+                onSelect={(id) => {
+                  sendToPage({
+                    type: 'PTR_RESELECT_ID',
+                    frameToken: lastFrameRef.current ?? undefined,
+                    elementId: id,
+                  }).catch(() => {})
+                }}
+                onHover={(id) =>
+                  sendToPage({
+                    type: 'PTR_HOVER_ID',
+                    frameToken: lastFrameRef.current ?? undefined,
+                    elementId: id,
+                  }).catch(() => {})
+                }
+              />
+            )}
           </div>
         </ScrollArea>
       </TabsContent>

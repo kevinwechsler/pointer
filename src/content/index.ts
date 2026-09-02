@@ -12,6 +12,17 @@ type SourceInfo = { fileName: string; lineNumber: number } | null
 const FRAME_TOKEN = crypto.randomUUID()
 const IS_TOP = window === window.top
 
+// Dev harnesses (e.g. Urdi's) render the real app inside an iframe and dress
+// the outer page up as host chrome — a sidebar, a title bar — purely for
+// context. That chrome is never what you want to edit, and it tends to sit
+// on top of the iframe and swallow clicks meant for the app. When the top
+// frame is recognizably a harness, it stays out of the way and lets the
+// iframe's own copy of this script handle everything.
+const IS_HOST_CHROME =
+  IS_TOP &&
+  (/urdi dev harness/i.test(document.title) ||
+    !!document.querySelector('iframe[src^="/__app__"]'))
+
 export type SelectionPayload = {
   frameToken: string
   elementId: number
@@ -23,7 +34,14 @@ export type SelectionPayload = {
   componentChain: string[]
   source: SourceInfo
   styles: Record<string, string>
-  rect: { width: number; height: number }
+  rect: { width: number; height: number; left: number; top: number }
+  /**
+   * Author-set inline values. Computed styles always resolve to pixels, so
+   * these are what tell Hug/Fixed/Fill apart.
+   */
+  inline: Record<string, string>
+  /** Decomposed transform, so position and rotation can be edited separately. */
+  transform: { dx: number; dy: number; rotate: number }
   /** Position among siblings, so reordering controls can show "2 of 5". */
   index: number
   siblingCount: number
@@ -64,8 +82,11 @@ const STYLE_PROPS = [
   'transform',
   'flexWrap',
   'gridTemplateColumns',
+  'gridTemplateRows',
   'alignSelf',
   'flexGrow',
+  'overflow',
+  'textTransform',
 ] as const
 
 let active = false
@@ -220,6 +241,70 @@ function getFiber(el: Element): any {
   return null
 }
 
+// ---------- layer tree ----------
+// The page as Figma would list it: nested layers with readable names. Names
+// come from the React component that rendered the node when available,
+// otherwise from the tag plus its first class. Capped so a huge page can't
+// flood the panel.
+export type LayerNode = {
+  id: number
+  name: string
+  tag: string
+  text: string
+  children: LayerNode[]
+}
+
+const TREE_MAX_DEPTH = 14
+const TREE_MAX_NODES = 2500
+const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'NOSCRIPT', 'TEMPLATE', 'BR'])
+
+function layerName(el: Element): string {
+  const fiber = getFiber(el)
+  // Nearest component that owns this host node, without walking far.
+  let f = fiber
+  for (let i = 0; f && i < 6; i++) {
+    const n = fiberName(f)
+    if (n) return n
+    f = f._debugOwner || f.return
+  }
+  const tag = el.tagName.toLowerCase()
+  const cls = Array.from(el.classList).find((c) => !/^\d|\[|:|\//.test(c) && c.length < 32)
+  return cls ? `${tag}.${cls}` : tag
+}
+
+function buildLayerTree(): LayerNode[] {
+  let count = 0
+  const walk = (el: Element, depth: number): LayerNode | null => {
+    if (count >= TREE_MAX_NODES) return null
+    if (SKIP_TAGS.has(el.tagName)) return null
+    if (el.hasAttribute('data-pointer-pin')) return null
+    count++
+    const children: LayerNode[] = []
+    if (depth < TREE_MAX_DEPTH) {
+      for (const child of Array.from(el.children)) {
+        const node = walk(child, depth + 1)
+        if (node) children.push(node)
+      }
+    }
+    // Own text only (not descendants'), trimmed, for a Figma-like preview.
+    const ownText = Array.from(el.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => (n.textContent || '').trim())
+      .filter(Boolean)
+      .join(' ')
+      .slice(0, 40)
+    return {
+      id: registerEl(el),
+      name: layerName(el),
+      tag: el.tagName.toLowerCase(),
+      text: ownText,
+      children,
+    }
+  }
+  const root = walk(document.body, 0)
+  return root ? root.children : []
+}
+
 function fiberName(fiber: any): string | null {
   const t = fiber?.type
   if (!t) return null
@@ -268,8 +353,32 @@ function buildPayload(el: Element): SelectionPayload {
     componentChain: chain,
     source,
     styles,
-    rect: { width: Math.round(rect.width), height: Math.round(rect.height) },
+    rect: {
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+    },
+    inline: readInline(el),
+    transform: getTransformParts(registerEl(el)),
   }
+}
+
+const INLINE_PROPS = [
+  'width',
+  'height',
+  'flexGrow',
+  'flexBasis',
+  'alignSelf',
+  'marginLeft',
+  'marginRight',
+] as const
+
+function readInline(el: Element): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!(el instanceof HTMLElement)) return out
+  for (const p of INLINE_PROPS) out[p] = el.style[p as any] || ''
+  return out
 }
 
 function selectElement(el: Element) {
@@ -1069,28 +1178,42 @@ function pasteStyleToHovered() {
   flashToast('Style pasted')
 }
 
-// Arrow keys nudge the selected element via `transform: translate(...)`,
-// which works regardless of the underlying layout method (flex/grid/static)
-// without fighting margins the page's own CSS might rely on.
-const nudgeOffsets = new Map<number, { dx: number; dy: number }>()
+// Position and rotation both live in `transform`, which sidesteps the page's
+// own margins/layout. They're stored decomposed so the panel can offer them
+// as separate fields the way Figma does, then recomposed into one value.
+type TransformParts = { dx: number; dy: number; rotate: number }
+const transforms = new Map<number, TransformParts>()
+
+function getTransformParts(id: number): TransformParts {
+  return transforms.get(id) ?? { dx: 0, dy: 0, rotate: 0 }
+}
+
+function composeTransform(t: TransformParts): string {
+  const parts: string[] = []
+  if (t.dx || t.dy) parts.push(`translate(${t.dx}px, ${t.dy}px)`)
+  if (t.rotate) parts.push(`rotate(${t.rotate}deg)`)
+  return parts.length ? parts.join(' ') : 'none'
+}
+
+function setTransform(id: number, next: Partial<TransformParts>): { from: string; to: string } {
+  const cur = getTransformParts(id)
+  const merged = { ...cur, ...next }
+  transforms.set(id, merged)
+  const from = composeTransform(cur)
+  const to = composeTransform(merged)
+  applyStyle(id, 'transform', to)
+  return { from, to }
+}
 
 function nudgeSelected(dx: number, dy: number) {
   if (!selectedEl) return
   const id = registerEl(selectedEl)
   const before = buildPayload(selectedEl)
-  const cur = nudgeOffsets.get(id) ?? { dx: 0, dy: 0 }
-  const next = { dx: cur.dx + dx, dy: cur.dy + dy }
-  nudgeOffsets.set(id, next)
-  const value = `translate(${next.dx}px, ${next.dy}px)`
-  applyStyle(id, 'transform', value)
+  const cur = getTransformParts(id)
+  const { from, to } = setTransform(id, { dx: cur.dx + dx, dy: cur.dy + dy })
   chrome.runtime.sendMessage({
     type: 'PTR_NUDGED',
-    payload: {
-      elementId: id,
-      value,
-      from: cur.dx === 0 && cur.dy === 0 ? 'none' : `translate(${cur.dx}px, ${cur.dy}px)`,
-      target: before,
-    },
+    payload: { elementId: id, value: to, from, target: before },
   })
 }
 
@@ -1187,6 +1310,16 @@ function onKeyUp(e: KeyboardEvent) {
   if (e.key === 'Alt' || e.key === 'Shift' || e.key === 'Control') hideMeasure()
 }
 
+// The cursor left the page — into the side panel, another window, wherever.
+// Whatever was hovered is no longer under the mouse, so the hover outline
+// would just linger. The selection is a deliberate click; it stays.
+function onMouseLeave() {
+  hoverEl = null
+  hideBox(hoverBox)
+  hideBox(hoverLabel as any)
+  hideMeasure()
+}
+
 function onMouseMove(e: MouseEvent) {
   if (!active && !commentMode) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
@@ -1261,7 +1394,7 @@ function onMouseDown(e: MouseEvent) {
   const el = document.elementFromPoint(e.clientX, e.clientY)
   if (!el || (el !== selectedEl && !selectedEl.contains(el))) return
   const id = registerEl(selectedEl)
-  const base = nudgeOffsets.get(id) ?? { dx: 0, dy: 0 }
+  const base = getTransformParts(id)
   dragState = {
     id,
     startX: e.clientX,
@@ -1279,9 +1412,7 @@ function onDragMove(e: MouseEvent) {
   if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
   dragState.moved = true
   e.preventDefault()
-  const next = { dx: dragState.baseX + dx, dy: dragState.baseY + dy }
-  nudgeOffsets.set(dragState.id, next)
-  applyStyle(dragState.id, 'transform', `translate(${next.dx}px, ${next.dy}px)`)
+  setTransform(dragState.id, { dx: dragState.baseX + dx, dy: dragState.baseY + dy })
   if (selectBox && selectedEl) positionBox(selectBox, selectedEl)
 }
 
@@ -1290,15 +1421,15 @@ function onMouseUp() {
   const { id, moved, baseX, baseY } = dragState
   dragState = null
   if (!moved) return
-  const offset = nudgeOffsets.get(id) ?? { dx: 0, dy: 0 }
+  const cur = getTransformParts(id)
   const el = getEl(id)
   if (!el) return
   chrome.runtime.sendMessage({
     type: 'PTR_NUDGED',
     payload: {
       elementId: id,
-      value: `translate(${offset.dx}px, ${offset.dy}px)`,
-      from: baseX === 0 && baseY === 0 ? 'none' : `translate(${baseX}px, ${baseY}px)`,
+      value: composeTransform(cur),
+      from: composeTransform({ ...cur, dx: baseX, dy: baseY }),
       target: buildPayload(el),
     },
   })
@@ -1366,9 +1497,12 @@ function onScrollOrResize() {
 }
 
 function setActive(on: boolean) {
+  // Host chrome never inspects; the app's iframe does.
+  if (on && IS_HOST_CHROME) return
   active = on
   if (on) {
     ensureOverlay()
+    document.documentElement.addEventListener('mouseleave', onMouseLeave)
     document.addEventListener('mousemove', onMouseMove, true)
     document.addEventListener('mousemove', onDragMove, true)
     document.addEventListener('mousedown', onMouseDown, true)
@@ -1381,6 +1515,7 @@ function setActive(on: boolean) {
     window.addEventListener('resize', onScrollOrResize)
     document.documentElement.style.cursor = 'crosshair'
   } else {
+    document.documentElement.removeEventListener('mouseleave', onMouseLeave)
     document.removeEventListener('mousemove', onMouseMove, true)
     document.removeEventListener('mousemove', onDragMove, true)
     document.removeEventListener('mousedown', onMouseDown, true)
@@ -1735,6 +1870,28 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
     case 'PTR_RESET_TEXT':
       sendResponse({ ok: resetText(msg.elementId) })
       break
+    case 'PTR_GET_TREE':
+      sendResponse({ ok: true, tree: buildLayerTree() })
+      break
+    case 'PTR_HOVER_ID': {
+      const el = msg.elementId != null ? getEl(msg.elementId) : null
+      ensureOverlay()
+      if (el) {
+        positionBox(hoverBox!, el)
+        hoverLabel!.textContent = shortDescriptor(el)
+        const r = el.getBoundingClientRect()
+        Object.assign(hoverLabel!.style, {
+          display: 'block',
+          top: `${Math.max(4, r.top - 22)}px`,
+          left: `${Math.max(4, r.left)}px`,
+        })
+      } else {
+        hideBox(hoverBox)
+        hideBox(hoverLabel as any)
+      }
+      sendResponse({ ok: true })
+      break
+    }
     case 'PTR_RESELECT_ID': {
       const el = getEl(msg.elementId)
       if (el) {
@@ -1765,6 +1922,13 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
     case 'PTR_DUPLICATE_ELEMENT':
       sendResponse(duplicateElement(msg.elementId))
       break
+    case 'PTR_SET_TRANSFORM': {
+      const r = setTransform(msg.elementId, msg.parts)
+      const el = getEl(msg.elementId)
+      if (el && selectBox && selectedEl === el) positionBox(selectBox, el)
+      sendResponse({ ok: !!el, ...r })
+      break
+    }
     case 'PTR_SELECT_COMMENT': {
       selectedCommentId = msg.id ?? null
       renderPins()
