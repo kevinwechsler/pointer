@@ -1150,7 +1150,7 @@ export default function App() {
   const [draggedLayerId, setDraggedLayerId] = useState<number | null>(null)
   const [layerDropTarget, setLayerDropTarget] = useState<LayerDropTarget | null>(null)
   const tabsListRef = useRef<HTMLDivElement>(null)
-  const tabsDrag = useRef<{ x: number; left: number; moved: boolean } | null>(null)
+  const tabsDrag = useRef<{ x: number; left: number; moved: boolean; value: string | null } | null>(null)
 
   // Last frame the user interacted with; frame-scoped requests that aren't
   // tied to a specific element (tokens, comments) go to this frame.
@@ -1318,6 +1318,12 @@ export default function App() {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
   }
+
+  useEffect(() => {
+    tabsListRef.current
+      ?.querySelector<HTMLElement>('[data-state="active"]')
+      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [activeTab])
 
   // Keep the selected layer revealed as selection changes on the page.
   useEffect(() => {
@@ -1525,6 +1531,12 @@ export default function App() {
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
+  }
+
+  function selectTab(v: string) {
+    setActiveTab(v)
+    if (v !== 'element') loadCommentsAndTokens()
+    if (v === 'layers') loadTree()
   }
 
   async function moveSelected(dir: 'prev' | 'next') {
@@ -2104,93 +2116,87 @@ export default function App() {
 
       <Tabs
         value={activeTab}
+        // "manual": Radix would otherwise also activate a tab the moment
+        // it receives focus, which a mouse press does — the same problem as
+        // the mousedown activation intercepted below, via a different path.
+        // Keyboard users still activate with Enter/Space.
+        activationMode="manual"
         className="flex min-h-0 flex-1 flex-col"
-        onValueChange={(v) => {
-          setActiveTab(v)
-          if (v !== 'element') loadCommentsAndTokens()
-          if (v === 'layers') loadTree()
-        }}
+        onValueChange={selectTab}
       >
-        {/* The gray baseline lives in this wrapper, not inside TabsList: an
-            absolutely-positioned child of a scrolling element scrolls right
-            along with its content (its containing block is the element's
-            own local coordinate space, which shifts with scrollLeft) even
-            though its size is still just the visible clientWidth — so as
-            the row scrolled, the line's fixed-width span drifted left with
-            it, leaving whatever was newly scrolled into view uncovered.
-            This wrapper never scrolls, so inset-x-0 here always covers the
-            full, constant-width row regardless of TabsList's own scroll
-            position. Verified both the bug and this fix against the actual
-            scroll math before landing it. */}
-        <div className="relative mx-4 mt-2 mb-2">
-        <TabsList
-          ref={tabsListRef}
-          variant="line"
-          // The component's active-tab indicator is a ::after sitting
-          // 5px below the *trigger's* own bottom edge. Per spec, a
-          // horizontally-scrolling element (overflow-x-auto) also clips
-          // vertically — there's no way to keep one axis "visible" once
-          // the other scrolls — so that indicator was being cropped away
-          // entirely. Fixed by giving the row real height (h-9) but the
-          // trigger a shorter, fixed one (h-6 on each TabsTrigger below):
-          // the extra room means the indicator lands inside the box
-          // instead of past its edge.
-          className="h-9 w-auto cursor-grab justify-start gap-0 overflow-x-auto active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          onPointerDown={(e) => {
-            const el = tabsListRef.current
-            if (!el) return
-            tabsDrag.current = { x: e.clientX, left: el.scrollLeft, moved: false }
-          }}
-          onPointerMove={(e) => {
-            const el = tabsListRef.current
-            const d = tabsDrag.current
-            if (!el || !d || !(e.buttons & 1)) return
-            const dx = e.clientX - d.x
-            if (Math.abs(dx) > 4) d.moved = true
-            if (d.moved) el.scrollLeft = d.left - dx
-          }}
-          onPointerUp={() => {
-            const d = tabsDrag.current
-            tabsDrag.current = null
-            // A real drag shouldn't also switch tabs on release.
-            if (d?.moved)
-              tabsListRef.current?.addEventListener(
-                'click',
-                (ev) => {
-                  ev.stopPropagation()
-                  ev.preventDefault()
-                },
-                { capture: true, once: true }
-              )
-          }}
-        >
-          <TabsTrigger value="element" className="h-6 shrink-0 px-2">
-            Element
-          </TabsTrigger>
-          <TabsTrigger value="layers" className="h-6 shrink-0 px-2">
-            Layers
-          </TabsTrigger>
-          <TabsTrigger value="changes" className="h-6 shrink-0 px-2">
-            Changes
-            {edits.length + tokenEdits.length > 0 && (
-              <Badge variant="secondary" className="ml-1.5">
-                {edits.length + tokenEdits.length}
-              </Badge>
-            )}
-          </TabsTrigger>
-          <TabsTrigger value="comments" className="h-6 shrink-0 px-2">
-            Comments
-            {comments.length > 0 && (
-              <Badge variant="secondary" className="ml-1.5">
-                {comments.length}
-              </Badge>
-            )}
-          </TabsTrigger>
-          <TabsTrigger value="tokens" className="h-6 shrink-0 px-2">
-            Tokens
-          </TabsTrigger>
-        </TabsList>
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border" />
+        {/* Plain shadcn tabs. The gray line is this wrapper's own bottom
+            border: full panel width, never scrolls, so it stays edge to
+            edge no matter how far the strip is dragged. */}
+        <div className="border-b">
+          <TabsList
+            ref={tabsListRef}
+            variant="line"
+            // Row taller than its triggers on purpose: the component draws
+            // the active underline 5px below the *trigger*, and a
+            // horizontally scrolling box also clips vertically, so the
+            // underline needs room inside the row. 26px triggers centered in
+            // 36px put its bottom edge exactly on the wrapper's border.
+            className="h-9 w-full cursor-grab justify-start gap-0 overflow-x-auto px-4 select-none active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            // Radix switches tabs on mousedown — before it's known whether
+            // this press is the start of a drag. Swallow it here, then decide
+            // on release: moved → it was a drag (scroll only); didn't move →
+            // it was a click, switch the tab ourselves.
+            onMouseDownCapture={(e) => e.stopPropagation()}
+            onPointerDown={(e) => {
+              if (e.button !== 0) return
+              const el = e.currentTarget
+              el.setPointerCapture(e.pointerId)
+              const trigger = (e.target as HTMLElement).closest<HTMLElement>('[data-value]')
+              tabsDrag.current = {
+                x: e.clientX,
+                left: el.scrollLeft,
+                moved: false,
+                value: trigger?.dataset.value ?? null,
+              }
+            }}
+            onPointerMove={(e) => {
+              const d = tabsDrag.current
+              if (!d) return
+              const dx = e.clientX - d.x
+              if (!d.moved && Math.abs(dx) > 4) d.moved = true
+              if (d.moved) e.currentTarget.scrollLeft = d.left - dx
+            }}
+            onPointerUp={(e) => {
+              const d = tabsDrag.current
+              tabsDrag.current = null
+              e.currentTarget.releasePointerCapture(e.pointerId)
+              if (d && !d.moved && d.value) selectTab(d.value)
+            }}
+            onPointerCancel={() => {
+              tabsDrag.current = null
+            }}
+          >
+            <TabsTrigger value="element" data-value="element" className="h-[26px] shrink-0 px-2">
+              Element
+            </TabsTrigger>
+            <TabsTrigger value="layers" data-value="layers" className="h-[26px] shrink-0 px-2">
+              Layers
+            </TabsTrigger>
+            <TabsTrigger value="changes" data-value="changes" className="h-[26px] shrink-0 px-2">
+              Changes
+              {edits.length + tokenEdits.length > 0 && (
+                <Badge variant="secondary" className="ml-1.5">
+                  {edits.length + tokenEdits.length}
+                </Badge>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="comments" data-value="comments" className="h-[26px] shrink-0 px-2">
+              Comments
+              {comments.length > 0 && (
+                <Badge variant="secondary" className="ml-1.5">
+                  {comments.length}
+                </Badge>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="tokens" data-value="tokens" className="h-[26px] shrink-0 px-2">
+              Tokens
+            </TabsTrigger>
+          </TabsList>
         </div>
 
       <TabsContent value="element" className="min-h-0 flex-1">
