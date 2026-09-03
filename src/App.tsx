@@ -2024,13 +2024,16 @@ export default function App() {
         <TabsList
           ref={tabsListRef}
           variant="line"
-          // Gray baseline under every tab so the row reads as continuing past
-          // the edge. Drawn at the same offset as the active tab's black
-          // indicator (an ::after at bottom:-5px on the trigger); that only
-          // lines up if every trigger is the same height, which needs the
-          // list's own height to stay a real value (triggers size to
-          // `calc(100% - 1px)`) instead of auto.
-          className="relative mx-4 mt-2 mb-1.5 w-auto cursor-grab justify-start gap-0 overflow-x-auto px-0 py-0 active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          // The component's active-tab indicator is a ::after sitting
+          // 5px below the *trigger's* own bottom edge. Per spec, a
+          // horizontally-scrolling element (overflow-x-auto) also clips
+          // vertically — there's no way to keep one axis "visible" once
+          // the other scrolls — so that indicator (and our own gray
+          // baseline below it) were being cropped away entirely. Fixed by
+          // giving the row real height (h-9) but the trigger a shorter,
+          // fixed one (h-6 on each TabsTrigger below): the extra room
+          // means both lines land inside the box instead of past its edge.
+          className="relative mx-4 mt-2 mb-2 h-9 w-auto cursor-grab justify-start gap-0 overflow-x-auto active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           onPointerDown={(e) => {
             const el = tabsListRef.current
             if (!el) return
@@ -2059,13 +2062,13 @@ export default function App() {
               )
           }}
         >
-          <TabsTrigger value="element" className="shrink-0 px-2">
+          <TabsTrigger value="element" className="h-6 shrink-0 px-2">
             Element
           </TabsTrigger>
-          <TabsTrigger value="layers" className="shrink-0 px-2">
+          <TabsTrigger value="layers" className="h-6 shrink-0 px-2">
             Layers
           </TabsTrigger>
-          <TabsTrigger value="changes" className="shrink-0 px-2">
+          <TabsTrigger value="changes" className="h-6 shrink-0 px-2">
             Changes
             {edits.length + tokenEdits.length > 0 && (
               <Badge variant="secondary" className="ml-1.5">
@@ -2073,7 +2076,7 @@ export default function App() {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="comments" className="shrink-0 px-2">
+          <TabsTrigger value="comments" className="h-6 shrink-0 px-2">
             Comments
             {comments.length > 0 && (
               <Badge variant="secondary" className="ml-1.5">
@@ -2081,10 +2084,10 @@ export default function App() {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="tokens" className="shrink-0 px-2">
+          <TabsTrigger value="tokens" className="h-6 shrink-0 px-2">
             Tokens
           </TabsTrigger>
-          <div className="pointer-events-none absolute inset-x-0 -bottom-[5px] h-0.5 bg-border" />
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border" />
         </TabsList>
 
       <TabsContent value="element" className="min-h-0 flex-1">
