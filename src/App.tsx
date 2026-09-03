@@ -37,7 +37,6 @@ import {
   X,
   Download,
   ArrowRight,
-  Layers,
   Keyboard,
   ChevronLeft,
   ChevronRight,
@@ -2125,7 +2124,7 @@ export default function App() {
                 <div className="flex gap-1">
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <Button size="sm" variant="outline" className="flex-1">
+                      <Button size="sm" variant="outline">
                         <Plus className="size-3.5" />
                         Insert
                         <ChevronDown className="size-3.5 text-muted-foreground" />
@@ -2149,6 +2148,18 @@ export default function App() {
                       ))}
                     </DropdownMenuContent>
                   </DropdownMenu>
+                  {/* The main reason to select something at all, so it gets
+                      the primary/filled treatment — Duplicate and Delete
+                      are secondary, outline-only actions next to it. */}
+                  <Button
+                    size="sm"
+                    className="flex-1"
+                    onClick={copyForFigma}
+                    title="Copy for the Pointer Figma plugin (see figma-plugin/ in the repo)"
+                  >
+                    {figmaCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+                    {figmaCopied ? 'Copied' : 'Copy for Figma'}
+                  </Button>
                   <Button size="sm" variant="outline" onClick={duplicateSelected} title="Duplicate">
                     <CopyPlus className="size-3.5" />
                   </Button>
@@ -2160,17 +2171,6 @@ export default function App() {
                     title="Delete"
                   >
                     <Trash2 className="size-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={copyForFigma}
-                    title="Copy for the Pointer Figma plugin (see figma-plugin/ in the repo)"
-                  >
-                    {figmaCopied ? <Check className="size-3.5" /> : <Layers className="size-3.5" />}
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={deselect} title="Deselect (Esc)">
-                    <X className="size-3.5" />
                   </Button>
                 </div>
               </div>
