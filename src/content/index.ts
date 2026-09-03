@@ -292,7 +292,7 @@ function classifyLayer(
   // Childless, textless: a shape if it visibly paints something, otherwise
   // an empty frame (Figma shows plain empty frames the same way).
   const cs = getComputedStyle(el)
-  const bg = parseCssColor(cs.backgroundColor)
+  const bg = figmaColor(cs.backgroundColor)
   const hasBorder = (parseFloat(cs.borderTopWidth) || 0) > 0 && cs.borderTopStyle !== 'none'
   if (!bg && !hasBorder) return 'frame'
   const radius = parseFloat(cs.borderTopLeftRadius) || 0
@@ -1615,239 +1615,143 @@ function setActive(on: boolean) {
   }
 }
 
-// ---------- export selection to Figma (as pasteable SVG) ----------
-// Figma's paste handler accepts raw SVG markup on the clipboard and turns
-// it into real, editable layers — <text> becomes an editable text layer,
-// shapes become vectors. We rebuild the selected subtree as SVG rather
-// than just serializing outerHTML, since Figma can't parse arbitrary HTML/CSS.
+// ---------- export selection to Figma (as a design tree for the Pointer plugin) ----------
+// An SVG paste puts everything into one flat bag of absolutely-positioned
+// shapes — Figma's SVG importer has no concept of "this frame has padding
+// 24 and gap 16", so every container without its own paint (the vast
+// majority of real layout divs) silently vanished, and what was left had
+// no auto layout at all. This exports a real nested tree instead — one
+// JSON object per DOM element, preserving the full parent/child structure
+// and each flex container's layout — which the companion Figma plugin
+// (figma-plugin/ in this repo) rebuilds as native frames with auto layout,
+// not shapes glued together by coordinates.
 
-function toHex2(n: number): string {
-  return Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0')
+export type DesignColor = { r: number; g: number; b: number; a: number }
+
+export type DesignLayout = {
+  direction: 'HORIZONTAL' | 'VERTICAL'
+  gap: number
+  padding: [number, number, number, number] // top right bottom left
+  primary: 'MIN' | 'CENTER' | 'MAX' | 'SPACE_BETWEEN'
+  counter: 'MIN' | 'CENTER' | 'MAX'
+  wrap: boolean
 }
 
-// Returns null for fully transparent / keyword values we don't paint (e.g. "transparent").
-function parseCssColor(value: string): { hex: string; alpha: number } | null {
+export type DesignText = {
+  characters: string
+  fontFamily: string
+  fontWeight: number
+  italic: boolean
+  fontSize: number
+  lineHeight: number | null // null = the font's natural line height
+  letterSpacing: number
+  align: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED'
+  case: 'ORIGINAL' | 'UPPER' | 'LOWER' | 'TITLE'
+  color: DesignColor
+}
+
+export type DesignNode = {
+  type: 'FRAME' | 'TEXT' | 'IMAGE' | 'VECTOR'
+  name: string
+  x: number
+  y: number
+  width: number
+  height: number
+  opacity?: number
+  cornerRadius?: [number, number, number, number] // TL TR BR BL
+  fill?: DesignColor
+  stroke?: DesignColor
+  strokeWeight?: number
+  clip?: boolean
+  layout?: DesignLayout
+  // How this node should behave inside ITS parent's auto layout, if any.
+  sizing?: { h: 'FIXED' | 'FILL'; v: 'FIXED' | 'FILL' }
+  text?: DesignText
+  image?: { dataUrl: string | null }
+  vector?: { svg: string }
+  children?: DesignNode[]
+}
+
+function figmaColor(value: string): DesignColor | null {
   const v = value.trim()
   if (!v || v === 'transparent') return null
   const m = v.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+))?\)/)
   if (!m) return null
-  const alpha = m[4] !== undefined ? parseFloat(m[4]) : 1
-  if (alpha <= 0) return null
-  return {
-    hex: `#${toHex2(+m[1])}${toHex2(+m[2])}${toHex2(+m[3])}`,
-    alpha,
-  }
+  const a = m[4] !== undefined ? parseFloat(m[4]) : 1
+  if (a <= 0) return null
+  return { r: +m[1] / 255, g: +m[2] / 255, b: +m[3] / 255, a }
 }
 
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-// Groups the visual lines of a wrapped text node using Range.getClientRects(),
-// which returns one rect per rendered line. We walk word-by-word, growing a
-// Range, and start a new line whenever the rect's top jumps — a cheap
-// approximation that works well for normal left-to-right UI copy.
-function getTextLines(node: Text): { text: string; rect: DOMRect }[] {
-  const full = node.textContent || ''
-  if (!full.trim()) return []
-  const words = full.split(/(\s+)/) // keep separators so offsets line up
-  const lines: { text: string; rect: DOMRect }[] = []
-  let offset = 0
-  let lineStart = 0
-  let lineTop: number | null = null
-  const range = document.createRange()
-
-  const flush = (endOffset: number, rect: DOMRect) => {
-    const text = full.slice(lineStart, endOffset)
-    if (text.trim()) lines.push({ text, rect })
-    lineStart = endOffset
-  }
-
-  for (const word of words) {
-    const start = offset
-    const end = offset + word.length
-    offset = end
-    if (!word.trim()) continue // whitespace-only chunk, don't measure
-    try {
-      range.setStart(node, start)
-      range.setEnd(node, end)
-    } catch {
-      continue
-    }
-    const rects = range.getClientRects()
-    if (!rects.length) continue
-    const rect = rects[0]
-    if (lineTop === null) {
-      lineTop = rect.top
-    } else if (Math.abs(rect.top - lineTop) > 2) {
-      // New visual line: close out the previous one using its own last rect.
-      range.setStart(node, lineStart)
-      range.setEnd(node, start)
-      const prevRects = range.getClientRects()
-      if (prevRects.length) flush(start, prevRects[prevRects.length - 1])
-      lineTop = rect.top
-    }
-  }
-  range.setStart(node, lineStart)
-  range.setEnd(node, full.length)
-  const finalRects = range.getClientRects()
-  if (finalRects.length) flush(full.length, finalRects[finalRects.length - 1])
-  return lines
-}
-
-function fontWeightNumber(computed: string): number {
-  const n = parseInt(computed, 10)
-  return Number.isNaN(n) ? 400 : n
-}
-
-// Real font metrics via a hidden canvas, so text can be positioned by its
-// actual baseline. Figma's SVG importer anchors <text> strictly at the
-// baseline and ignores dominant-baseline, so guessing (or relying on that
-// attribute) shifts every text layer and makes the whole paste look like
-// its spacing is wrong.
-let metricsCtx: CanvasRenderingContext2D | null = null
-
-function baselineWithinLine(style: CSSStyleDeclaration, lineBoxHeight: number): number {
-  const fontSize = parseFloat(style.fontSize) || 16
-  if (!metricsCtx) metricsCtx = document.createElement('canvas').getContext('2d')
-  let ascent = fontSize * 0.8
-  let descent = fontSize * 0.2
-  if (metricsCtx) {
-    try {
-      metricsCtx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
-      const m = metricsCtx.measureText('Mg')
-      if (m.fontBoundingBoxAscent) ascent = m.fontBoundingBoxAscent
-      if (m.fontBoundingBoxDescent) descent = m.fontBoundingBoxDescent
-    } catch {
-      // keep the estimate
-    }
-  }
-  // The line box may be taller than the glyphs (line-height leading);
-  // browsers center the glyph box inside it.
-  const leading = Math.max(0, lineBoxHeight - (ascent + descent))
-  return leading / 2 + ascent
-}
-
-function svgTextElement(
-  text: string,
-  x: number,
-  baselineY: number,
-  style: CSSStyleDeclaration
-): string {
-  const color = parseCssColor(style.color) ?? { hex: '#000000', alpha: 1 }
-  const fontSize = parseFloat(style.fontSize) || 16
-  const family = style.fontFamily.split(',')[0].replace(/["']/g, '').trim()
-  const weight = fontWeightNumber(style.fontWeight)
-  // Bake in text-transform: it only changes rendering, not textContent, so
-  // without this the exported layer would show the original casing instead
-  // of what's actually visible on the page (e.g. an uppercase button label).
-  let display = text
-  if (style.textTransform === 'uppercase') display = display.toUpperCase()
-  else if (style.textTransform === 'lowercase') display = display.toLowerCase()
-  else if (style.textTransform === 'capitalize')
-    display = display.replace(/\b\w/g, (c) => c.toUpperCase())
-  const attrs = [
-    `x="${x.toFixed(1)}"`,
-    `y="${baselineY.toFixed(1)}"`,
-    `font-family="${esc(family)}"`,
-    `font-size="${fontSize.toFixed(1)}"`,
-    `font-weight="${weight}"`,
-    `fill="${color.hex}"`,
-    `fill-opacity="${color.alpha}"`,
+function cornerRadii(style: CSSStyleDeclaration): [number, number, number, number] {
+  return [
+    parseFloat(style.borderTopLeftRadius) || 0,
+    parseFloat(style.borderTopRightRadius) || 0,
+    parseFloat(style.borderBottomRightRadius) || 0,
+    parseFloat(style.borderBottomLeftRadius) || 0,
   ]
-  const ls = parseFloat(style.letterSpacing)
-  if (!Number.isNaN(ls) && ls !== 0) attrs.push(`letter-spacing="${ls.toFixed(2)}"`)
-  return `<text ${attrs.join(' ')}>${esc(display)}</text>`
 }
 
-function elementToSvg(
-  el: Element,
-  originX: number,
-  originY: number,
-  out: string[],
-  imgData: Map<string, string>
-) {
-  if (!(el instanceof HTMLElement) && !(el instanceof SVGElement)) return
-  const style = getComputedStyle(el)
-  if (style.display === 'none' || style.visibility === 'hidden') return
-
-  const rect = el.getBoundingClientRect()
-  if (rect.width <= 0 || rect.height <= 0) return
-  const x = rect.left - originX
-  const y = rect.top - originY
-
-  // Pass inline SVG icons through as-is, positioned via a translated group.
-  if (el instanceof SVGElement) {
-    out.push(`<g transform="translate(${x.toFixed(1)}, ${y.toFixed(1)})">${el.outerHTML}</g>`)
-    return
-  }
-
-  if (el instanceof HTMLImageElement && el.src) {
-    // Figma won't fetch external URLs when pasting an SVG, so images must
-    // travel embedded as data URIs (fetched beforehand by inlineImages).
-    const href = imgData.get(el.src) ?? el.src
-    out.push(
-      `<image x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${rect.width.toFixed(
-        1
-      )}" height="${rect.height.toFixed(1)}" href="${esc(href)}" preserveAspectRatio="none" />`
-    )
-    return
-  }
-
-  // Background + border, drawn at the literal border-box rect. SVG strokes
-  // are centered on the path rather than inset like CSS borders, but that's
-  // a sub-pixel difference — not worth risking distortion for elements
-  // whose border width differs per side (a shrink hack here previously
-  // threw off padding/gap-sensitive layouts).
-  const bg = parseCssColor(style.backgroundColor)
-  const borderWidth = parseFloat(style.borderTopWidth) || 0
-  const hasBorder = borderWidth > 0 && style.borderTopStyle !== 'none'
-  const borderColor = hasBorder ? parseCssColor(style.borderTopColor) : null
-  const radius = parseFloat(style.borderTopLeftRadius) || 0
-  const opacity = parseFloat(style.opacity)
-
-  if (bg || borderColor) {
-    const attrs = [
-      `x="${x.toFixed(1)}"`,
-      `y="${y.toFixed(1)}"`,
-      `width="${rect.width.toFixed(1)}"`,
-      `height="${rect.height.toFixed(1)}"`,
-    ]
-    if (radius > 0) attrs.push(`rx="${radius.toFixed(1)}"`, `ry="${radius.toFixed(1)}"`)
-    attrs.push(bg ? `fill="${bg.hex}" fill-opacity="${bg.alpha}"` : `fill="none"`)
-    if (borderColor) {
-      attrs.push(
-        `stroke="${borderColor.hex}" stroke-opacity="${borderColor.alpha}" stroke-width="${borderWidth}"`
-      )
-    }
-    if (!Number.isNaN(opacity) && opacity < 1) attrs.push(`opacity="${opacity}"`)
-    out.push(`<rect ${attrs.join(' ')} />`)
-  }
-
-  // Direct text nodes only (not text belonging to nested elements, which
-  // get handled when we recurse into them below). Each rendered line is
-  // placed at its measured left edge with a baseline computed from real
-  // font metrics — the alignment is already baked into where the line
-  // rect sits, so no SVG text-anchor tricks are needed.
-  for (const child of Array.from(el.childNodes)) {
-    if (child.nodeType === Node.TEXT_NODE && (child.textContent || '').trim()) {
-      for (const line of getTextLines(child as Text)) {
-        const lineX = line.rect.left - originX
-        const baselineY =
-          line.rect.top - originY + baselineWithinLine(style, line.rect.height)
-        out.push(svgTextElement(line.text.trim(), lineX, baselineY, style))
-      }
-    }
-  }
-
-  for (const child of Array.from(el.children)) {
-    elementToSvg(child, originX, originY, out, imgData)
+function mapJustify(v: string): DesignLayout['primary'] {
+  switch (v) {
+    case 'center':
+      return 'CENTER'
+    case 'flex-end':
+    case 'end':
+      return 'MAX'
+    case 'space-between':
+      return 'SPACE_BETWEEN'
+    default:
+      return 'MIN'
   }
 }
 
-// Fetch every <img> in the subtree and convert it to a data URI. Same-origin
-// (localhost) images always work; cross-origin ones without CORS headers are
-// left as URLs (Figma will drop them, but nothing else breaks).
+function mapAlign(v: string): DesignLayout['counter'] {
+  switch (v) {
+    case 'center':
+      return 'CENTER'
+    case 'flex-end':
+    case 'end':
+      return 'MAX'
+    default:
+      return 'MIN'
+  }
+}
+
+function mapTextAlign(v: string): DesignText['align'] {
+  switch (v) {
+    case 'center':
+      return 'CENTER'
+    case 'right':
+    case 'end':
+      return 'RIGHT'
+    case 'justify':
+      return 'JUSTIFIED'
+    default:
+      return 'LEFT'
+  }
+}
+
+function mapTextCase(v: string): DesignText['case'] {
+  switch (v) {
+    case 'uppercase':
+      return 'UPPER'
+    case 'lowercase':
+      return 'LOWER'
+    case 'capitalize':
+      return 'TITLE'
+    default:
+      return 'ORIGINAL'
+  }
+}
+
+/** FILL if this element grows on the main axis or is sized ~100% of its parent, else FIXED. */
+function sizingFor(style: CSSStyleDeclaration): 'FIXED' | 'FILL' {
+  if ((parseFloat(style.flexGrow) || 0) > 0) return 'FILL'
+  return 'FIXED'
+}
+
+/** Fetch every <img> in the subtree and convert it to a data URI — the plugin
+ * runs inside Figma's sandbox and can't fetch arbitrary URLs itself. */
 async function inlineImages(root: Element): Promise<Map<string, string>> {
   const map = new Map<string, string>()
   const imgs: HTMLImageElement[] = []
@@ -1867,24 +1771,158 @@ async function inlineImages(root: Element): Promise<Map<string, string>> {
         })
         map.set(src, dataUrl)
       } catch {
-        // leave as URL
+        // Cross-origin without CORS headers — the plugin falls back to a
+        // gray placeholder rect for this one image.
       }
     })
   )
   return map
 }
 
-async function buildFigmaSvg(root: Element): Promise<string> {
-  const rect = root.getBoundingClientRect()
-  const imgData = await inlineImages(root)
-  const out: string[] = []
-  elementToSvg(root, rect.left, rect.top, out, imgData)
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${rect.width.toFixed(
-    1
-  )}" height="${rect.height.toFixed(1)}" viewBox="0 0 ${rect.width.toFixed(
-    1
-  )} ${rect.height.toFixed(1)}">\n${out.join('\n')}\n</svg>`
+/** One DesignNode per contiguous run of an element's own (non-descendant)
+ * text, sized to the run's full wrapped bounding box (via Range) so the
+ * plugin can hand Figma's own text engine that box and let IT rewrap —
+ * far more reliable than us pre-computing line breaks by hand. */
+function textNodeFor(node: Text, style: CSSStyleDeclaration, parentRect: DOMRect): DesignNode | null {
+  const range = document.createRange()
+  range.selectNodeContents(node)
+  const r = range.getBoundingClientRect()
+  if (r.width <= 0 || r.height <= 0) return null
+  const characters = (node.textContent || '').trim()
+  if (!characters) return null
+  const color = figmaColor(style.color) ?? { r: 0, g: 0, b: 0, a: 1 }
+  const lh = style.lineHeight === 'normal' ? null : parseFloat(style.lineHeight)
+  return {
+    type: 'TEXT',
+    name: characters.slice(0, 24),
+    x: r.left - parentRect.left,
+    y: r.top - parentRect.top,
+    width: r.width,
+    height: r.height,
+    text: {
+      characters,
+      fontFamily: style.fontFamily.split(',')[0].replace(/["']/g, '').trim(),
+      fontWeight: fontWeightNumber(style.fontWeight),
+      italic: style.fontStyle === 'italic',
+      fontSize: parseFloat(style.fontSize) || 16,
+      lineHeight: Number.isNaN(lh as number) ? null : lh,
+      letterSpacing: parseFloat(style.letterSpacing) || 0,
+      align: mapTextAlign(style.textAlign),
+      case: mapTextCase(style.textTransform),
+      color,
+    },
+  }
 }
+
+function fontWeightNumber(computed: string): number {
+  const n = parseInt(computed, 10)
+  return Number.isNaN(n) ? 400 : n
+}
+
+const TREE_EXPORT_MAX_NODES = 1500
+
+function walkDesignTree(
+  el: Element,
+  parentRect: DOMRect | null,
+  imgData: Map<string, string>,
+  budget: { count: number }
+): DesignNode | null {
+  if (budget.count >= TREE_EXPORT_MAX_NODES) return null
+  if (!(el instanceof HTMLElement) && !(el instanceof SVGElement)) return null
+  const style = getComputedStyle(el)
+  if (style.display === 'none' || style.visibility === 'hidden') return null
+
+  const rect = el.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  budget.count++
+  const x = parentRect ? rect.left - parentRect.left : 0
+  const y = parentRect ? rect.top - parentRect.top : 0
+  const { name } = layerName(el)
+
+  if (el instanceof SVGElement) {
+    return { type: 'VECTOR', name, x, y, width: rect.width, height: rect.height, vector: { svg: el.outerHTML } }
+  }
+
+  if (el instanceof HTMLImageElement && el.src) {
+    return {
+      type: 'IMAGE',
+      name,
+      x,
+      y,
+      width: rect.width,
+      height: rect.height,
+      image: { dataUrl: imgData.get(el.src) ?? null },
+    }
+  }
+
+  const node: DesignNode = { type: 'FRAME', name, x, y, width: rect.width, height: rect.height }
+
+  const bg = figmaColor(style.backgroundColor)
+  if (bg) node.fill = bg
+
+  const borderWidth = parseFloat(style.borderTopWidth) || 0
+  if (borderWidth > 0 && style.borderTopStyle !== 'none') {
+    const bc = figmaColor(style.borderTopColor)
+    if (bc) {
+      node.stroke = bc
+      node.strokeWeight = borderWidth
+    }
+  }
+
+  const radii = cornerRadii(style)
+  if (radii.some((r) => r > 0)) node.cornerRadius = radii
+
+  const opacity = parseFloat(style.opacity)
+  if (!Number.isNaN(opacity) && opacity < 1) node.opacity = opacity
+
+  if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
+    node.clip = true
+  }
+
+  if (style.display.includes('flex')) {
+    node.layout = {
+      direction: style.flexDirection.startsWith('column') ? 'VERTICAL' : 'HORIZONTAL',
+      gap: parseFloat(style.columnGap) || parseFloat(style.rowGap) || 0,
+      padding: [
+        parseFloat(style.paddingTop) || 0,
+        parseFloat(style.paddingRight) || 0,
+        parseFloat(style.paddingBottom) || 0,
+        parseFloat(style.paddingLeft) || 0,
+      ],
+      primary: mapJustify(style.justifyContent),
+      counter: mapAlign(style.alignItems),
+      wrap: style.flexWrap === 'wrap',
+    }
+  }
+
+  const children: DesignNode[] = []
+  for (const child of Array.from(el.childNodes)) {
+    if (budget.count >= TREE_EXPORT_MAX_NODES) break
+    if (child.nodeType === Node.TEXT_NODE && (child.textContent || '').trim()) {
+      const t = textNodeFor(child as Text, style, rect)
+      if (t) {
+        budget.count++
+        children.push(t)
+      }
+    } else if (child.nodeType === Node.ELEMENT_NODE) {
+      const sub = walkDesignTree(child as Element, rect, imgData, budget)
+      if (sub) {
+        const childStyle = getComputedStyle(child as Element)
+        sub.sizing = { h: sizingFor(childStyle), v: sizingFor(childStyle) }
+        children.push(sub)
+      }
+    }
+  }
+  if (children.length) node.children = children
+  return node
+}
+
+async function buildFigmaTree(root: Element): Promise<{ pointerExport: 1; root: DesignNode | null }> {
+  const imgData = await inlineImages(root)
+  const tree = walkDesignTree(root, null, imgData, { count: 0 })
+  return { pointerExport: 1, root: tree }
+}
+
 
 // ---------- messages from the side panel ----------
 
@@ -2051,14 +2089,14 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       sendResponse({ ok: true, comments })
       break
     }
-    case 'PTR_EXPORT_SVG': {
+    case 'PTR_EXPORT_DESIGN': {
       const el = getEl(msg.elementId)
       if (!el) {
         sendResponse({ ok: false })
         break
       }
-      buildFigmaSvg(el)
-        .then((svg) => sendResponse({ ok: true, svg }))
+      buildFigmaTree(el)
+        .then((design) => sendResponse({ ok: true, design }))
         .catch(() => sendResponse({ ok: false }))
       return true // keep the channel open for the async response
     }

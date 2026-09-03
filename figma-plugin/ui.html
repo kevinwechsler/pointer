@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 12px;
+        font: 12px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #1a1a1a;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      p.hint {
+        margin: 0;
+        color: #666;
+      }
+      textarea {
+        width: 100%;
+        height: 110px;
+        resize: none;
+        font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        outline: none;
+      }
+      textarea:focus {
+        border-color: #18a0fb;
+      }
+      button {
+        background: #18a0fb;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font: 600 12px/1 -apple-system, sans-serif;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #ccc;
+        cursor: default;
+      }
+      #status {
+        min-height: 32px;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      #status.error {
+        color: #d1293d;
+      }
+      #status.ok {
+        color: #1a7f37;
+      }
+      #status .note {
+        color: #806a00;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <p class="hint">
+      In Pointer, select an element and hit <strong>Copy for Figma</strong>. Then paste
+      here (⌘V) and import.
+    </p>
+    <textarea id="input" placeholder="Paste the copied design here…" autofocus></textarea>
+    <button id="importBtn">Import to Figma</button>
+    <div id="status"></div>
+
+    <script>
+      const input = document.getElementById('input');
+      const status = document.getElementById('status');
+      const importBtn = document.getElementById('importBtn');
+
+      function runImport() {
+        const json = input.value.trim();
+        if (!json) return;
+        status.className = '';
+        status.textContent = 'Building layers…';
+        importBtn.disabled = true;
+        parent.postMessage({ pluginMessage: { type: 'import', json } }, '*');
+      }
+
+      importBtn.addEventListener('click', runImport);
+
+      // Paste-and-go: importing immediately after a paste means one less
+      // click for the common case of "just did Copy for Figma".
+      input.addEventListener('paste', () => {
+        setTimeout(runImport, 0);
+      });
+
+      window.addEventListener('message', (event) => {
+        const msg = event.data.pluginMessage;
+        if (!msg) return;
+        importBtn.disabled = false;
+        if (msg.type === 'done') {
+          status.className = 'ok';
+          status.innerHTML =
+            'Imported — selected and centered in view.' +
+            (msg.notes || []).map((n) => `<span class="note">${n}</span>`).join('');
+        } else if (msg.type === 'error') {
+          status.className = 'error';
+          status.textContent = msg.message;
+        }
+      });
+    </script>
+  </body>
+</html>

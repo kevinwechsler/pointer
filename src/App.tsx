@@ -1663,12 +1663,19 @@ export default function App() {
   // file instead of a giant clipboard blob. Not a hard OS/clipboard limit.
   const PROMPT_DOWNLOAD_THRESHOLD = 20_000
 
+  // Copies a design-tree JSON (frames/auto-layout/text, not shapes glued
+  // together by SVG coordinates) for the companion Figma plugin — see
+  // figma-plugin/ in this repo — to paste with real, editable layers.
   async function copyForFigma() {
     if (!selection) return
     try {
-      const r = await sendToPage({ type: 'PTR_EXPORT_SVG', frameToken: selection.frameToken, elementId: selection.elementId })
-      if (!r?.svg) throw new Error('no svg')
-      await navigator.clipboard.writeText(r.svg)
+      const r = await sendToPage({
+        type: 'PTR_EXPORT_DESIGN',
+        frameToken: selection.frameToken,
+        elementId: selection.elementId,
+      })
+      if (!r?.design) throw new Error('no design')
+      await navigator.clipboard.writeText(JSON.stringify(r.design))
       setFigmaCopied(true)
       setTimeout(() => setFigmaCopied(false), 1500)
     } catch {
@@ -2151,7 +2158,12 @@ export default function App() {
                   >
                     <Trash2 className="size-3.5" />
                   </Button>
-                  <Button size="sm" variant="outline" onClick={copyForFigma} title="Copy for Figma">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={copyForFigma}
+                    title="Copy for the Pointer Figma plugin (see figma-plugin/ in the repo)"
+                  >
                     {figmaCopied ? <Check className="size-3.5" /> : <Layers className="size-3.5" />}
                   </Button>
                   <Button size="sm" variant="outline" onClick={deselect} title="Deselect (Esc)">

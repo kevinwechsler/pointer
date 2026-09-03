@@ -27,6 +27,13 @@ Then in Chrome:
 
 After making code changes, run `npm run build` again and hit the refresh icon on the extension card.
 
+## Send a selection to Figma
+
+Select an element and hit **Copy for Figma** in the panel. It copies a real
+design tree (frames, auto layout, text — not an SVG), which the companion
+Figma plugin turns into native layers. See [`figma-plugin/README.md`](figma-plugin/README.md)
+for one-time setup (loading a local dev plugin, no publishing needed).
+
 ## Known limitations (v1)
 
 - File/line resolution relies on React dev-mode debug info. Newer React versions (19+) removed part of this, so some apps will fall back to selector-based references — still precise, just not file-exact.
