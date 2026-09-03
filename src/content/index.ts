@@ -192,10 +192,12 @@ function positionBox(box: HTMLDivElement, el: Element) {
     width: `${r.width}px`,
     height: `${r.height}px`,
   })
+  if (box === selectBox) positionHandles(el)
 }
 
 function hideBox(box: HTMLDivElement | null) {
   if (box) box.style.display = 'none'
+  if (box && box === selectBox) hideHandles()
 }
 
 // ---------- element identity ----------
@@ -477,6 +479,8 @@ function readInline(el: Element): Record<string, string> {
 }
 
 function selectElement(el: Element) {
+  if (editingEl && editingEl !== el) exitTextEdit(true)
+  hidePadBand()
   selectedEl = el
   ensureOverlay()
   positionBox(selectBox!, el)
@@ -1500,7 +1504,8 @@ function onMouseMove(e: MouseEvent) {
   if (!active && !commentMode) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
   if (!el) return
-  if (el instanceof HTMLElement && el.dataset.pointerPin) return
+  if (isPointerUi(el)) return
+  if (editingEl) return
 
   if (active && !commentMode && e.altKey) {
     hoverEl = el
@@ -1512,6 +1517,7 @@ function onMouseMove(e: MouseEvent) {
     return
   }
   hideMeasure()
+  updatePaddingHover(e.clientX, e.clientY)
   if (el === hoverEl || el === hoverBox || el === hoverLabel) return
   hoverEl = el
   ensureOverlay()
@@ -1534,7 +1540,7 @@ let stackIndex = 0
 function elementAtWithCycle(x: number, y: number): Element | null {
   const stack = document
     .elementsFromPoint(x, y)
-    .filter((el) => el !== hoverBox && el !== selectBox && el !== hoverLabel)
+    .filter((el) => el !== hoverBox && el !== selectBox && el !== hoverLabel && !isPointerUi(el))
   if (!stack.length) return null
   const samePoint = stackPoint && stackPoint.x === x && stackPoint.y === y
   stackIndex = samePoint ? (stackIndex + 1) % stack.length : 0
@@ -1566,9 +1572,10 @@ let dragState: {
 
 function onMouseDown(e: MouseEvent) {
   if (!active || commentMode || e.button !== 0 || e.altKey) return
-  if (!selectedEl) return
+  if (!selectedEl || editingEl) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
-  if (!el || (el !== selectedEl && !selectedEl.contains(el))) return
+  if (!el || isPointerUi(el)) return
+  if (el !== selectedEl && !selectedEl.contains(el)) return
   const id = registerEl(selectedEl)
   const base = getTransformParts(id)
   dragState = {
@@ -1619,8 +1626,14 @@ function onMouseUp() {
 function onClick(e: MouseEvent) {
   if (!active && !commentMode) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
-  // Pins have their own click handler; let it run instead of selecting.
-  if (el instanceof HTMLElement && el.dataset.pointerPin) return
+  // Pins, resize handles and padding bands have their own handlers.
+  if (isPointerUi(el)) return
+  // Clicking inside text being edited just moves the caret; clicking
+  // anywhere else finishes that edit first, then selects as usual.
+  if (editingEl) {
+    if (el && editingEl.contains(el)) return
+    exitTextEdit(true)
+  }
   e.preventDefault()
   e.stopPropagation()
   stackPoint = null
@@ -1664,6 +1677,7 @@ function setCommentMode(on: boolean) {
 }
 
 function onScrollOrResize() {
+  hidePadBand()
   if (selectedEl && selectBox) positionBox(selectBox, selectedEl)
   if (selectedEl) drawGridOverlay(selectedEl)
   clearHighlight()
@@ -1685,13 +1699,498 @@ function setCursorOverride(on: boolean) {
     if (cursorOverrideStyle) return
     cursorOverrideStyle = document.createElement('style')
     cursorOverrideStyle.textContent =
-      '*, *::before, *::after { cursor: crosshair !important; } [data-pointer-pin] { cursor: pointer !important; }'
+      '*, *::before, *::after { cursor: crosshair !important; }' +
+      ' [data-pointer-pin] { cursor: pointer !important; }' +
+      ' [data-ptr-cursor="ew"] { cursor: ew-resize !important; }' +
+      ' [data-ptr-cursor="ns"] { cursor: ns-resize !important; }' +
+      ' [data-ptr-cursor="nwse"] { cursor: nwse-resize !important; }' +
+      ' [data-ptr-cursor="nesw"] { cursor: nesw-resize !important; }' +
+      ' [data-ptr-cursor="text"], [data-ptr-cursor="text"] * { cursor: text !important; }'
     document.documentElement.appendChild(cursorOverrideStyle)
   } else {
     cursorOverrideStyle?.remove()
     cursorOverrideStyle = null
   }
 }
+
+// ---------- direct manipulation on the page (Figma-style) ----------
+// Resize handles on the selection, draggable padding bands, and in-place
+// text editing on double-click. Everything goes through the same pristine
+// snapshots as panel edits (applyStyle / setTransform / text pristine), so
+// Changes-tab revert and Clear all already cover it, and the panel is
+// notified so its fields, history and the prompt stay in sync.
+
+const pf = (v: string) => parseFloat(v) || 0
+
+/** Our own overlay nodes (handles, bands, pins): never selectable, never
+ * hover targets, never drag starts. */
+function isPointerUi(el: Element | null): boolean {
+  return (
+    !!el &&
+    el instanceof HTMLElement &&
+    (el.dataset.pointerUi !== undefined || el.dataset.pointerPin !== undefined)
+  )
+}
+
+function makeUiNode(cursor: string, extra: Partial<CSSStyleDeclaration>): HTMLDivElement {
+  const n = document.createElement('div')
+  n.dataset.pointerUi = '1'
+  if (cursor) n.dataset.ptrCursor = cursor
+  Object.assign(n.style, {
+    position: 'fixed',
+    zIndex: '2147483646',
+    display: 'none',
+    boxSizing: 'border-box',
+    ...extra,
+  })
+  document.documentElement.appendChild(n)
+  return n
+}
+
+// --- resize handles ---
+type HandleSide = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
+const HANDLE_DEFS: { side: HandleSide; cursor: string; w: number; h: number }[] = [
+  { side: 'nw', cursor: 'nwse', w: 8, h: 8 },
+  { side: 'ne', cursor: 'nesw', w: 8, h: 8 },
+  { side: 'sw', cursor: 'nesw', w: 8, h: 8 },
+  { side: 'se', cursor: 'nwse', w: 8, h: 8 },
+  { side: 'n', cursor: 'ns', w: 16, h: 5 },
+  { side: 's', cursor: 'ns', w: 16, h: 5 },
+  { side: 'w', cursor: 'ew', w: 5, h: 16 },
+  { side: 'e', cursor: 'ew', w: 5, h: 16 },
+]
+const handles: { side: HandleSide; w: number; h: number; el: HTMLDivElement }[] = []
+let sizeLabel: HTMLDivElement | null = null
+
+function ensureHandles() {
+  if (handles.length) return
+  for (const d of HANDLE_DEFS) {
+    const el = makeUiNode(d.cursor, {
+      width: `${d.w}px`,
+      height: `${d.h}px`,
+      background: '#fff',
+      border: '1.5px solid #3b82f6',
+      borderRadius: '2px',
+      pointerEvents: 'auto',
+      zIndex: '2147483647',
+    })
+    el.addEventListener('mousedown', (e) => startResize(e, d.side))
+    handles.push({ side: d.side, w: d.w, h: d.h, el })
+  }
+  sizeLabel = makeUiNode('', {
+    background: '#3b82f6',
+    color: '#fff',
+    font: 'bold 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
+    padding: '1px 6px',
+    borderRadius: '4px',
+    pointerEvents: 'none',
+    zIndex: '2147483647',
+    whiteSpace: 'nowrap',
+  })
+}
+
+function positionHandles(el: Element) {
+  ensureHandles()
+  const r = el.getBoundingClientRect()
+  const cx = r.left + r.width / 2
+  const cy = r.top + r.height / 2
+  for (const h of handles) {
+    let x = cx
+    let y = cy
+    if (h.side.includes('w')) x = r.left
+    if (h.side.includes('e')) x = r.right
+    if (h.side.includes('n')) y = r.top
+    if (h.side.includes('s')) y = r.bottom
+    Object.assign(h.el.style, {
+      display: 'block',
+      left: `${x - h.w / 2}px`,
+      top: `${y - h.h / 2}px`,
+    })
+  }
+}
+
+function hideHandles() {
+  for (const h of handles) h.el.style.display = 'none'
+  if (sizeLabel) sizeLabel.style.display = 'none'
+}
+
+function showSizeLabel(el: Element) {
+  if (!sizeLabel) return
+  const r = el.getBoundingClientRect()
+  sizeLabel.textContent = `${Math.round(r.width)} × ${Math.round(r.height)}`
+  Object.assign(sizeLabel.style, {
+    display: 'block',
+    left: `${r.left + r.width / 2 - 28}px`,
+    top: `${r.bottom + 8}px`,
+  })
+}
+
+let resizeState: {
+  id: number
+  side: HandleSide
+  startX: number
+  startY: number
+  startW: number
+  startH: number
+  startDx: number
+  startDy: number
+  // padding+border to subtract when the element sizes its content box
+  chromeW: number
+  chromeH: number
+  from: Record<string, string>
+} | null = null
+
+function startResize(e: MouseEvent, side: HandleSide) {
+  if (!selectedEl || e.button !== 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  exitTextEdit(true)
+  hidePadBand()
+  const el = selectedEl
+  const id = registerEl(el)
+  const r = el.getBoundingClientRect()
+  const cs = getComputedStyle(el)
+  const contentBox = cs.boxSizing !== 'border-box'
+  const t = getTransformParts(id)
+  resizeState = {
+    id,
+    side,
+    startX: e.clientX,
+    startY: e.clientY,
+    startW: r.width,
+    startH: r.height,
+    startDx: t.dx,
+    startDy: t.dy,
+    chromeW: contentBox
+      ? pf(cs.paddingLeft) + pf(cs.paddingRight) + pf(cs.borderLeftWidth) + pf(cs.borderRightWidth)
+      : 0,
+    chromeH: contentBox
+      ? pf(cs.paddingTop) + pf(cs.paddingBottom) + pf(cs.borderTopWidth) + pf(cs.borderBottomWidth)
+      : 0,
+    from: { width: cs.width, height: cs.height, transform: composeTransform(t), flexGrow: cs.flexGrow },
+  }
+  // A Fill-sized flex child ignores an explicit width; pin it so the drag
+  // actually sticks (this is what the panel's "Fixed" does too).
+  if (pf(cs.flexGrow) > 0 && (side.includes('e') || side.includes('w'))) applyStyle(id, 'flex-grow', '0')
+  window.addEventListener('mousemove', onResizeMove, true)
+  window.addEventListener('mouseup', onResizeUp, true)
+}
+
+function onResizeMove(e: MouseEvent) {
+  const s = resizeState
+  if (!s) return
+  e.preventDefault()
+  const dx = e.clientX - s.startX
+  const dy = e.clientY - s.startY
+  let w = s.startW
+  let h = s.startH
+  let tx = s.startDx
+  let ty = s.startDy
+  if (s.side.includes('e')) w = s.startW + dx
+  // Dragging the left/top edge keeps the opposite edge where it is, like
+  // Figma: shrink/grow, then shift by the same amount.
+  if (s.side.includes('w')) {
+    w = s.startW - dx
+    tx = s.startDx + dx
+  }
+  if (s.side.includes('s')) h = s.startH + dy
+  if (s.side.includes('n')) {
+    h = s.startH - dy
+    ty = s.startDy + dy
+  }
+  w = Math.max(1, Math.round(w))
+  h = Math.max(1, Math.round(h))
+  if (s.side.includes('e') || s.side.includes('w')) applyStyle(s.id, 'width', `${Math.max(0, w - s.chromeW)}px`)
+  if (s.side.includes('n') || s.side.includes('s')) applyStyle(s.id, 'height', `${Math.max(0, h - s.chromeH)}px`)
+  if (tx !== s.startDx || ty !== s.startDy) setTransform(s.id, { dx: tx, dy: ty })
+  const el = getEl(s.id)
+  if (el) showSizeLabel(el)
+}
+
+function onResizeUp() {
+  const s = resizeState
+  resizeState = null
+  window.removeEventListener('mousemove', onResizeMove, true)
+  window.removeEventListener('mouseup', onResizeUp, true)
+  if (sizeLabel) sizeLabel.style.display = 'none'
+  if (!s) return
+  const el = getEl(s.id)
+  if (!el) return
+  const cs = getComputedStyle(el)
+  const now: Record<string, string> = {
+    width: cs.width,
+    height: cs.height,
+    transform: composeTransform(getTransformParts(s.id)),
+    flexGrow: cs.flexGrow,
+  }
+  const changes = Object.keys(now)
+    .filter((k) => now[k] !== s.from[k])
+    .map((k) => ({ prop: k, from: s.from[k], to: now[k] }))
+  if (changes.length) {
+    chrome.runtime.sendMessage({
+      type: 'PTR_STYLES_CHANGED',
+      payload: { target: buildPayload(el), changes },
+    })
+  }
+}
+
+// --- padding bands ---
+type PadSide = 'top' | 'right' | 'bottom' | 'left'
+const OPPOSITE: Record<PadSide, PadSide> = { top: 'bottom', bottom: 'top', left: 'right', right: 'left' }
+let padBand: HTMLDivElement | null = null
+let padBadge: HTMLDivElement | null = null
+let padHoverSide: PadSide | null = null
+let padDrag: {
+  id: number
+  side: PadSide
+  startPos: number
+  startVal: number
+  startOpp: number
+  alt: boolean
+  from: Record<string, string>
+} | null = null
+
+function ensurePadUi() {
+  if (padBand) return
+  padBand = makeUiNode('ns', {
+    background:
+      'repeating-linear-gradient(45deg, rgba(59,130,246,0.38) 0 2px, rgba(59,130,246,0.10) 2px 7px)',
+    pointerEvents: 'auto',
+  })
+  padBand.addEventListener('mousedown', startPadDrag)
+  padBand.addEventListener('mouseleave', () => {
+    if (!padDrag) hidePadBand()
+  })
+  padBadge = makeUiNode('', {
+    background: '#3b82f6',
+    color: '#fff',
+    font: 'bold 10px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
+    padding: '1px 5px',
+    borderRadius: '3px',
+    pointerEvents: 'none',
+    zIndex: '2147483647',
+  })
+}
+
+function hidePadBand() {
+  padHoverSide = null
+  if (padBand) padBand.style.display = 'none'
+  if (padBadge) padBadge.style.display = 'none'
+}
+
+/** Geometry of one padding band of the selected element, in viewport px. */
+function padBandRect(el: Element, side: PadSide) {
+  const r = el.getBoundingClientRect()
+  const cs = getComputedStyle(el)
+  const t = pf(cs.paddingTop)
+  const rt = pf(cs.paddingRight)
+  const b = pf(cs.paddingBottom)
+  const l = pf(cs.paddingLeft)
+  const val = { top: t, right: rt, bottom: b, left: l }[side]
+  const rect =
+    side === 'top'
+      ? { left: r.left, top: r.top, width: r.width, height: t }
+      : side === 'bottom'
+        ? { left: r.left, top: r.bottom - b, width: r.width, height: b }
+        : side === 'left'
+          ? { left: r.left, top: r.top + t, width: l, height: Math.max(0, r.height - t - b) }
+          : { left: r.right - rt, top: r.top + t, width: rt, height: Math.max(0, r.height - t - b) }
+  return { rect, val }
+}
+
+function showPadBand(el: Element, side: PadSide) {
+  ensurePadUi()
+  const { rect, val } = padBandRect(el, side)
+  padHoverSide = side
+  padBand!.dataset.ptrCursor = side === 'top' || side === 'bottom' ? 'ns' : 'ew'
+  Object.assign(padBand!.style, {
+    display: 'block',
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+  })
+  padBadge!.textContent = `${Math.round(val)}`
+  Object.assign(padBadge!.style, {
+    display: 'block',
+    left: `${rect.left + rect.width / 2 - 10}px`,
+    top: `${rect.top + rect.height / 2 - 9}px`,
+  })
+}
+
+// Hovering inside the selected element's padding lights that band up
+// (hatched, with its value) and turns the cursor into a resize arrow; the
+// band itself then takes the mousedown to start the drag.
+function updatePaddingHover(x: number, y: number) {
+  if (!selectedEl || padDrag || resizeState || editingEl) return
+  const el = selectedEl
+  const r = el.getBoundingClientRect()
+  if (x < r.left || x > r.right || y < r.top || y > r.bottom) {
+    hidePadBand()
+    return
+  }
+  const cs = getComputedStyle(el)
+  const t = pf(cs.paddingTop)
+  const rt = pf(cs.paddingRight)
+  const b = pf(cs.paddingBottom)
+  const l = pf(cs.paddingLeft)
+  let side: PadSide | null = null
+  if (t > 0 && y - r.top <= t) side = 'top'
+  else if (b > 0 && r.bottom - y <= b) side = 'bottom'
+  else if (l > 0 && x - r.left <= l) side = 'left'
+  else if (rt > 0 && r.right - x <= rt) side = 'right'
+  if (!side) {
+    hidePadBand()
+    return
+  }
+  if (side !== padHoverSide) showPadBand(el, side)
+}
+
+function startPadDrag(e: MouseEvent) {
+  if (!selectedEl || !padHoverSide || e.button !== 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  const el = selectedEl
+  const id = registerEl(el)
+  const cs = getComputedStyle(el)
+  const side = padHoverSide
+  const prop = (s: PadSide) => `padding${s[0].toUpperCase()}${s.slice(1)}` as keyof CSSStyleDeclaration
+  padDrag = {
+    id,
+    side,
+    startPos: side === 'top' || side === 'bottom' ? e.clientY : e.clientX,
+    startVal: pf(cs[prop(side)] as string),
+    startOpp: pf(cs[prop(OPPOSITE[side])] as string),
+    alt: e.altKey,
+    from: {
+      paddingTop: cs.paddingTop,
+      paddingRight: cs.paddingRight,
+      paddingBottom: cs.paddingBottom,
+      paddingLeft: cs.paddingLeft,
+    },
+  }
+  window.addEventListener('mousemove', onPadMove, true)
+  window.addEventListener('mouseup', onPadUp, true)
+}
+
+function onPadMove(e: MouseEvent) {
+  const d = padDrag
+  if (!d) return
+  e.preventDefault()
+  const pos = d.side === 'top' || d.side === 'bottom' ? e.clientY : e.clientX
+  const delta = pos - d.startPos
+  // Dragging a band inward (away from its edge) grows that padding.
+  const grows = d.side === 'top' || d.side === 'left' ? delta : -delta
+  const v = Math.max(0, Math.round(d.startVal + grows))
+  applyStyle(d.id, `padding-${d.side}`, `${v}px`)
+  // Alt: the opposite side follows, Figma-style.
+  if (d.alt || e.altKey) applyStyle(d.id, `padding-${OPPOSITE[d.side]}`, `${v}px`)
+  const el = getEl(d.id)
+  if (el) showPadBand(el, d.side)
+}
+
+function onPadUp() {
+  const d = padDrag
+  padDrag = null
+  window.removeEventListener('mousemove', onPadMove, true)
+  window.removeEventListener('mouseup', onPadUp, true)
+  hidePadBand()
+  if (!d) return
+  const el = getEl(d.id)
+  if (!el) return
+  const cs = getComputedStyle(el)
+  const now: Record<string, string> = {
+    paddingTop: cs.paddingTop,
+    paddingRight: cs.paddingRight,
+    paddingBottom: cs.paddingBottom,
+    paddingLeft: cs.paddingLeft,
+  }
+  const changes = Object.keys(now)
+    .filter((k) => now[k] !== d.from[k])
+    .map((k) => ({ prop: k, from: d.from[k], to: now[k] }))
+  if (changes.length) {
+    chrome.runtime.sendMessage({
+      type: 'PTR_STYLES_CHANGED',
+      payload: { target: buildPayload(el), changes },
+    })
+  }
+}
+
+// --- in-place text editing ---
+let editingEl: HTMLElement | null = null
+let editingFrom = ''
+
+function onDblClick(e: MouseEvent) {
+  if (!active) return
+  const el = document.elementFromPoint(e.clientX, e.clientY)
+  if (!(el instanceof HTMLElement) || isPointerUi(el)) return
+  // Only a text leaf: editing a container's joined text would wipe its
+  // children (see buildPayload).
+  if (el.children.length > 0 || !(el.textContent || '').trim()) return
+  e.preventDefault()
+  e.stopPropagation()
+  if (editingEl && editingEl !== el) exitTextEdit(true)
+  if (el !== selectedEl) selectElement(el)
+  startTextEdit(el, e.clientX, e.clientY)
+}
+
+function startTextEdit(el: HTMLElement, x: number, y: number) {
+  const id = registerEl(el)
+  const p = ensurePristine(id)
+  if (p.text === null) p.text = el.innerText // so Changes-tab revert works
+  editingEl = el
+  editingFrom = el.innerText
+  el.setAttribute('contenteditable', 'true')
+  el.dataset.ptrCursor = 'text'
+  el.focus()
+  // Caret where you double-clicked, not at the start.
+  const range = document.caretRangeFromPoint?.(x, y)
+  if (range) {
+    const sel = window.getSelection()
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  }
+  el.addEventListener('keydown', onEditKeyDown)
+  el.addEventListener('blur', onEditBlur)
+  hidePadBand()
+}
+
+function onEditKeyDown(e: KeyboardEvent) {
+  // Keep Pointer's own shortcuts (arrows, Delete, Cmd+D…) out of the text.
+  e.stopPropagation()
+  if (e.key === 'Escape' || (e.key === 'Enter' && !e.shiftKey)) {
+    e.preventDefault()
+    exitTextEdit(true)
+  } else if (e.key === 'Enter') {
+    // A line break would insert a child element and stop this being a text
+    // leaf; keep in-place edits single-line (use the panel for more).
+    e.preventDefault()
+  }
+}
+
+function onEditBlur() {
+  exitTextEdit(true)
+}
+
+function exitTextEdit(commit: boolean) {
+  const el = editingEl
+  if (!el) return
+  editingEl = null
+  el.removeEventListener('keydown', onEditKeyDown)
+  el.removeEventListener('blur', onEditBlur)
+  el.removeAttribute('contenteditable')
+  delete el.dataset.ptrCursor
+  window.getSelection()?.removeAllRanges()
+  const to = el.innerText
+  if (commit && to !== editingFrom) {
+    chrome.runtime.sendMessage({
+      type: 'PTR_TEXT_EDITED',
+      payload: { target: buildPayload(el), from: editingFrom, to },
+    })
+  }
+  if (selectedEl === el && selectBox) positionBox(selectBox, el)
+}
+
 
 function setActive(on: boolean) {
   // Host chrome never inspects; the app's iframe does.
@@ -1707,6 +2206,7 @@ function setActive(on: boolean) {
     document.addEventListener('mouseup', onMouseUp, true)
     document.addEventListener('click', onClick, true)
     document.addEventListener('contextmenu', onContextMenu, true)
+    document.addEventListener('dblclick', onDblClick, true)
     document.addEventListener('keydown', onKeyDown, true)
     document.addEventListener('keyup', onKeyUp, true)
     window.addEventListener('scroll', onScrollOrResize, true)
@@ -1719,7 +2219,13 @@ function setActive(on: boolean) {
     document.removeEventListener('mouseup', onMouseUp, true)
     document.removeEventListener('click', onClick, true)
     document.removeEventListener('contextmenu', onContextMenu, true)
+    document.removeEventListener('dblclick', onDblClick, true)
     document.removeEventListener('keydown', onKeyDown, true)
+    exitTextEdit(true)
+    hideHandles()
+    hidePadBand()
+    resizeState = null
+    padDrag = null
     document.removeEventListener('keyup', onKeyUp, true)
     dragState = null
     window.removeEventListener('scroll', onScrollOrResize, true)

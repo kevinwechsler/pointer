@@ -1254,7 +1254,9 @@ export default function App() {
         upsertEdit(target, 'style', 'transform', from, value)
         if (selection?.elementId === elementId) setDraft((d) => ({ ...d, transform: value }))
       }
-      if (msg.type === 'PTR_STYLE_PASTED') {
+      // Style pasted with V, or changed directly on the page (resize handles,
+      // padding bands): same shape, same bookkeeping.
+      if (msg.type === 'PTR_STYLE_PASTED' || msg.type === 'PTR_STYLES_CHANGED') {
         const { target, changes } = msg.payload as {
           target: SelectionPayload
           changes: { prop: string; from: string; to: string }[]
@@ -1264,11 +1266,22 @@ export default function App() {
           upsertEdit(target, 'style', c.prop, c.from, c.to)
         }
         if (selection?.elementId === target.elementId) {
+          // Fresh payload so W/H, position and inline sizing reflect the drag.
+          setSelection(target)
           setDraft((d) => {
             const next = { ...d }
             for (const c of changes) next[c.prop] = c.to
             return next
           })
+        }
+      }
+      if (msg.type === 'PTR_TEXT_EDITED') {
+        const { target, from, to } = msg.payload as { target: SelectionPayload; from: string; to: string }
+        pushHistory({ frameToken: target.frameToken, elementId: target.elementId, kind: 'text', prop: 'text', from, to })
+        upsertEdit(target, 'text', 'text', from, to)
+        if (selection?.elementId === target.elementId) {
+          setSelection(target)
+          setText(to)
         }
       }
     }
@@ -3153,6 +3166,9 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: 'Editing',
     items: [
+      { keys: 'Double-click text', desc: 'Edit it right on the page (Enter or Esc to finish)' },
+      { keys: 'Drag a corner or edge', desc: 'Resize the selected element' },
+      { keys: 'Drag a padding area', desc: "Change that side's padding (hold Alt to change both sides)" },
       { keys: 'Arrow keys', desc: 'Nudge the selected element 1px' },
       { keys: 'Shift + Arrow keys', desc: 'Nudge the selected element 10px' },
       { keys: 'Cmd + [', desc: 'Move the selected element earlier among its siblings' },
