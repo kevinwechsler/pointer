@@ -1710,16 +1710,15 @@ export default function App() {
   async function applyOp(op: HistoryOp, value: string) {
     try {
       if (op.kind === 'move') {
-        // Undo/redo of a reorder is just the same step in the other
-        // direction — derived from whether we're heading back to `from`.
-        const undoing = value === op.from
-        const wentForward = Number(op.to) > Number(op.from)
-        const dir = undoing === wentForward ? 'prev' : 'next'
+        // Jump straight to the exact index rather than nudging one sibling
+        // at a time — the original move (a canvas drag, or "move to end")
+        // can span several positions in one go, and a single prev/next step
+        // would land undo/redo on the wrong element entirely.
         await sendToPage({
-          type: 'PTR_MOVE_ELEMENT',
+          type: 'PTR_MOVE_TO_INDEX',
           frameToken: op.frameToken,
           elementId: op.elementId,
-          dir,
+          index: Number(value),
         })
       } else if (op.kind === 'text') {
         await sendToPage({ type: 'PTR_SET_TEXT', frameToken: op.frameToken, elementId: op.elementId, value })

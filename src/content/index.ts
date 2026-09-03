@@ -585,6 +585,28 @@ function moveToEdge(
   return { ok: true, from, to, parentDesc: shortDescriptor(parent) }
 }
 
+/** Moves an element to an exact sibling index within its current parent —
+ * unlike moveElement/moveToEdge (one adjacent step at a time), this can
+ * jump straight to any position. It's what undo/redo replay a 'move' op
+ * with: a canvas drag or "move to end" can jump several positions in one
+ * user action, and undoing that needs to land back on the exact original
+ * index, not just take one step in the right direction. */
+function moveElementToIndex(id: number, index: number): { ok: boolean } {
+  const el = getEl(id)
+  const parent = el?.parentElement
+  if (!el || !parent) return { ok: false }
+  const siblings = Array.from(parent.children).filter((c) => c !== el)
+  const refNode = index < siblings.length ? siblings[index] : null
+  if (el === refNode) return { ok: true } // already exactly there
+  if (!movePristine.has(id)) {
+    movePristine.set(id, { parent, nextSibling: el.nextSibling })
+  }
+  parent.insertBefore(el, refNode)
+  if (selectedEl === el && selectBox) positionBox(selectBox, el)
+  schedulePinUpdate()
+  return { ok: true }
+}
+
 // Arbitrary drag-and-drop reordering from the Layers tab — not limited to
 // swapping with an adjacent sibling like moveElement/moveToEdge (those back
 // the Position tab's Back/Forward buttons), this can also move an element
@@ -1633,6 +1655,43 @@ let dragState: {
   moved: boolean
 } | null = null
 
+// Dragging a normal flow child reorders it among its siblings — live, as
+// you drag past them — instead of nudging an X/Y that layout would just
+// override anyway. Only an out-of-flow element (position: absolute/fixed)
+// gets the real XY drag above.
+let reorderDragState: {
+  id: number
+  startX: number
+  startY: number
+  startParent: Element
+  startIndex: number
+  moved: boolean
+} | null = null
+
+/** Which sibling the cursor is nearest to, and whether the dragged element
+ * should land before or after it — compared along whichever axis the
+ * container actually lays its children out on. */
+function findReorderTarget(
+  el: Element,
+  parent: Element,
+  x: number,
+  y: number
+): { target: Element; position: 'before' | 'after' } | null {
+  const siblings = Array.from(parent.children).filter((c) => c !== el && !isPointerUi(c))
+  if (!siblings.length) return null
+  const cs = getComputedStyle(parent)
+  const horizontal = cs.display.includes('flex') && !cs.flexDirection.startsWith('column')
+  let best: { target: Element; dist: number; before: boolean } | null = null
+  for (const sib of siblings) {
+    const r = sib.getBoundingClientRect()
+    const mid = horizontal ? r.left + r.width / 2 : r.top + r.height / 2
+    const pos = horizontal ? x : y
+    const dist = Math.abs(pos - mid)
+    if (!best || dist < best.dist) best = { target: sib, dist, before: pos < mid }
+  }
+  return best && { target: best.target, position: best.before ? 'before' : 'after' }
+}
+
 function onMouseDown(e: MouseEvent) {
   if (!active || commentMode || e.button !== 0 || e.altKey) return
   if (!selectedEl || editingEl) return
@@ -1640,50 +1699,102 @@ function onMouseDown(e: MouseEvent) {
   if (!el || isPointerUi(el)) return
   if (el !== selectedEl && !selectedEl.contains(el)) return
   const id = registerEl(selectedEl)
-  const base = getTransformParts(id)
-  dragState = {
+  if (isOutOfFlow(selectedEl)) {
+    const base = getTransformParts(id)
+    dragState = {
+      id,
+      startX: e.clientX,
+      startY: e.clientY,
+      baseX: base.dx,
+      baseY: base.dy,
+      moved: false,
+    }
+    return
+  }
+  const parent = selectedEl.parentElement
+  if (!parent) return
+  reorderDragState = {
     id,
     startX: e.clientX,
     startY: e.clientY,
-    baseX: base.dx,
-    baseY: base.dy,
+    startParent: parent,
+    startIndex: siblingIndex(selectedEl),
     moved: false,
   }
 }
 
 function onDragMove(e: MouseEvent) {
-  if (!dragState) return
-  const dx = e.clientX - dragState.startX
-  const dy = e.clientY - dragState.startY
-  if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
-  dragState.moved = true
-  e.preventDefault()
-  setTransform(dragState.id, { dx: dragState.baseX + dx, dy: dragState.baseY + dy })
-  if (selectBox && selectedEl) positionBox(selectBox, selectedEl)
+  if (dragState) {
+    const dx = e.clientX - dragState.startX
+    const dy = e.clientY - dragState.startY
+    if (!dragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
+    dragState.moved = true
+    e.preventDefault()
+    setTransform(dragState.id, { dx: dragState.baseX + dx, dy: dragState.baseY + dy })
+    if (selectBox && selectedEl) positionBox(selectBox, selectedEl)
+    return
+  }
+  if (reorderDragState) {
+    const dx = e.clientX - reorderDragState.startX
+    const dy = e.clientY - reorderDragState.startY
+    if (!reorderDragState.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
+    reorderDragState.moved = true
+    e.preventDefault()
+    const el = getEl(reorderDragState.id)
+    const parent = el?.parentElement
+    if (!el || !parent) return
+    const drop = findReorderTarget(el, parent, e.clientX, e.clientY)
+    if (drop) reparentElement(reorderDragState.id, registerEl(drop.target), drop.position)
+  }
 }
 
 function onMouseUp() {
-  if (!dragState) return
-  const { id, moved, baseX, baseY } = dragState
-  dragState = null
-  if (!moved) return
-  const cur = getTransformParts(id)
-  const el = getEl(id)
-  if (!el) return
-  chrome.runtime.sendMessage({
-    type: 'PTR_NUDGED',
-    payload: {
-      elementId: id,
-      value: composeTransform(cur),
-      from: composeTransform({ ...cur, dx: baseX, dy: baseY }),
-      target: buildPayload(el),
-    },
-  })
-  // Swallow the click that ends the drag so it doesn't re-select.
-  document.addEventListener('click', (ev) => ev.stopPropagation(), {
-    capture: true,
-    once: true,
-  })
+  if (dragState) {
+    const { id, moved, baseX, baseY } = dragState
+    dragState = null
+    if (!moved) return
+    const cur = getTransformParts(id)
+    const el = getEl(id)
+    if (!el) return
+    chrome.runtime.sendMessage({
+      type: 'PTR_NUDGED',
+      payload: {
+        elementId: id,
+        value: composeTransform(cur),
+        from: composeTransform({ ...cur, dx: baseX, dy: baseY }),
+        target: buildPayload(el),
+      },
+    })
+    // Swallow the click that ends the drag so it doesn't re-select.
+    document.addEventListener('click', (ev) => ev.stopPropagation(), {
+      capture: true,
+      once: true,
+    })
+    return
+  }
+  if (reorderDragState) {
+    const { id, moved, startParent, startIndex } = reorderDragState
+    reorderDragState = null
+    if (!moved) return
+    const el = getEl(id)
+    if (!el) return
+    const finalIndex = siblingIndex(el)
+    if (el.parentElement === startParent && finalIndex === startIndex) return // ended up back where it started
+    chrome.runtime.sendMessage({
+      type: 'PTR_MOVED',
+      payload: {
+        elementId: id,
+        target: buildPayload(el),
+        from: startIndex,
+        to: finalIndex,
+        parentDesc: shortDescriptor(el.parentElement ?? startParent),
+      },
+    })
+    document.addEventListener('click', (ev) => ev.stopPropagation(), {
+      capture: true,
+      once: true,
+    })
+  }
 }
 
 function onClick(e: MouseEvent) {
@@ -2291,6 +2402,7 @@ function setActive(on: boolean) {
     padDrag = null
     document.removeEventListener('keyup', onKeyUp, true)
     dragState = null
+    reorderDragState = null
     window.removeEventListener('scroll', onScrollOrResize, true)
     window.removeEventListener('resize', onScrollOrResize)
     hideBox(hoverBox)
@@ -2748,6 +2860,9 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
     }
     case 'PTR_MOVE_ELEMENT':
       sendResponse(moveElement(msg.elementId, msg.dir))
+      break
+    case 'PTR_MOVE_TO_INDEX':
+      sendResponse(moveElementToIndex(msg.elementId, msg.index))
       break
     case 'PTR_RESET_MOVE':
       sendResponse({ ok: resetMove(msg.elementId) })
