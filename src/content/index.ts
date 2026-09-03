@@ -1672,14 +1672,50 @@ export type DesignNode = {
   children?: DesignNode[]
 }
 
+let colorCanvasCtx: CanvasRenderingContext2D | null = null
+
 function figmaColor(value: string): DesignColor | null {
   const v = value.trim()
   if (!v || v === 'transparent') return null
+
+  // The common case getComputedStyle actually returns for background-color
+  // etc. Cheap to check first, and avoids the canvas round-trip.
   const m = v.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+))?\)/)
-  if (!m) return null
-  const a = m[4] !== undefined ? parseFloat(m[4]) : 1
-  if (a <= 0) return null
-  return { r: +m[1] / 255, g: +m[2] / 255, b: +m[3] / 255, a }
+  if (m) {
+    const a = m[4] !== undefined ? parseFloat(m[4]) : 1
+    if (a <= 0) return null
+    return { r: +m[1] / 255, g: +m[2] / 255, b: +m[3] / 255, a }
+  }
+
+  // Modern wide-gamut syntaxes (oklch(), lab(), color(), color-mix() with
+  // those) come back from getComputedStyle as-is in Chrome instead of being
+  // converted to rgb() — the regex above won't match, and without this the
+  // color would silently be treated as "no paint" (this is why a chip using
+  // a Tailwind oklch swatch lost its fill on export). A 2D canvas always
+  // renders any valid CSS color into sRGB, regardless of the function used
+  // to specify it, so painting one pixel and reading it back resolves any
+  // of these reliably.
+  try {
+    if (!colorCanvasCtx) {
+      colorCanvasCtx = document.createElement('canvas').getContext('2d', {
+        willReadFrequently: true,
+      })
+    }
+    if (!colorCanvasCtx) return null
+    colorCanvasCtx.clearRect(0, 0, 1, 1)
+    colorCanvasCtx.fillStyle = '#000'
+    colorCanvasCtx.fillStyle = v
+    if (colorCanvasCtx.fillStyle === '#000000' && v !== '#000' && !/^#0{3,6}$/i.test(v)) {
+      // fillStyle didn't change, meaning the browser rejected `v` outright.
+      return null
+    }
+    colorCanvasCtx.fillRect(0, 0, 1, 1)
+    const [r, g, b, a] = colorCanvasCtx.getImageData(0, 0, 1, 1).data
+    if (a === 0) return null
+    return { r: r / 255, g: g / 255, b: b / 255, a: a / 255 }
+  } catch {
+    return null
+  }
 }
 
 function cornerRadii(style: CSSStyleDeclaration): [number, number, number, number] {
