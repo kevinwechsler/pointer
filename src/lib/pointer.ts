@@ -98,7 +98,6 @@ export type PointerComment = {
   selector: string
   descriptor: string
   text: string
-  author: string
   createdAt: number
 }
 

@@ -1175,7 +1175,6 @@ export default function App() {
   // Comments
   const [comments, setComments] = useState<PointerComment[]>([])
   const [commentsVisible, setCommentsVisible] = useState(true)
-  const [author, setAuthor] = useState('')
   const [picking, setPicking] = useState(false)
   const [pendingTarget, setPendingTarget] = useState<{
     id: string
@@ -1302,10 +1301,6 @@ export default function App() {
       if (msg.type === 'PTR_REQUEST_REDO') redo()
     }
     chrome.runtime.onMessage.addListener(listener)
-    chrome.storage?.local
-      .get('author')
-      .then((r) => setAuthor((r.author as string) ?? ''))
-      .catch(() => {})
     return () => chrome.runtime.onMessage.removeListener(listener)
   }, [])
 
@@ -1853,7 +1848,6 @@ export default function App() {
       selector: pendingTarget.selector,
       descriptor: pendingTarget.descriptor,
       text: newCommentText.trim(),
-      author: author.trim() || 'anonymous',
       createdAt: Date.now(),
     }
     try {
@@ -1862,7 +1856,6 @@ export default function App() {
     } catch {
       return
     }
-    chrome.storage?.local.set({ author: author.trim() })
     setPendingTarget(null)
     setNewCommentText('')
   }
@@ -2078,28 +2071,14 @@ export default function App() {
                 <MoreHorizontal className="size-4" />
               </Button>
             </PopoverTrigger>
-            <PopoverContent align="end" className="w-64 space-y-4">
-              <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">Your name</Label>
-                <Input
-                  value={author}
-                  onChange={(e) => setAuthor(e.target.value)}
-                  onBlur={() => chrome.storage?.local.set({ author: author.trim() })}
-                  placeholder="e.g. Kevin"
-                  className="h-8 text-xs"
-                />
-                <p className="text-[11px] text-muted-foreground">
-                  Shown as the author on comments you add.
-                </p>
-              </div>
-              <Separator />
-              <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">Color format</Label>
+            <PopoverContent align="end" className="w-56 space-y-3">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs">Color format</Label>
                 <div className="flex gap-1">
                   <Button
                     size="sm"
                     variant={colorFormat === 'hex' ? 'default' : 'outline'}
-                    className="h-7 flex-1 text-xs"
+                    className="h-6 px-2 text-xs"
                     onClick={() => setColorFormat('hex')}
                   >
                     Hex
@@ -2107,17 +2086,16 @@ export default function App() {
                   <Button
                     size="sm"
                     variant={colorFormat === 'rgb' ? 'default' : 'outline'}
-                    className="h-7 flex-1 text-xs"
+                    className="h-6 px-2 text-xs"
                     onClick={() => setColorFormat('rgb')}
                   >
                     RGB
                   </Button>
                 </div>
               </div>
-              <Separator />
               <Dialog>
                 <DialogTrigger asChild>
-                  <Button variant="outline" size="sm" className="w-full">
+                  <Button variant="outline" size="sm" className="h-7 w-full text-xs">
                     <Keyboard className="size-3.5" />
                     Keyboard shortcuts
                   </Button>
@@ -2130,8 +2108,8 @@ export default function App() {
                 </DialogContent>
               </Dialog>
               <Separator />
-              <Button variant="destructive" size="sm" className="w-full" onClick={closePointer}>
-                <X className="size-4" />
+              <Button variant="destructive" size="sm" className="h-7 w-full text-xs" onClick={closePointer}>
+                <X className="size-3.5" />
                 Close Pointer
               </Button>
             </PopoverContent>
@@ -2949,7 +2927,6 @@ export default function App() {
                         >
                           {i + 1}
                         </Badge>
-                        <span className="shrink-0 font-medium">{c.author}</span>
                         <span className="shrink-0 text-muted-foreground">
                           {new Date(c.createdAt).toLocaleDateString()}
                         </span>

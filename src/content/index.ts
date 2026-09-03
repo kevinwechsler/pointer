@@ -859,7 +859,6 @@ type PointerComment = {
   selector: string
   descriptor: string
   text: string
-  author: string
   createdAt: number
 }
 
@@ -937,7 +936,7 @@ function renderPins() {
     const isSelected = c.id === selectedCommentId
     const pin = document.createElement('div')
     pin.textContent = String(i + 1)
-    pin.title = `${c.author}: ${c.text}`
+    pin.title = c.text
     pin.dataset.pointerPin = c.id
     const size = isSelected ? 26 : 20
     Object.assign(pin.style, {
