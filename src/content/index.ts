@@ -30,7 +30,12 @@ export type SelectionPayload = {
   id: string
   classes: string[]
   selector: string
+  /** Only set for a text leaf (no child elements) — never a joined blob
+   * from multiple descendants, which editing would destroy. */
   text: string
+  /** Typography keys (color, fontSize, ...) to hide: the subtree's text
+   * runs don't all share that value, or there's no text at all. */
+  mixedTypography: string[]
   componentChain: string[]
   source: SourceInfo
   styles: Record<string, string>
@@ -364,10 +369,68 @@ function resolveSource(el: Element): { source: SourceInfo; chain: string[] } {
 
 // ---------- selection ----------
 
+// Typography properties that only make sense to show/edit when they mean
+// one consistent thing across whatever text is inside the selection.
+const TYPOGRAPHY_KEYS = [
+  'color',
+  'fontSize',
+  'fontWeight',
+  'lineHeight',
+  'letterSpacing',
+  'textAlign',
+  'textTransform',
+] as const
+
+/** Every descendant (including the element itself) that owns direct,
+ * non-whitespace text — i.e. every distinct "text run" inside the
+ * selection, at any depth. */
+function collectTextRuns(root: Element): Element[] {
+  const runs: Element[] = []
+  const walk = (node: Element) => {
+    const hasOwnText = Array.from(node.childNodes).some(
+      (c) => c.nodeType === Node.TEXT_NODE && (c.textContent || '').trim()
+    )
+    if (hasOwnText) runs.push(node)
+    for (const child of Array.from(node.children)) walk(child)
+  }
+  walk(root)
+  return runs
+}
+
 function buildPayload(el: Element): SelectionPayload {
   const computed = window.getComputedStyle(el)
   const styles: Record<string, string> = {}
   for (const p of STYLE_PROPS) styles[p] = computed[p as any] as string
+
+  // A container holding several distinct text elements has no single
+  // "content" to show — el.textContent used to concatenate all of them,
+  // and editing that wrote the joined string back via el.innerText,
+  // silently deleting every child element in the process. Content is only
+  // ever shown/editable for an actual text leaf (no child elements at all).
+  const isLeaf = el.children.length === 0
+  const text = isLeaf ? (el.textContent || '').trim().slice(0, 120) : ''
+
+  // Likewise, a container's own computed font/color reflects nothing in
+  // particular when its text children don't all agree — showing it invites
+  // editing a value that doesn't actually represent (or won't actually
+  // change) everything underneath. Each typography field is only included
+  // when every text run in the subtree currently shares that exact value;
+  // the panel hides whichever ones don't.
+  const textRuns = collectTextRuns(el)
+  const mixedTypography: string[] = []
+  if (textRuns.length === 0) {
+    mixedTypography.push(...TYPOGRAPHY_KEYS)
+  } else {
+    for (const k of TYPOGRAPHY_KEYS) {
+      const values = new Set(textRuns.map((r) => getComputedStyle(r)[k as any] as string))
+      if (values.size > 1) mixedTypography.push(k)
+      // A single deeper run (el itself has no direct text, but there's
+      // exactly one nested leaf) is the value that's actually true —
+      // el's own computed style could easily disagree with it.
+      else styles[k] = values.values().next().value as string
+    }
+  }
+
   const { source, chain } = resolveSource(el)
   const rect = el.getBoundingClientRect()
   return {
@@ -380,7 +443,8 @@ function buildPayload(el: Element): SelectionPayload {
     id: el.id || '',
     classes: Array.from(el.classList),
     selector: cssSelector(el),
-    text: (el.textContent || '').trim().slice(0, 120),
+    text,
+    mixedTypography,
     componentChain: chain,
     source,
     styles,

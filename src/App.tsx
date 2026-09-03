@@ -2548,7 +2548,21 @@ export default function App() {
               </Section>
 
               {/* Typography */}
+              {(() => {
+                const visibleTypography = TYPOGRAPHY_FIELDS.filter(
+                  (f) => !selection.mixedTypography.includes(f.prop)
+                )
+                const showColor = !selection.mixedTypography.includes('color')
+                if (!selection.text && !visibleTypography.length && !showColor) return null
+                return (
               <Section title="Typography">
+                {!selection.text && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Showing only values shared by every text element inside —
+                    select one directly to edit its text or anything that
+                    differs between them.
+                  </p>
+                )}
                 {selection.text && (
                   <FieldRow label="Content">
                     <div className="space-y-1">
@@ -2589,11 +2603,15 @@ export default function App() {
                     </div>
                   </FieldRow>
                 )}
-                <div className="grid grid-cols-2 gap-2">
-                  {TYPOGRAPHY_FIELDS.map(renderField)}
-                </div>
-                {renderField({ prop: 'color', label: 'Color', type: 'color' })}
+                {visibleTypography.length > 0 && (
+                  <div className="grid grid-cols-2 gap-2">
+                    {visibleTypography.map(renderField)}
+                  </div>
+                )}
+                {showColor && renderField({ prop: 'color', label: 'Color', type: 'color' })}
               </Section>
+                )
+              })()}
             </div>
           )}
         </ScrollArea>

@@ -11,7 +11,12 @@ export type SelectionPayload = {
   id: string
   classes: string[]
   selector: string
+  /** Only set for a text leaf (no child elements) — never a joined blob
+   * from multiple descendants, which editing would destroy. */
   text: string
+  /** Typography keys (color, fontSize, ...) to hide: the subtree's text
+   * runs don't all share that value, or there's no text at all. */
+  mixedTypography: string[]
   componentChain: string[]
   source: SourceInfo
   styles: Record<string, string>
