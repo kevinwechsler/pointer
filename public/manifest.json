@@ -3,8 +3,20 @@
   "name": "Pointer",
   "version": "0.1.0",
   "description": "Point at elements in your localhost app and turn visual edits into precise prompts for Claude.",
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "action": {
-    "default_title": "Pointer"
+    "default_title": "Pointer",
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
   },
   "background": {
     "service_worker": "background.js"
