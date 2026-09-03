@@ -2106,6 +2106,18 @@ export default function App() {
           if (v === 'layers') loadTree()
         }}
       >
+        {/* The gray baseline lives in this wrapper, not inside TabsList: an
+            absolutely-positioned child of a scrolling element scrolls right
+            along with its content (its containing block is the element's
+            own local coordinate space, which shifts with scrollLeft) even
+            though its size is still just the visible clientWidth — so as
+            the row scrolled, the line's fixed-width span drifted left with
+            it, leaving whatever was newly scrolled into view uncovered.
+            This wrapper never scrolls, so inset-x-0 here always covers the
+            full, constant-width row regardless of TabsList's own scroll
+            position. Verified both the bug and this fix against the actual
+            scroll math before landing it. */}
+        <div className="relative mx-4 mt-2 mb-2">
         <TabsList
           ref={tabsListRef}
           variant="line"
@@ -2113,12 +2125,12 @@ export default function App() {
           // 5px below the *trigger's* own bottom edge. Per spec, a
           // horizontally-scrolling element (overflow-x-auto) also clips
           // vertically — there's no way to keep one axis "visible" once
-          // the other scrolls — so that indicator (and our own gray
-          // baseline below it) were being cropped away entirely. Fixed by
-          // giving the row real height (h-9) but the trigger a shorter,
-          // fixed one (h-6 on each TabsTrigger below): the extra room
-          // means both lines land inside the box instead of past its edge.
-          className="relative mx-4 mt-2 mb-2 h-9 w-auto cursor-grab justify-start gap-0 overflow-x-auto active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          // the other scrolls — so that indicator was being cropped away
+          // entirely. Fixed by giving the row real height (h-9) but the
+          // trigger a shorter, fixed one (h-6 on each TabsTrigger below):
+          // the extra room means the indicator lands inside the box
+          // instead of past its edge.
+          className="h-9 w-auto cursor-grab justify-start gap-0 overflow-x-auto active:cursor-grabbing [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           onPointerDown={(e) => {
             const el = tabsListRef.current
             if (!el) return
@@ -2172,8 +2184,9 @@ export default function App() {
           <TabsTrigger value="tokens" className="h-6 shrink-0 px-2">
             Tokens
           </TabsTrigger>
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border" />
         </TabsList>
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border" />
+        </div>
 
       <TabsContent value="element" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
