@@ -838,7 +838,12 @@ function ColorRow({
   onChange: (v: string) => void
 }) {
   const parsed = parseColor(value)
-  const lastVisible = useRef<string>('#000000')
+  // Seed for the picker when there's no color yet. Was #000000, which made
+  // a transparent fill look like Pointer "knew" the color was black
+  // whenever the element's text happened to be black. Figma's default for
+  // a newly added fill is this light gray, and it can't be mistaken for a
+  // real value.
+  const lastVisible = useRef<string>('#d9d9d9')
   if (!parsed.transparent && !parsed.unknown) lastVisible.current = value
   const visible = !parsed.transparent
 
@@ -2515,12 +2520,35 @@ export default function App() {
               </Section>
 
               {/* Fill */}
+              {/* Figma's model: for a text layer, Fill *is* the text color.
+                  A heading's background is genuinely transparent, so showing
+                  that here as "Fill" read as a bug ("my title is black, why
+                  is the fill empty?"). Text leaves get Fill = color, with the
+                  background as its own row underneath; everything else keeps
+                  Fill = background. */}
               <Section title="Fill">
-                <ColorRow
-                  value={draft.backgroundColor ?? ''}
-                  edited={isEdited('backgroundColor')}
-                  onChange={(v) => applyStyle('backgroundColor', v)}
-                />
+                {selection.text ? (
+                  <>
+                    <ColorRow
+                      value={draft.color ?? ''}
+                      edited={isEdited('color')}
+                      onChange={(v) => applyStyle('color', v)}
+                    />
+                    <FieldRow label="Background">
+                      <ColorRow
+                        value={draft.backgroundColor ?? ''}
+                        edited={isEdited('backgroundColor')}
+                        onChange={(v) => applyStyle('backgroundColor', v)}
+                      />
+                    </FieldRow>
+                  </>
+                ) : (
+                  <ColorRow
+                    value={draft.backgroundColor ?? ''}
+                    edited={isEdited('backgroundColor')}
+                    onChange={(v) => applyStyle('backgroundColor', v)}
+                  />
+                )}
               </Section>
 
               {/* Stroke */}
@@ -2608,7 +2636,10 @@ export default function App() {
                     {visibleTypography.map(renderField)}
                   </div>
                 )}
-                {showColor && renderField({ prop: 'color', label: 'Color', type: 'color' })}
+                {/* For a text leaf the color already lives in Fill above. */}
+                {showColor &&
+                  !selection.text &&
+                  renderField({ prop: 'color', label: 'Color', type: 'color' })}
               </Section>
                 )
               })()}
