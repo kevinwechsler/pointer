@@ -1556,11 +1556,11 @@ function setCommentMode(on: boolean) {
     ensureOverlay()
     document.addEventListener('mousemove', onMouseMove, true)
     document.addEventListener('click', onClick, true)
-    document.documentElement.style.cursor = 'crosshair'
+    setCursorOverride(true)
   } else if (!active) {
     document.removeEventListener('mousemove', onMouseMove, true)
     document.removeEventListener('click', onClick, true)
-    document.documentElement.style.cursor = ''
+    setCursorOverride(false)
     hideBox(hoverBox)
     hideBox(hoverLabel as any)
   }
@@ -1575,10 +1575,32 @@ function onScrollOrResize() {
   hideMeasure()
 }
 
+// Forces the crosshair cursor everywhere while Inspect is on. Setting
+// `document.documentElement.style.cursor` alone isn't enough: cursor is
+// inherited, but any element with its own `cursor` (buttons, links —
+// basically everything the page wants you to know is clickable) overrides
+// that inherited value. A page-wide !important rule beats those; pins keep
+// their own pointer cursor via a more specific selector on top of it.
+let cursorOverrideStyle: HTMLStyleElement | null = null
+
+function setCursorOverride(on: boolean) {
+  if (on) {
+    if (cursorOverrideStyle) return
+    cursorOverrideStyle = document.createElement('style')
+    cursorOverrideStyle.textContent =
+      '*, *::before, *::after { cursor: crosshair !important; } [data-pointer-pin] { cursor: pointer !important; }'
+    document.documentElement.appendChild(cursorOverrideStyle)
+  } else {
+    cursorOverrideStyle?.remove()
+    cursorOverrideStyle = null
+  }
+}
+
 function setActive(on: boolean) {
   // Host chrome never inspects; the app's iframe does.
   if (on && IS_HOST_CHROME) return
   active = on
+  setCursorOverride(on)
   if (on) {
     ensureOverlay()
     document.documentElement.addEventListener('mouseleave', onMouseLeave)
@@ -1592,7 +1614,6 @@ function setActive(on: boolean) {
     document.addEventListener('keyup', onKeyUp, true)
     window.addEventListener('scroll', onScrollOrResize, true)
     window.addEventListener('resize', onScrollOrResize)
-    document.documentElement.style.cursor = 'crosshair'
   } else {
     document.documentElement.removeEventListener('mouseleave', onMouseLeave)
     document.removeEventListener('mousemove', onMouseMove, true)
@@ -1606,7 +1627,6 @@ function setActive(on: boolean) {
     dragState = null
     window.removeEventListener('scroll', onScrollOrResize, true)
     window.removeEventListener('resize', onScrollOrResize)
-    document.documentElement.style.cursor = ''
     hideBox(hoverBox)
     hideBox(hoverLabel as any)
     hideMeasure()
