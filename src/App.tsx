@@ -1159,6 +1159,18 @@ export default function App() {
   // Undo/redo stack. historyRef holds ops; index points AFTER the last applied op.
   const historyRef = useRef<HistoryOp[]>([])
   const [historyIndex, setHistoryIndex] = useState(0)
+  // The message listener below is registered once (empty deps) so it never
+  // picks up fresh closures — reading `historyIndex` state directly from
+  // inside it always saw the value from the very first render (0), so every
+  // page-driven edit's pushHistory call did `historyRef.current.slice(0, 0)`
+  // and silently wiped the entire undo stack before pushing the new op.
+  // This ref is the single source of truth pushHistory/undo/redo read from;
+  // historyIndex state stays only for re-rendering the Undo/Redo buttons.
+  const historyIndexRef = useRef(0)
+  const setHistoryIndexBoth = (n: number) => {
+    historyIndexRef.current = n
+    setHistoryIndex(n)
+  }
 
   // Comments
   const [comments, setComments] = useState<PointerComment[]>([])
@@ -1284,6 +1296,10 @@ export default function App() {
           setText(to)
         }
       }
+      // Cmd/Ctrl+Z on the page — the content script has no history of its
+      // own, so it just asks the panel to do what the Undo/Redo buttons do.
+      if (msg.type === 'PTR_REQUEST_UNDO') undo()
+      if (msg.type === 'PTR_REQUEST_REDO') redo()
     }
     chrome.runtime.onMessage.addListener(listener)
     chrome.storage?.local
@@ -1361,9 +1377,9 @@ export default function App() {
   }
 
   function pushHistory(op: HistoryOp) {
-    historyRef.current = historyRef.current.slice(0, historyIndex)
+    historyRef.current = historyRef.current.slice(0, historyIndexRef.current)
     historyRef.current.push(op)
-    setHistoryIndex(historyRef.current.length)
+    setHistoryIndexBoth(historyRef.current.length)
   }
 
   function upsertEdit(
@@ -1740,17 +1756,19 @@ export default function App() {
   }
 
   async function undo() {
-    if (historyIndex === 0) return
-    const op = historyRef.current[historyIndex - 1]
+    const i = historyIndexRef.current
+    if (i === 0) return
+    const op = historyRef.current[i - 1]
     await applyOp(op, op.from)
-    setHistoryIndex(historyIndex - 1)
+    setHistoryIndexBoth(i - 1)
   }
 
   async function redo() {
-    if (historyIndex >= historyRef.current.length) return
-    const op = historyRef.current[historyIndex]
+    const i = historyIndexRef.current
+    if (i >= historyRef.current.length) return
+    const op = historyRef.current[i]
     await applyOp(op, op.to)
-    setHistoryIndex(historyIndex + 1)
+    setHistoryIndexBoth(i + 1)
   }
 
   async function clearAll() {
@@ -1767,7 +1785,7 @@ export default function App() {
       return d
     })
     historyRef.current = []
-    setHistoryIndex(0)
+    setHistoryIndexBoth(0)
     if (selection) {
       setDraft({ ...selection.styles })
       setText(selection.text)
@@ -3175,6 +3193,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: 'Cmd + ]', desc: 'Move the selected element later among its siblings' },
       { keys: 'Cmd + Shift + [', desc: 'Move it to the very start among its siblings' },
       { keys: 'Cmd + Shift + ]', desc: 'Move it to the very end among its siblings' },
+      { keys: 'Cmd + Z', desc: 'Undo — same as the Undo button' },
+      { keys: 'Cmd + Shift + Z', desc: 'Redo — same as the Redo button' },
       { keys: 'Drag', desc: 'Drag the selected element to move it freely' },
       { keys: 'Delete / Backspace', desc: 'Remove the selected element' },
       { keys: 'Cmd + D', desc: 'Duplicate the selected element' },

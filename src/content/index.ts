@@ -1411,6 +1411,15 @@ function onKeyDown(e: KeyboardEvent) {
     selectParentOrDeselect()
     return
   }
+  // Undo/redo history lives in the panel (it's what drives the Undo/Redo
+  // buttons), so these just ask it to act — same as clicking them. Cmd on
+  // Mac, Ctrl elsewhere; redo is the Shift variant either way (there's no
+  // separate Cmd+Y path here since the panel is the one place this fires).
+  if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault()
+    chrome.runtime.sendMessage({ type: e.shiftKey ? 'PTR_REQUEST_REDO' : 'PTR_REQUEST_UNDO' })
+    return
+  }
   if (e.key.startsWith('Arrow') && selectedEl && !e.altKey && !e.metaKey && !e.ctrlKey) {
     e.preventDefault()
     const step = e.shiftKey ? 10 : 1
