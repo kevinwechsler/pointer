@@ -863,23 +863,46 @@ type PointerComment = {
   createdAt: number
 }
 
-const COMMENTS_KEY = () => `__pointer_comments__:${location.pathname}`
+// Comments used to live in this page's own localStorage — which the browser
+// scopes per *origin*, port included. Dev servers (Vite, Next…) routinely
+// come up on a different port after a restart if the usual one is still
+// held by something, which silently swapped the whole storage bucket out
+// from under Pointer — the comments weren't deleted, just stranded on an
+// origin you'd stopped visiting. chrome.storage.local lives with the
+// extension instead, so it doesn't care which port the app happens to be
+// on this time. Keyed by pathname alone (not origin) so a comment survives
+// that swap; the tradeoff is that two different local projects that happen
+// to share a route path (e.g. both have "/") would share its comments too
+// — acceptable for a tool used on one app at a time.
+const COMMENTS_KEY = () => `pointer_comments:${location.pathname}`
 const COMMENTS_VISIBLE_KEY = '__pointer_comments_visible__'
 
 let commentMode = false
 let commentsVisible = localStorage.getItem(COMMENTS_VISIBLE_KEY) !== '0'
 const pinEls: HTMLDivElement[] = []
 
+// In-memory mirror of chrome.storage.local so the many synchronous call
+// sites (rendering pins, etc.) don't all need to become async. Loaded once
+// at startup below; every write updates both the cache and storage.
+let commentsCache: PointerComment[] = []
+let commentsLoaded = false
+
+async function initComments() {
+  const key = COMMENTS_KEY()
+  const result = await chrome.storage.local.get(key)
+  commentsCache = (result[key] as PointerComment[] | undefined) ?? []
+  commentsLoaded = true
+  renderPins()
+}
+void initComments()
+
 function loadComments(): PointerComment[] {
-  try {
-    return JSON.parse(localStorage.getItem(COMMENTS_KEY()) || '[]')
-  } catch {
-    return []
-  }
+  return commentsCache
 }
 
-function saveComments(comments: PointerComment[]) {
-  localStorage.setItem(COMMENTS_KEY(), JSON.stringify(comments))
+async function saveComments(comments: PointerComment[]) {
+  commentsCache = comments
+  await chrome.storage.local.set({ [COMMENTS_KEY()]: comments })
 }
 
 function clearPins() {
@@ -2743,7 +2766,14 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       sendResponse({ ok: true })
       break
     case 'PTR_GET_COMMENTS':
-      sendResponse({ ok: true, comments: loadComments(), visible: commentsVisible })
+      if (commentsLoaded) {
+        sendResponse({ ok: true, comments: loadComments(), visible: commentsVisible })
+      } else {
+        initComments().then(() =>
+          sendResponse({ ok: true, comments: loadComments(), visible: commentsVisible })
+        )
+        return true
+      }
       break
     case 'PTR_ADD_COMMENT': {
       const comments = loadComments()
