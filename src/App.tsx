@@ -945,22 +945,42 @@ function LayerIcon({ kind }: { kind: LayerNode['kind'] }) {
   }
 }
 
+/** Only real containers make sense as an "inside" drop target — dropping
+ * something inside a line of text or an icon isn't a meaningful move. */
+function canNestInto(kind: LayerNode['kind']): boolean {
+  return kind === 'frame' || kind === 'component'
+}
+
+export type LayerDropTarget = { id: number; position: 'before' | 'after' | 'inside' }
+
 function LayerTree({
   nodes,
   depth,
   expanded,
   selectedId,
+  draggedId,
+  dropTarget,
   onToggle,
   onSelect,
   onHover,
+  onDragStartRow,
+  onDragOverRow,
+  onDropRow,
+  onDragEndRow,
 }: {
   nodes: LayerNode[]
   depth: number
   expanded: Set<number>
   selectedId: number | null
+  draggedId: number | null
+  dropTarget: LayerDropTarget | null
   onToggle: (id: number) => void
   onSelect: (id: number) => void
   onHover: (id: number | null) => void
+  onDragStartRow: (id: number) => void
+  onDragOverRow: (id: number, position: LayerDropTarget['position']) => void
+  onDropRow: () => void
+  onDragEndRow: () => void
 }) {
   return (
     <>
@@ -968,6 +988,7 @@ function LayerTree({
         const hasChildren = n.children.length > 0
         const open = expanded.has(n.id)
         const isSelected = n.id === selectedId
+        const drop = dropTarget?.id === n.id ? dropTarget.position : null
         return (
           <div key={n.id}>
             <div
@@ -976,15 +997,50 @@ function LayerTree({
               ref={(node) => {
                 if (node && isSelected) node.scrollIntoView({ block: 'nearest' })
               }}
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.effectAllowed = 'move'
+                onDragStartRow(n.id)
+              }}
+              onDragOver={(e) => {
+                if (draggedId == null || draggedId === n.id) return
+                e.preventDefault()
+                const rect = e.currentTarget.getBoundingClientRect()
+                const ratio = (e.clientY - rect.top) / rect.height
+                const nestable = canNestInto(n.kind)
+                const position: LayerDropTarget['position'] =
+                  nestable && ratio > 0.25 && ratio < 0.75
+                    ? 'inside'
+                    : ratio < 0.5
+                      ? 'before'
+                      : 'after'
+                onDragOverRow(n.id, position)
+              }}
+              onDrop={(e) => {
+                e.preventDefault()
+                onDropRow()
+              }}
+              onDragEnd={onDragEndRow}
               onClick={() => onSelect(n.id)}
               onMouseEnter={() => onHover(n.id)}
               onMouseLeave={() => onHover(null)}
               className={
-                'flex h-7 cursor-default items-center gap-1 rounded-sm pr-2 text-xs select-none ' +
-                (isSelected ? 'bg-primary/10 text-foreground' : 'hover:bg-muted')
+                'relative flex h-7 cursor-default items-center gap-1 rounded-sm pr-2 text-xs select-none ' +
+                (drop === 'inside'
+                  ? 'bg-primary/15 outline outline-primary'
+                  : isSelected
+                    ? 'bg-primary/10 text-foreground'
+                    : 'hover:bg-muted') +
+                (draggedId === n.id ? ' opacity-40' : '')
               }
               style={{ paddingLeft: 4 + depth * 14 }}
             >
+              {drop === 'before' && (
+                <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-primary" />
+              )}
+              {drop === 'after' && (
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-0.5 bg-primary" />
+              )}
               <button
                 type="button"
                 className={
@@ -1012,9 +1068,15 @@ function LayerTree({
                 depth={depth + 1}
                 expanded={expanded}
                 selectedId={selectedId}
+                draggedId={draggedId}
+                dropTarget={dropTarget}
                 onToggle={onToggle}
                 onSelect={onSelect}
                 onHover={onHover}
+                onDragStartRow={onDragStartRow}
+                onDragOverRow={onDragOverRow}
+                onDropRow={onDropRow}
+                onDragEndRow={onDragEndRow}
               />
             )}
           </div>
@@ -1080,6 +1142,8 @@ export default function App() {
   // Layers
   const [tree, setTree] = useState<LayerNode[]>([])
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const [draggedLayerId, setDraggedLayerId] = useState<number | null>(null)
+  const [layerDropTarget, setLayerDropTarget] = useState<LayerDropTarget | null>(null)
   const tabsListRef = useRef<HTMLDivElement>(null)
   const tabsDrag = useRef<{ x: number; left: number; moved: boolean } | null>(null)
 
@@ -1434,6 +1498,28 @@ export default function App() {
       return
     }
     setEdits((prev) => prev.filter((e) => e.id !== edit.id))
+  }
+
+  // Drag-and-drop in the Layers tab: the general version of the Position
+  // tab's Back/Forward buttons — this can also move an element into a
+  // completely different parent, not just shuffle it among its current
+  // siblings.
+  async function reparentLayer(id: number, targetId: number, position: LayerDropTarget['position']) {
+    try {
+      const r = await sendToPage({
+        type: 'PTR_REPARENT_ELEMENT',
+        frameToken: lastFrameRef.current ?? undefined,
+        elementId: id,
+        targetId,
+        position,
+      })
+      if (!r?.ok || !r.target) return
+      upsertEdit(r.target, 'move', 'parent', r.fromParentDesc, r.toParentDesc, r.toParentDesc)
+      if (selection?.elementId === id) setSelection(r.target)
+      await loadTree()
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
   }
 
   async function moveSelected(dir: 'prev' | 'next') {
@@ -2521,6 +2607,21 @@ export default function App() {
                 depth={0}
                 expanded={expanded}
                 selectedId={selection?.elementId ?? null}
+                draggedId={draggedLayerId}
+                dropTarget={layerDropTarget}
+                onDragStartRow={setDraggedLayerId}
+                onDragOverRow={(id, position) => setLayerDropTarget({ id, position })}
+                onDropRow={() => {
+                  if (draggedLayerId != null && layerDropTarget) {
+                    reparentLayer(draggedLayerId, layerDropTarget.id, layerDropTarget.position)
+                  }
+                  setDraggedLayerId(null)
+                  setLayerDropTarget(null)
+                }}
+                onDragEndRow={() => {
+                  setDraggedLayerId(null)
+                  setLayerDropTarget(null)
+                }}
                 onToggle={(id) =>
                   setExpanded((prev) => {
                     const next = new Set(prev)
@@ -2602,9 +2703,15 @@ export default function App() {
                               </span>
                             ) : e.kind === 'move' ? (
                               <>
-                                order:{' '}
-                                <span className="line-through">{e.from}</span> →{' '}
-                                <span className="font-medium text-foreground">{e.to}</span>
+                                {e.prop === 'parent' ? 'moved to' : 'order'}:{' '}
+                                {e.prop === 'parent' ? (
+                                  <span className="font-medium text-foreground">{e.to}</span>
+                                ) : (
+                                  <>
+                                    <span className="line-through">{e.from}</span> →{' '}
+                                    <span className="font-medium text-foreground">{e.to}</span>
+                                  </>
+                                )}
                               </>
                             ) : (
                               <>

@@ -517,6 +517,39 @@ function moveToEdge(
   return { ok: true, from, to, parentDesc: shortDescriptor(parent) }
 }
 
+// Arbitrary drag-and-drop reordering from the Layers tab — not limited to
+// swapping with an adjacent sibling like moveElement/moveToEdge (those back
+// the Position tab's Back/Forward buttons), this can also move an element
+// into a completely different parent, like dragging a layer in Figma.
+function reparentElement(
+  id: number,
+  targetId: number,
+  position: 'before' | 'after' | 'inside'
+): { ok: boolean; target?: SelectionPayload; fromParentDesc?: string; toParentDesc?: string } {
+  const el = getEl(id)
+  const target = getEl(targetId)
+  if (!el || !target || el === target) return { ok: false }
+  // Dropping onto (or before/after, which still resolves inside) one of the
+  // dragged element's own descendants would detach it from the document.
+  if (el.contains(target)) return { ok: false }
+
+  const parent = position === 'inside' ? target : target.parentElement
+  if (!parent) return { ok: false }
+  const refNode = position === 'inside' ? parent.firstChild : position === 'before' ? target : target.nextSibling
+  if (el === refNode) return { ok: false } // already exactly there
+
+  if (!movePristine.has(id)) {
+    movePristine.set(id, { parent: el.parentElement!, nextSibling: el.nextSibling })
+  }
+  const fromParentDesc = el.parentElement ? shortDescriptor(el.parentElement) : ''
+  parent.insertBefore(el, refNode)
+
+  if (selectedEl === el && selectBox) positionBox(selectBox, el)
+  if (selectedEl) drawGridOverlay(selectedEl)
+  schedulePinUpdate()
+  return { ok: true, target: buildPayload(el), fromParentDesc, toParentDesc: shortDescriptor(parent) }
+}
+
 function resetMove(id: number): boolean {
   const el = getEl(id)
   const rec = movePristine.get(id)
@@ -2085,6 +2118,9 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     case 'PTR_RESET_MOVE':
       sendResponse({ ok: resetMove(msg.elementId) })
+      break
+    case 'PTR_REPARENT_ELEMENT':
+      sendResponse(reparentElement(msg.elementId, msg.targetId, msg.position))
       break
     case 'PTR_INSERT_ELEMENT':
       sendResponse(insertElement(msg.kind, msg.targetId ?? null, msg.position))
