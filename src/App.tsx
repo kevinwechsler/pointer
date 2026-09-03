@@ -3164,8 +3164,14 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: 'Double-click text', desc: 'Edit it right on the page (Enter or Esc to finish)' },
       { keys: 'Drag a corner or edge', desc: 'Resize the selected element' },
       { keys: 'Drag a padding area', desc: "Change that side's padding (hold Alt to change both sides)" },
-      { keys: 'Arrow keys', desc: 'Nudge the selected element 1px' },
-      { keys: 'Shift + Arrow keys', desc: 'Nudge the selected element 10px' },
+      {
+        keys: 'Arrow keys',
+        desc: 'Reorder among siblings — or nudge 1px if the element is position: absolute/fixed',
+      },
+      {
+        keys: 'Shift + Arrow keys',
+        desc: 'Move to the very start/end among siblings — or nudge 10px if absolute/fixed',
+      },
       { keys: 'Cmd + [', desc: 'Move the selected element earlier among its siblings' },
       { keys: 'Cmd + ]', desc: 'Move the selected element later among its siblings' },
       { keys: 'Cmd + Shift + [', desc: 'Move it to the very start among its siblings' },

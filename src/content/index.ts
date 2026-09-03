@@ -1380,6 +1380,14 @@ function setTransform(id: number, next: Partial<TransformParts>): { from: string
   return { from, to }
 }
 
+/** Only an out-of-flow element (position: absolute/fixed) has an X/Y that
+ * means anything to nudge — a normal flow child's position is decided by
+ * layout, not by an offset sitting on top of it. */
+function isOutOfFlow(el: Element): boolean {
+  const pos = getComputedStyle(el).position
+  return pos === 'absolute' || pos === 'fixed'
+}
+
 function nudgeSelected(dx: number, dy: number) {
   if (!selectedEl) return
   const id = registerEl(selectedEl)
@@ -1444,15 +1452,39 @@ function onKeyDown(e: KeyboardEvent) {
   }
   if (e.key.startsWith('Arrow') && selectedEl && !e.altKey && !e.metaKey && !e.ctrlKey) {
     e.preventDefault()
-    const step = e.shiftKey ? 10 : 1
-    const deltas: Record<string, [number, number]> = {
-      ArrowUp: [0, -step],
-      ArrowDown: [0, step],
-      ArrowLeft: [-step, 0],
-      ArrowRight: [step, 0],
+    // X/Y only mean something for an element taken out of normal flow —
+    // otherwise the browser's layout puts it wherever the flow dictates and
+    // an offset is just a visual hack sitting on top of that. For a normal
+    // flow child (the overwhelming majority of elements), what arrow keys
+    // actually move is where it sits *among its siblings* — same thing
+    // Cmd+[ / Cmd+] and Position → Order already do.
+    if (isOutOfFlow(selectedEl)) {
+      const step = e.shiftKey ? 10 : 1
+      const deltas: Record<string, [number, number]> = {
+        ArrowUp: [0, -step],
+        ArrowDown: [0, step],
+        ArrowLeft: [-step, 0],
+        ArrowRight: [step, 0],
+      }
+      const d = deltas[e.key]
+      if (d) nudgeSelected(d[0], d[1])
+    } else {
+      const earlier = e.key === 'ArrowUp' || e.key === 'ArrowLeft'
+      const later = e.key === 'ArrowDown' || e.key === 'ArrowRight'
+      if (earlier || later) {
+        const id = registerEl(selectedEl)
+        const target = buildPayload(selectedEl)
+        const r = e.shiftKey
+          ? moveToEdge(id, earlier ? 'back' : 'front')
+          : moveElement(id, earlier ? 'prev' : 'next')
+        if (r.ok) {
+          chrome.runtime.sendMessage({
+            type: 'PTR_MOVED',
+            payload: { elementId: id, target, from: r.from, to: r.to, parentDesc: r.parentDesc },
+          })
+        }
+      }
     }
-    const d = deltas[e.key]
-    if (d) nudgeSelected(d[0], d[1])
     return
   }
   // Figma's actual "copy/paste properties" shortcut — bare C and V are its
