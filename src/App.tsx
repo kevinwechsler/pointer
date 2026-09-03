@@ -1205,6 +1205,32 @@ export default function App() {
     return () => port.disconnect()
   }, [])
 
+  // The content script has its own Cmd/Ctrl+Z (+Shift) handler, but that
+  // only ever sees keystrokes while the *page* has keyboard focus — the
+  // panel is a separate document, and focus lands there constantly just
+  // from clicking a button or a field in it. Without this, the shortcut
+  // would work "sometimes" depending on where focus happened to be, while
+  // the Undo/Redo buttons (which call the same undo/redo directly) always
+  // worked — exactly what made this look like a broken shortcut rather
+  // than a focus gap. historyIndexRef makes undo/redo safe to call from a
+  // stale closure here, same as from the content-script message listener.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null
+      if (
+        target &&
+        (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+      )
+        return
+      if (e.key.toLowerCase() !== 'z' || !(e.metaKey || e.ctrlKey)) return
+      e.preventDefault()
+      if (e.shiftKey) redo()
+      else undo()
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [])
+
   useEffect(() => {
     const listener = (msg: any) => {
       if (msg.type === 'PTR_SELECTED') {
