@@ -29,6 +29,7 @@ import {
   MessageSquarePlus,
   Trash2,
   MoreHorizontal,
+  Pipette,
   Image,
   PenTool,
   Frame,
@@ -696,6 +697,11 @@ function useDragPick(onPick: (x: number, y: number) => void) {
   }
 }
 
+// Chrome's native eyedropper — samples a color from anywhere on the
+// screen, not just inside the page, same as Figma's. No polyfill for
+// browsers without it; the button just doesn't render there.
+const EYEDROPPER_SUPPORTED = typeof window !== 'undefined' && 'EyeDropper' in window
+
 function ColorPicker({ value, onChange }: { value: string; onChange: (css: string) => void }) {
   const parsed = parseColor(value)
   const [hsv, setHsv] = useState<HSV>(() =>
@@ -710,6 +716,16 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (css: strin
     setHsv(next)
     setAlpha(a)
     onChange(composeColor(hsvToRgb(next), a))
+  }
+
+  const pickWithEyeDropper = async () => {
+    try {
+      const result = await new (window as any).EyeDropper().open()
+      const c = parseColor(result.sRGBHex)
+      if (!c.unknown) emit(rgbToHsv(c.r, c.g, c.b), alpha)
+    } catch {
+      // User pressed Escape — nothing to do.
+    }
   }
 
   const sv = useDragPick((x, y) => emit({ ...hsv, s: x, v: 1 - y }, alpha))
@@ -790,8 +806,20 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (css: strin
       </div>
 
       <div className="flex items-center gap-1">
+        {EYEDROPPER_SUPPORTED && (
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            title="Pick a color from anywhere on screen"
+            onClick={pickWithEyeDropper}
+          >
+            <Pipette className="size-3.5" />
+          </Button>
+        )}
         <Select value={fmt} onValueChange={(f: ColorFmt) => { setFmt(f); setTextDraft(null) }}>
-          <SelectTrigger className="h-8 w-[64px] shrink-0 px-2 text-[11px]">
+          <SelectTrigger className="h-8 w-14 shrink-0 px-2 text-[11px]">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
