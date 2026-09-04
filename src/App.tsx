@@ -980,8 +980,13 @@ function LayerIcon({ kind }: { kind: LayerNode['kind'] }) {
 
 /** Only real containers make sense as an "inside" drop target — dropping
  * something inside a line of text or an icon isn't a meaningful move. */
+// The icon (frame/component/rect/circle/...) reflects how the layer looks,
+// not whether it can hold children — a childless <div> with a background
+// is classified as "rect" for its icon, but is still a completely ordinary
+// element that can have things dropped into it. Only genuine leaves (text,
+// an <img>, an inline <svg>) can't meaningfully nest anything.
 function canNestInto(kind: LayerNode['kind']): boolean {
-  return kind === 'frame' || kind === 'component'
+  return kind !== 'text' && kind !== 'image' && kind !== 'vector'
 }
 
 export type LayerDropTarget = { id: number; position: 'before' | 'after' | 'inside' }
@@ -1027,34 +1032,59 @@ function LayerTree({
             <div
               role="button"
               tabIndex={0}
+              data-layer-id={n.id}
+              data-layer-kind={n.kind}
               ref={(node) => {
                 if (node && isSelected) node.scrollIntoView({ block: 'nearest' })
               }}
-              draggable
-              onDragStart={(e) => {
-                e.dataTransfer.effectAllowed = 'move'
-                onDragStartRow(n.id)
+              // Native HTML5 draggable starts a drag on the very first
+              // pixel of movement, no matter how small — so an ordinary
+              // click with a hair of hand-tremor routinely got swallowed
+              // as a drag attempt instead of registering as a click. This
+              // tracks the press by hand with a real threshold: under it,
+              // it's a click; past it, it's a drag, with the drop target
+              // recomputed from whatever row is actually under the cursor.
+              onMouseDown={(e) => {
+                if (e.button !== 0) return
+                const startX = e.clientX
+                const startY = e.clientY
+                let moved = false
+                const onMove = (ev: MouseEvent) => {
+                  const dx = ev.clientX - startX
+                  const dy = ev.clientY - startY
+                  if (!moved) {
+                    if (Math.hypot(dx, dy) < 4) return
+                    moved = true
+                    onDragStartRow(n.id)
+                  }
+                  const hovered = document
+                    .elementFromPoint(ev.clientX, ev.clientY)
+                    ?.closest<HTMLElement>('[data-layer-id]')
+                  if (!hovered) return
+                  const targetId = Number(hovered.dataset.layerId)
+                  const targetKind = hovered.dataset.layerKind as LayerNode['kind']
+                  if (targetId === n.id) return
+                  const rect = hovered.getBoundingClientRect()
+                  const ratio = (ev.clientY - rect.top) / rect.height
+                  const nestable = canNestInto(targetKind)
+                  const position: LayerDropTarget['position'] =
+                    nestable && ratio > 0.25 && ratio < 0.75
+                      ? 'inside'
+                      : ratio < 0.5
+                        ? 'before'
+                        : 'after'
+                  onDragOverRow(targetId, position)
+                }
+                const onUp = () => {
+                  document.removeEventListener('mousemove', onMove)
+                  document.removeEventListener('mouseup', onUp)
+                  if (moved) onDropRow()
+                  else onSelect(n.id)
+                  onDragEndRow()
+                }
+                document.addEventListener('mousemove', onMove)
+                document.addEventListener('mouseup', onUp)
               }}
-              onDragOver={(e) => {
-                if (draggedId == null || draggedId === n.id) return
-                e.preventDefault()
-                const rect = e.currentTarget.getBoundingClientRect()
-                const ratio = (e.clientY - rect.top) / rect.height
-                const nestable = canNestInto(n.kind)
-                const position: LayerDropTarget['position'] =
-                  nestable && ratio > 0.25 && ratio < 0.75
-                    ? 'inside'
-                    : ratio < 0.5
-                      ? 'before'
-                      : 'after'
-                onDragOverRow(n.id, position)
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                onDropRow()
-              }}
-              onDragEnd={onDragEndRow}
-              onClick={() => onSelect(n.id)}
               onMouseEnter={() => onHover(n.id)}
               onMouseLeave={() => onHover(null)}
               className={
@@ -1080,6 +1110,7 @@ function LayerTree({
                   'flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground ' +
                   (hasChildren ? '' : 'invisible')
                 }
+                onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation()
                   onToggle(n.id)
