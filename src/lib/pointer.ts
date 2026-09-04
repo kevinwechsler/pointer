@@ -91,6 +91,9 @@ export type LayerNode = {
   children: LayerNode[]
 }
 
+/** A spot in the DOM tree: which parent, at which child index. */
+export type Placement = { parentId: number; parentDesc: string; index: number }
+
 export type TokenEdit = { name: string; from: string; to: string }
 
 export type PointerComment = {
@@ -138,6 +141,10 @@ export function generatePrompt(edits: Edit[], tokenEdits: TokenEdit[] = []): str
       lines.push('   Remove this element.')
     } else if (e.kind === 'text') {
       lines.push(`   Change the text from "${e.from}" to "${e.to}".`)
+    } else if (e.kind === 'move' && e.prop === 'parent') {
+      lines.push(
+        `   Move it out of ${e.from} and into ${e.to}${e.detail ? `, as child number ${Number(e.detail) + 1}` : ''}.`
+      )
     } else if (e.kind === 'move') {
       lines.push(
         `   Reorder it within ${e.detail ?? 'its parent'}: move it from position ${e.from} to position ${e.to} among its siblings.`

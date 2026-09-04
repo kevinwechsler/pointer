@@ -607,15 +607,65 @@ function moveElementToIndex(id: number, index: number): { ok: boolean } {
   return { ok: true }
 }
 
-// Arbitrary drag-and-drop reordering from the Layers tab — not limited to
-// swapping with an adjacent sibling like moveElement/moveToEdge (those back
-// the Position tab's Back/Forward buttons), this can also move an element
-// into a completely different parent, like dragging a layer in Figma.
+// A place in the tree, as "which parent, at which child index". This is what
+// a Layers-tab move is recorded as, so it can be undone/redone exactly even
+// when the element crossed into a different parent.
+type Placement = { parentId: number; parentDesc: string; index: number }
+
+function placementOf(el: Element): Placement | null {
+  const parent = el.parentElement
+  if (!parent) return null
+  return { parentId: registerEl(parent), parentDesc: shortDescriptor(parent), index: siblingIndex(el) }
+}
+
+/** Where the element sat before Pointer ever moved it — its current spot if
+ * it hasn't been moved. The panel compares this against where a move lands
+ * to describe the *net* change ("moved into X", or nothing at all if it's
+ * back where it started), instead of chaining one move onto the last. */
+function pristinePlacement(id: number, el: Element): Placement | null {
+  const rec = movePristine.get(id)
+  if (!rec) return placementOf(el)
+  // Walk from the remembered marker to the next real element — skipping
+  // text nodes, and the element itself, which may since have landed right
+  // back between the marker and its old neighbour.
+  let next: Node | null = rec.nextSibling
+  while (next && (next.nodeType !== Node.ELEMENT_NODE || next === el)) next = next.nextSibling
+  const others = Array.from(rec.parent.children).filter((c) => c !== el)
+  const index = next ? others.indexOf(next as Element) : -1
+  return {
+    parentId: registerEl(rec.parent),
+    parentDesc: shortDescriptor(rec.parent),
+    index: index < 0 ? others.length : index,
+  }
+}
+
+// from: where it sat just before this move. origin: where it sat before
+// Pointer ever touched it. to: where it is now.
+type MoveResult = {
+  ok: boolean
+  target?: SelectionPayload
+  from?: Placement
+  origin?: Placement
+  to?: Placement
+}
+
+function afterElementMoved(el: Element) {
+  if (selectedEl === el && selectBox) positionBox(selectBox, el)
+  if (selectedEl) drawGridOverlay(selectedEl)
+  schedulePinUpdate()
+}
+
+// Arbitrary drag-and-drop from the Layers tab — not limited to swapping with
+// an adjacent sibling like moveElement/moveToEdge (those back the Position
+// tab's Back/Forward buttons), this can also move an element into a
+// completely different parent, like dragging a layer in Figma.
+//   before / after — as a sibling of `target`, on that side of it
+//   inside         — as the last child of `target` (i.e. "put it in the div")
 function reparentElement(
   id: number,
   targetId: number,
   position: 'before' | 'after' | 'inside'
-): { ok: boolean; target?: SelectionPayload; fromParentDesc?: string; toParentDesc?: string } {
+): MoveResult {
   const el = getEl(id)
   const target = getEl(targetId)
   if (!el || !target || el === target) return { ok: false }
@@ -625,19 +675,43 @@ function reparentElement(
 
   const parent = position === 'inside' ? target : target.parentElement
   if (!parent) return { ok: false }
-  const refNode = position === 'inside' ? parent.firstChild : position === 'before' ? target : target.nextSibling
-  if (el === refNode) return { ok: false } // already exactly there
+  const from = placementOf(el)
+  if (!from) return { ok: false }
+
+  // Work out where it would land before touching the DOM, so a drop that
+  // resolves to its current spot (e.g. "after" its own previous sibling)
+  // is a clean no-op rather than a recorded edit.
+  const others = Array.from(parent.children).filter((c) => c !== el)
+  const index =
+    position === 'inside'
+      ? others.length
+      : others.indexOf(target) + (position === 'after' ? 1 : 0)
+  if (parent === el.parentElement && index === from.index) return { ok: false }
 
   if (!movePristine.has(id)) {
     movePristine.set(id, { parent: el.parentElement!, nextSibling: el.nextSibling })
   }
-  const fromParentDesc = el.parentElement ? shortDescriptor(el.parentElement) : ''
-  parent.insertBefore(el, refNode)
+  parent.insertBefore(el, index < others.length ? others[index] : null)
+  afterElementMoved(el)
+  return { ok: true, target: buildPayload(el), from, origin: pristinePlacement(id, el)!, to: placementOf(el)! }
+}
 
-  if (selectedEl === el && selectBox) positionBox(selectBox, el)
-  if (selectedEl) drawGridOverlay(selectedEl)
-  schedulePinUpdate()
-  return { ok: true, target: buildPayload(el), fromParentDesc, toParentDesc: shortDescriptor(parent) }
+/** Puts an element at an exact (parent, index) — what undo/redo replays a
+ * Layers-tab move with, since such a move may have crossed parents. */
+function placeElement(id: number, parentId: number, index: number): MoveResult {
+  const el = getEl(id)
+  const parent = getEl(parentId)
+  if (!el || !parent || el === parent || el.contains(parent)) return { ok: false }
+  const from = placementOf(el)
+  if (!from) return { ok: false }
+  if (!movePristine.has(id)) {
+    movePristine.set(id, { parent: el.parentElement!, nextSibling: el.nextSibling })
+  }
+  const siblings = Array.from(parent.children).filter((c) => c !== el)
+  const refNode = index < siblings.length ? siblings[index] : null
+  parent.insertBefore(el, refNode)
+  afterElementMoved(el)
+  return { ok: true, target: buildPayload(el), from, origin: pristinePlacement(id, el)!, to: placementOf(el)! }
 }
 
 function resetMove(id: number): boolean {
@@ -2869,6 +2943,9 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     case 'PTR_REPARENT_ELEMENT':
       sendResponse(reparentElement(msg.elementId, msg.targetId, msg.position))
+      break
+    case 'PTR_PLACE_ELEMENT':
+      sendResponse(placeElement(msg.elementId, msg.parentId, msg.index))
       break
     case 'PTR_INSERT_ELEMENT':
       sendResponse(insertElement(msg.kind, msg.targetId ?? null, msg.position))

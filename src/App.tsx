@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -83,6 +83,7 @@ import {
   type TokenEdit,
   type PointerComment,
   type LayerNode,
+  type Placement,
   sendToPage,
   generatePrompt,
 } from '@/lib/pointer'
@@ -1016,6 +1017,217 @@ function canNestInto(kind: LayerNode['kind']): boolean {
 
 export type LayerDropTarget = { id: number; position: 'before' | 'after' | 'inside' }
 
+/** Ids of `id` and everything under it — none of these can be a drop target
+ * while `id` is being dragged (an element can't be moved into itself). */
+function subtreeIds(nodes: LayerNode[], id: number): Set<number> {
+  const out = new Set<number>()
+  const collect = (n: LayerNode) => {
+    out.add(n.id)
+    n.children.forEach(collect)
+  }
+  const find = (list: LayerNode[]): boolean => {
+    for (const n of list) {
+      if (n.id === id) {
+        collect(n)
+        return true
+      }
+      if (find(n.children)) return true
+    }
+    return false
+  }
+  find(nodes)
+  return out
+}
+
+const DRAG_THRESHOLD_PX = 4
+const AUTO_EXPAND_MS = 600
+const AUTO_SCROLL_EDGE_PX = 28
+const AUTO_SCROLL_MAX_PX = 14
+
+/**
+ * The Layers-tab drag gesture, modelled on Figma's layer panel.
+ *
+ * The visible tree is read as a flat list of rows, and every gap between two
+ * rows is exactly one slot in the DOM — so the line drawn under the cursor
+ * always means precisely one thing:
+ *   - top quarter of a row      → before it (as a sibling)
+ *   - middle of a container row → inside it, at the end ("put it in the div")
+ *   - bottom quarter of a row   → after it (as a sibling)… except when the
+ *     row is an *open* container, where the gap under it is visually the
+ *     slot before its first child, so that's what it maps to.
+ * Rows that can't hold children (text, images, svgs) only offer before/after.
+ * The dragged row and its own descendants are never targets.
+ *
+ * The whole gesture lives in this one closure: which row is being dragged
+ * and where it currently hovers are local variables, and the final drop is
+ * reported with explicit arguments. Nothing is read back out of React state
+ * at drop time — an earlier version did, and always saw the stale, empty
+ * values from the render in which the press began, so drops silently did
+ * nothing. React state is only *written* here, purely for the visuals.
+ *
+ * Pointer capture keeps move/up events flowing even when the cursor leaves
+ * the side panel mid-drag, so releasing outside never leaves a drag stuck.
+ * Hovering a collapsed container for a moment opens it (like Figma), and
+ * nearing the top/bottom edge scrolls the list so long trees are reachable.
+ */
+function startLayerDrag(
+  e: ReactPointerEvent<HTMLElement>,
+  id: number,
+  tree: LayerNode[],
+  cb: {
+    onClick: (id: number) => void
+    onDrop: (id: number, target: LayerDropTarget) => void
+    onExpand: (id: number) => void
+    setDragged: (id: number | null) => void
+    setDropTarget: (t: LayerDropTarget | null) => void
+  }
+) {
+  if (e.button !== 0) return
+  const row = e.currentTarget
+  const viewport = row.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')
+  const startX = e.clientX
+  const startY = e.clientY
+  const excluded = subtreeIds(tree, id)
+
+  let dragging = false
+  let lastX = startX
+  let lastY = startY
+  let target: LayerDropTarget | null = null
+  let expandTimer: number | null = null
+  let expandFor: number | null = null
+  let scrollRaf: number | null = null
+
+  const rowAt = (x: number, y: number): HTMLElement | null => {
+    const hit = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-layer-id]') ?? null
+    if (hit) return hit
+    // Below the last row (blank space at the end of the list): treat as
+    // hovering the bottom edge of that last row.
+    const rows = viewport?.querySelectorAll<HTMLElement>('[data-layer-id]')
+    const last = rows?.[rows.length - 1]
+    if (last && y > last.getBoundingClientRect().bottom) return last
+    return null
+  }
+
+  const setTarget = (t: LayerDropTarget | null) => {
+    if (t?.id === target?.id && t?.position === target?.position) return
+    target = t
+    cb.setDropTarget(t)
+  }
+
+  const scheduleExpand = (hovered: HTMLElement, hoveredId: number) => {
+    const collapsed = hovered.dataset.layerHasChildren === '1' && hovered.dataset.layerOpen !== '1'
+    if (!collapsed) {
+      cancelExpand()
+      return
+    }
+    if (expandFor === hoveredId) return
+    cancelExpand()
+    expandFor = hoveredId
+    expandTimer = window.setTimeout(() => {
+      cb.onExpand(hoveredId)
+      expandTimer = null
+    }, AUTO_EXPAND_MS)
+  }
+  const cancelExpand = () => {
+    if (expandTimer != null) window.clearTimeout(expandTimer)
+    expandTimer = null
+    expandFor = null
+  }
+
+  const resolve = () => {
+    const hovered = rowAt(lastX, lastY)
+    if (!hovered) return
+    const hoveredId = Number(hovered.dataset.layerId)
+    if (excluded.has(hoveredId)) {
+      cancelExpand()
+      setTarget(null)
+      return
+    }
+    const rect = hovered.getBoundingClientRect()
+    const ratio = Math.min(1, Math.max(0, (lastY - rect.top) / rect.height))
+    const nestable = hovered.dataset.layerNestable === '1'
+    const open = hovered.dataset.layerOpen === '1'
+    const firstChild = hovered.dataset.layerFirstChild
+
+    if (!nestable) {
+      cancelExpand()
+      setTarget({ id: hoveredId, position: ratio < 0.5 ? 'before' : 'after' })
+      return
+    }
+    if (ratio < 0.25) {
+      cancelExpand()
+      setTarget({ id: hoveredId, position: 'before' })
+    } else if (ratio < 0.75) {
+      scheduleExpand(hovered, hoveredId)
+      setTarget({ id: hoveredId, position: 'inside' })
+    } else {
+      cancelExpand()
+      if (open && firstChild) setTarget({ id: Number(firstChild), position: 'before' })
+      else setTarget({ id: hoveredId, position: 'after' })
+    }
+  }
+
+  const autoScroll = () => {
+    scrollRaf = null
+    if (!viewport || !dragging) return
+    const r = viewport.getBoundingClientRect()
+    let delta = 0
+    if (lastY < r.top + AUTO_SCROLL_EDGE_PX) {
+      delta = -Math.ceil(((r.top + AUTO_SCROLL_EDGE_PX - lastY) / AUTO_SCROLL_EDGE_PX) * AUTO_SCROLL_MAX_PX)
+    } else if (lastY > r.bottom - AUTO_SCROLL_EDGE_PX) {
+      delta = Math.ceil(((lastY - (r.bottom - AUTO_SCROLL_EDGE_PX)) / AUTO_SCROLL_EDGE_PX) * AUTO_SCROLL_MAX_PX)
+    }
+    if (delta !== 0) {
+      const before = viewport.scrollTop
+      viewport.scrollTop += delta
+      if (viewport.scrollTop !== before) resolve()
+    }
+    scrollRaf = requestAnimationFrame(autoScroll)
+  }
+
+  const onMove = (ev: PointerEvent) => {
+    lastX = ev.clientX
+    lastY = ev.clientY
+    if (!dragging) {
+      if (Math.hypot(lastX - startX, lastY - startY) < DRAG_THRESHOLD_PX) return
+      dragging = true
+      cb.setDragged(id)
+      document.body.style.cursor = 'grabbing'
+      if (scrollRaf == null) scrollRaf = requestAnimationFrame(autoScroll)
+    }
+    resolve()
+  }
+
+  const finish = (drop: boolean) => {
+    row.removeEventListener('pointermove', onMove)
+    row.removeEventListener('pointerup', onUp)
+    row.removeEventListener('pointercancel', onCancel)
+    try {
+      row.releasePointerCapture(e.pointerId)
+    } catch {
+      /* already released */
+    }
+    cancelExpand()
+    if (scrollRaf != null) cancelAnimationFrame(scrollRaf)
+    document.body.style.cursor = ''
+    const finalTarget = target
+    cb.setDragged(null)
+    cb.setDropTarget(null)
+    if (!dragging) {
+      if (drop) cb.onClick(id)
+      return
+    }
+    if (drop && finalTarget) cb.onDrop(id, finalTarget)
+  }
+  const onUp = () => finish(true)
+  const onCancel = () => finish(false)
+
+  row.setPointerCapture(e.pointerId)
+  row.addEventListener('pointermove', onMove)
+  row.addEventListener('pointerup', onUp)
+  row.addEventListener('pointercancel', onCancel)
+}
+
 function LayerTree({
   nodes,
   depth,
@@ -1024,12 +1236,8 @@ function LayerTree({
   draggedId,
   dropTarget,
   onToggle,
-  onSelect,
+  onPointerDownRow,
   onHover,
-  onDragStartRow,
-  onDragOverRow,
-  onDropRow,
-  onDragEndRow,
 }: {
   nodes: LayerNode[]
   depth: number
@@ -1038,12 +1246,8 @@ function LayerTree({
   draggedId: number | null
   dropTarget: LayerDropTarget | null
   onToggle: (id: number) => void
-  onSelect: (id: number) => void
+  onPointerDownRow: (e: ReactPointerEvent<HTMLElement>, id: number) => void
   onHover: (id: number | null) => void
-  onDragStartRow: (id: number) => void
-  onDragOverRow: (id: number, position: LayerDropTarget['position']) => void
-  onDropRow: () => void
-  onDragEndRow: () => void
 }) {
   return (
     <>
@@ -1057,61 +1261,24 @@ function LayerTree({
             <div
               role="button"
               tabIndex={0}
+              // Everything the drag gesture needs to know about a row is
+              // published here, so it can be read straight off whatever row
+              // is under the cursor — no React state lookups mid-drag.
               data-layer-id={n.id}
-              data-layer-kind={n.kind}
+              data-layer-nestable={canNestInto(n.kind) ? '1' : '0'}
+              data-layer-has-children={hasChildren ? '1' : '0'}
+              data-layer-open={hasChildren && open ? '1' : '0'}
+              data-layer-first-child={hasChildren ? n.children[0].id : undefined}
               ref={(node) => {
                 if (node && isSelected) node.scrollIntoView({ block: 'nearest' })
               }}
-              // Native HTML5 draggable starts a drag on the very first
-              // pixel of movement, no matter how small — so an ordinary
-              // click with a hair of hand-tremor routinely got swallowed
-              // as a drag attempt instead of registering as a click. This
-              // tracks the press by hand with a real threshold: under it,
-              // it's a click; past it, it's a drag, with the drop target
-              // recomputed from whatever row is actually under the cursor.
-              onMouseDown={(e) => {
-                if (e.button !== 0) return
-                const startX = e.clientX
-                const startY = e.clientY
-                let moved = false
-                const onMove = (ev: MouseEvent) => {
-                  const dx = ev.clientX - startX
-                  const dy = ev.clientY - startY
-                  if (!moved) {
-                    if (Math.hypot(dx, dy) < 4) return
-                    moved = true
-                    onDragStartRow(n.id)
-                  }
-                  const hovered = document
-                    .elementFromPoint(ev.clientX, ev.clientY)
-                    ?.closest<HTMLElement>('[data-layer-id]')
-                  if (!hovered) return
-                  const targetId = Number(hovered.dataset.layerId)
-                  const targetKind = hovered.dataset.layerKind as LayerNode['kind']
-                  if (targetId === n.id) return
-                  const rect = hovered.getBoundingClientRect()
-                  const ratio = (ev.clientY - rect.top) / rect.height
-                  const nestable = canNestInto(targetKind)
-                  const position: LayerDropTarget['position'] =
-                    nestable && ratio > 0.25 && ratio < 0.75
-                      ? 'inside'
-                      : ratio < 0.5
-                        ? 'before'
-                        : 'after'
-                  onDragOverRow(targetId, position)
-                }
-                const onUp = () => {
-                  document.removeEventListener('mousemove', onMove)
-                  document.removeEventListener('mouseup', onUp)
-                  if (moved) onDropRow()
-                  else onSelect(n.id)
-                  onDragEndRow()
-                }
-                document.addEventListener('mousemove', onMove)
-                document.addEventListener('mouseup', onUp)
+              onPointerDown={(e) => onPointerDownRow(e, n.id)}
+              onMouseEnter={() => {
+                if (draggedId == null) onHover(n.id)
               }}
-              onMouseEnter={() => onHover(n.id)}
-              onMouseLeave={() => onHover(null)}
+              onMouseLeave={() => {
+                if (draggedId == null) onHover(null)
+              }}
               className={
                 'relative flex h-7 cursor-default items-center gap-1 rounded-sm pr-2 text-xs select-none ' +
                 (drop === 'inside'
@@ -1123,11 +1290,21 @@ function LayerTree({
               }
               style={{ paddingLeft: 4 + depth * 14 }}
             >
+              {/* The line starts at this row's indent, so it reads as
+                  "at this depth" — that's how the slot under an open
+                  container (drawn at the child depth) tells apart from
+                  a slot beside it. */}
               {drop === 'before' && (
-                <div className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-primary" />
+                <div
+                  className="pointer-events-none absolute top-0 right-0 h-0.5 bg-primary"
+                  style={{ left: 4 + depth * 14 }}
+                />
               )}
               {drop === 'after' && (
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-0.5 bg-primary" />
+                <div
+                  className="pointer-events-none absolute right-0 bottom-0 h-0.5 bg-primary"
+                  style={{ left: 4 + depth * 14 }}
+                />
               )}
               <button
                 type="button"
@@ -1135,7 +1312,7 @@ function LayerTree({
                   'flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground ' +
                   (hasChildren ? '' : 'invisible')
                 }
-                onMouseDown={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation()
                   onToggle(n.id)
@@ -1160,12 +1337,8 @@ function LayerTree({
                 draggedId={draggedId}
                 dropTarget={dropTarget}
                 onToggle={onToggle}
-                onSelect={onSelect}
+                onPointerDownRow={onPointerDownRow}
                 onHover={onHover}
-                onDragStartRow={onDragStartRow}
-                onDragOverRow={onDragOverRow}
-                onDropRow={onDropRow}
-                onDragEndRow={onDragEndRow}
               />
             )}
           </div>
@@ -1436,7 +1609,7 @@ export default function App() {
     }
   }
 
-  async function loadTree() {
+  async function loadTree(revealId?: number) {
     try {
       const r = await sendToPage({ type: 'PTR_GET_TREE', frameToken: lastFrameRef.current ?? undefined })
       const nodes: LayerNode[] = r.tree ?? []
@@ -1446,6 +1619,7 @@ export default function App() {
         // First load: open the top level so the tree isn't a single row.
         if (prev.size === 0) nodes.forEach((n) => next.add(n.id))
         if (selection) pathToNode(nodes, selection.elementId)?.forEach((id) => next.add(id))
+        if (revealId != null) pathToNode(nodes, revealId)?.forEach((id) => next.add(id))
         return next
       })
     } catch {
@@ -1650,21 +1824,74 @@ export default function App() {
   // completely different parent, not just shuffle it among its current
   // siblings.
   async function reparentLayer(id: number, targetId: number, position: LayerDropTarget['position']) {
+    const frameToken = lastFrameRef.current ?? undefined
     try {
       const r = await sendToPage({
         type: 'PTR_REPARENT_ELEMENT',
-        frameToken: lastFrameRef.current ?? undefined,
+        frameToken,
         elementId: id,
         targetId,
         position,
       })
       if (!r?.ok || !r.target) return
-      upsertEdit(r.target, 'move', 'parent', r.fromParentDesc, r.toParentDesc, r.toParentDesc)
-      if (selection?.elementId === id) setSelection(r.target)
-      await loadTree()
+      const { origin, to } = r as { origin: Placement; to: Placement }
+      pushHistory({
+        frameToken: r.target.frameToken,
+        elementId: id,
+        kind: 'move',
+        prop: 'parent',
+        // Undo needs the spot it came *from this time*, which is where it
+        // was a moment ago — not necessarily its pristine origin.
+        from: JSON.stringify(r.from ?? origin),
+        to: JSON.stringify(to),
+      })
+      syncMoveEdit(r.target, origin, to)
+      // Like Figma, the layer you just dropped is the selected one — and
+      // selecting it is what reveals it in its new place in the tree.
+      selectLayer(id)
+      await loadTree(id)
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
+  }
+
+  /** The single "move" edit an element has in the Changes tab, derived from
+   * where it started vs where it is now — so any number of drags collapse
+   * into one honest line, and dragging it back home makes the line vanish. */
+  function syncMoveEdit(target: SelectionPayload, origin: Placement, to: Placement) {
+    setEdits((prev) => {
+      const rest = prev.filter((e) => !(e.kind === 'move' && e.target.elementId === target.elementId))
+      if (origin.parentId === to.parentId && origin.index === to.index) return rest
+      const edit: Edit =
+        origin.parentId === to.parentId
+          ? {
+              id: crypto.randomUUID(),
+              target,
+              kind: 'move',
+              prop: 'order',
+              from: String(origin.index),
+              to: String(to.index),
+              detail: to.parentDesc,
+            }
+          : {
+              id: crypto.randomUUID(),
+              target,
+              kind: 'move',
+              prop: 'parent',
+              from: origin.parentDesc,
+              to: to.parentDesc,
+              detail: String(to.index),
+            }
+      return [...rest, edit]
+    })
+  }
+
+  function selectLayer(id: number) {
+    sendToPage({
+      type: 'PTR_RESELECT_ID',
+      frameToken: lastFrameRef.current ?? undefined,
+      elementId: id,
+    }).catch(() => {})
   }
 
   function selectTab(v: string) {
@@ -1819,6 +2046,22 @@ export default function App() {
   // Apply one history op in a given direction and sync panel state.
   async function applyOp(op: HistoryOp, value: string) {
     try {
+      if (op.kind === 'move' && op.prop === 'parent') {
+        // A Layers-tab drag may have crossed into another parent, so this
+        // replays it as "put it at (parent, index)" rather than as an
+        // index within whatever parent it happens to be in now.
+        const place = JSON.parse(value) as Placement
+        const r = await sendToPage({
+          type: 'PTR_PLACE_ELEMENT',
+          frameToken: op.frameToken,
+          elementId: op.elementId,
+          parentId: place.parentId,
+          index: place.index,
+        })
+        if (r?.ok && r.target) syncMoveEdit(r.target, r.origin, r.to)
+        if (activeTab === 'layers') loadTree(op.elementId)
+        return
+      }
       if (op.kind === 'move') {
         // Jump straight to the exact index rather than nudging one sibling
         // at a time — the original move (a canvas drag, or "move to end")
@@ -2795,19 +3038,23 @@ export default function App() {
                 selectedId={selection?.elementId ?? null}
                 draggedId={draggedLayerId}
                 dropTarget={layerDropTarget}
-                onDragStartRow={setDraggedLayerId}
-                onDragOverRow={(id, position) => setLayerDropTarget({ id, position })}
-                onDropRow={() => {
-                  if (draggedLayerId != null && layerDropTarget) {
-                    reparentLayer(draggedLayerId, layerDropTarget.id, layerDropTarget.position)
-                  }
-                  setDraggedLayerId(null)
-                  setLayerDropTarget(null)
-                }}
-                onDragEndRow={() => {
-                  setDraggedLayerId(null)
-                  setLayerDropTarget(null)
-                }}
+                onPointerDownRow={(e, id) =>
+                  startLayerDrag(e, id, tree, {
+                    setDragged: setDraggedLayerId,
+                    setDropTarget: setLayerDropTarget,
+                    onExpand: (id) => setExpanded((prev) => new Set(prev).add(id)),
+                    onDrop: (id, target) => reparentLayer(id, target.id, target.position),
+                    onClick: (id) => {
+                      // Clicking the already-selected layer toggles it off,
+                      // same as clicking empty canvas space in Figma.
+                      if (id === selection?.elementId) {
+                        deselect()
+                        return
+                      }
+                      selectLayer(id)
+                    },
+                  })
+                }
                 onToggle={(id) =>
                   setExpanded((prev) => {
                     const next = new Set(prev)
@@ -2816,19 +3063,6 @@ export default function App() {
                     return next
                   })
                 }
-                onSelect={(id) => {
-                  // Clicking the already-selected layer toggles it off,
-                  // same as clicking empty canvas space in Figma.
-                  if (id === selection?.elementId) {
-                    deselect()
-                    return
-                  }
-                  sendToPage({
-                    type: 'PTR_RESELECT_ID',
-                    frameToken: lastFrameRef.current ?? undefined,
-                    elementId: id,
-                  }).catch(() => {})
-                }}
                 onHover={(id) =>
                   sendToPage({
                     type: 'PTR_HOVER_ID',
