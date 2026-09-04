@@ -194,12 +194,6 @@ function toHex(c: ParsedColor): string {
   return `#${h(c.r)}${h(c.g)}${h(c.b)}`
 }
 
-/** Hex for <input type="color">, which only accepts 6-digit hex. */
-function swatchHex(value: string): string {
-  const c = parseColor(value)
-  return c.transparent || c.unknown ? '#ffffff' : toHex(c)
-}
-
 /**
  * What the text field shows. Transparent and unrecognized values are shown
  * verbatim rather than coerced into a color — showing `#000000` for an
@@ -3101,49 +3095,33 @@ export default function App() {
                     <p className="text-xs font-medium text-muted-foreground">{group.title}</p>
 
                     {group.title === 'Colors' ? (
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-2">
                         {group.items.map((t) => {
                           const value = tokenDraft[t.name] ?? t.value
                           const edited = tokenEdits.some((e) => e.name === t.name)
                           return (
-                            <div
-                              key={t.name}
-                              className={
-                                'flex items-center gap-2 rounded-md border p-1.5' +
-                                (edited ? ' border-primary bg-primary/5' : '')
-                              }
-                            >
-                              <div
-                                className="relative size-8 shrink-0 overflow-hidden rounded border"
-                                style={{ background: CHECKER }}
-                              >
-                                <div className="absolute inset-0" style={{ background: value }} />
-                                <input
-                                  type="color"
-                                  value={swatchHex(value)}
-                                  onChange={(e) => applyToken(t.name, e.target.value)}
-                                  className="absolute inset-0 cursor-pointer opacity-0"
-                                />
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <p className="truncate text-xs font-medium">
+                            <div key={t.name} className="space-y-1">
+                              <div className="flex items-center justify-between gap-2">
+                                <Label className="min-w-0 truncate text-[11px] text-muted-foreground">
                                   {advancedTokens ? t.name : tokenLabel(t.name)}
-                                </p>
-                                <p className="truncate font-mono text-[10px] text-muted-foreground">
-                                  {value}
-                                </p>
+                                </Label>
+                                {edited && (
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="size-5 shrink-0"
+                                    title="Reset this change"
+                                    onClick={() => resetTokenEdit(t.name)}
+                                  >
+                                    <RotateCcw className="size-3" />
+                                  </Button>
+                                )}
                               </div>
-                              {edited && (
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="size-5 shrink-0"
-                                  title="Reset this change"
-                                  onClick={() => resetTokenEdit(t.name)}
-                                >
-                                  <RotateCcw className="size-3" />
-                                </Button>
-                              )}
+                              <ColorRow
+                                value={value}
+                                edited={edited}
+                                onChange={(v) => applyToken(t.name, v)}
+                              />
                             </div>
                           )
                         })}
