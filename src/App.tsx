@@ -124,6 +124,8 @@ type ParsedColor = {
 
 const NO_COLOR: ParsedColor = { r: 0, g: 0, b: 0, alpha: 0, transparent: true, unknown: false }
 
+let colorCanvasCtx: CanvasRenderingContext2D | null = null
+
 function parseColor(value: string): ParsedColor {
   const v = (value || '').trim()
   if (!v || v === 'transparent' || v === 'none') return NO_COLOR
@@ -153,6 +155,35 @@ function parseColor(value: string): ParsedColor {
     }
     if ([r, g, b].some(Number.isNaN)) return { ...NO_COLOR, unknown: true, transparent: false }
     return { r, g, b, alpha, transparent: alpha === 0, unknown: false }
+  }
+
+  // Modern wide-gamut syntaxes (oklch(), lab(), color(), color-mix() with
+  // those) — common in current Tailwind palettes — don't match either
+  // regex above. Without this, they were marked "unknown" and the picker
+  // opened on plain white, silently ready to overwrite the real color the
+  // moment you touched anything in it. A 2D canvas always renders any
+  // valid CSS color into sRGB, whatever function was used to specify it,
+  // so painting one pixel and reading it back resolves these reliably —
+  // the same technique already used for the Figma export.
+  try {
+    if (!colorCanvasCtx) {
+      colorCanvasCtx = document.createElement('canvas').getContext('2d', {
+        willReadFrequently: true,
+      })
+    }
+    if (colorCanvasCtx) {
+      colorCanvasCtx.clearRect(0, 0, 1, 1)
+      colorCanvasCtx.fillStyle = '#000'
+      colorCanvasCtx.fillStyle = v
+      const rejected = colorCanvasCtx.fillStyle === '#000000' && v !== '#000' && !/^#0{3,6}$/i.test(v)
+      if (!rejected) {
+        colorCanvasCtx.fillRect(0, 0, 1, 1)
+        const [r, g, b, a] = colorCanvasCtx.getImageData(0, 0, 1, 1).data
+        return { r, g, b, alpha: a / 255, transparent: a === 0, unknown: false }
+      }
+    }
+  } catch {
+    // fall through to unknown
   }
 
   return { r: 0, g: 0, b: 0, alpha: 1, transparent: false, unknown: true }
