@@ -1628,9 +1628,13 @@ export default function App() {
   }
 
   useEffect(() => {
+    // 'center' (not 'nearest') so clicking a tab near either edge nudges it
+    // toward the middle — that shift is what tells you there are more tabs
+    // hidden off to its side, since a tab flush against the edge looks the
+    // same whether or not anything's hidden past it.
     tabsListRef.current
       ?.querySelector<HTMLElement>('[data-state="active"]')
-      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+      ?.scrollIntoView({ block: 'nearest', inline: 'center' })
   }, [activeTab])
 
   // Keep the selected layer revealed as selection changes on the page.
