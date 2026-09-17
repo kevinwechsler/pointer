@@ -26,6 +26,10 @@ export type SelectionPayload = {
    * these are what tell Hug/Fixed/Fill apart.
    */
   inline: Record<string, string>
+  /** The parent's layout mode, which decides what Hug/Fixed/Fill have to
+   * write: grow along the parent's main axis, stretch across it, or a plain
+   * percentage when the parent isn't a flex container at all. */
+  parentLayout: { display: string; flexDirection: string }
   /** Decomposed transform, so position and rotation can be edited separately. */
   transform: { dx: number; dy: number; rotate: number }
   /** Position among siblings, so reordering controls can show "2 of 5". */

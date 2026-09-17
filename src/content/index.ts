@@ -1,9 +1,14 @@
+// The panel and this script exchange these shapes; they used to be
+// declared twice, once on each side, which let them drift apart in
+// silence. Type-only imports are erased at build time, so sharing the
+// single definition costs the content script nothing at runtime.
+import type { SelectionPayload, SourceInfo } from '@/lib/pointer'
+
 // Pointer content script: runs inside the localhost page.
 // Handles hover highlighting, element selection, live style edits with
 // true revert (restores the element's pristine state), and resolving
 // the selected DOM element back to its source file via React fiber.
 
-type SourceInfo = { fileName: string; lineNumber: number } | null
 
 // With all_frames enabled, one copy of this script runs per frame (the app
 // may live inside an iframe, e.g. hosted platforms like Urdi). Each copy
@@ -23,36 +28,6 @@ const IS_HOST_CHROME =
   (/urdi dev harness/i.test(document.title) ||
     !!document.querySelector('iframe[src^="/__app__"]'))
 
-export type SelectionPayload = {
-  frameToken: string
-  elementId: number
-  tag: string
-  id: string
-  classes: string[]
-  selector: string
-  /** Only set for a text leaf (no child elements) — never a joined blob
-   * from multiple descendants, which editing would destroy. */
-  text: string
-  /** Typography keys (color, fontSize, ...) to hide: the subtree's text
-   * runs don't all share that value, or there's no text at all. */
-  mixedTypography: string[]
-  componentChain: string[]
-  source: SourceInfo
-  styles: Record<string, string>
-  rect: { width: number; height: number; left: number; top: number }
-  /**
-   * Author-set inline values. Computed styles always resolve to pixels, so
-   * these are what tell Hug/Fixed/Fill apart.
-   */
-  inline: Record<string, string>
-  /** Decomposed transform, so position and rotation can be edited separately. */
-  transform: { dx: number; dy: number; rotate: number }
-  /** Position among siblings, so reordering controls can show "2 of 5". */
-  index: number
-  siblingCount: number
-  /** True for elements Pointer created (insert or duplicate). */
-  isNew: boolean
-}
 
 const STYLE_PROPS = [
   'color',
@@ -80,6 +55,11 @@ const STYLE_PROPS = [
   'alignItems',
   'justifyContent',
   'gap',
+  // Read and written separately from the `gap` shorthand: that shorthand can
+  // hold two different lengths at once ("10px 20px"), which no single numeric
+  // field can represent or edit.
+  'rowGap',
+  'columnGap',
   'opacity',
   'boxShadow',
   'width',
@@ -457,8 +437,19 @@ function buildPayload(el: Element): SelectionPayload {
       top: Math.round(rect.top),
     },
     inline: readInline(el),
+    parentLayout: readParentLayout(el),
     transform: getTransformParts(registerEl(el)),
   }
+}
+
+/** How the parent lays its children out. Whether "Fill" means grow, stretch
+ * or 100% width depends entirely on this — the same CSS does nothing at all
+ * in the wrong kind of parent. */
+function readParentLayout(el: Element): SelectionPayload['parentLayout'] {
+  const parent = el.parentElement
+  if (!parent) return { display: 'block', flexDirection: 'row' }
+  const cs = getComputedStyle(parent)
+  return { display: cs.display, flexDirection: cs.flexDirection }
 }
 
 const INLINE_PROPS = [
@@ -491,25 +482,46 @@ function selectElement(el: Element) {
 
 // ---------- edit operations ----------
 
-function applyStyle(id: number, prop: string, value: string): boolean {
+/** What an element looks like right after an edit. The panel's sizing
+ * controls (Hug/Fixed/Fill) can't be read off computed styles — those always
+ * resolve to pixels — so they depend on the author-set inline values, which
+ * means the panel has to be told the new ones every time rather than reusing
+ * the ones captured back when the element was selected. */
+type StyleResult = { ok: boolean; inline?: Record<string, string>; rect?: SelectionPayload['rect'] }
+
+function liveStyleState(el: Element): StyleResult {
+  const r = el.getBoundingClientRect()
+  return {
+    ok: true,
+    inline: readInline(el),
+    rect: {
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+      left: Math.round(r.left),
+      top: Math.round(r.top),
+    },
+  }
+}
+
+function applyStyle(id: number, prop: string, value: string): StyleResult {
   const el = getEl(id)
-  if (!el) return false
+  if (!el) return { ok: false }
   const p = ensurePristine(id)
   if (!p.inline.has(prop)) p.inline.set(prop, el.style.getPropertyValue(prop))
   el.style.setProperty(prop, value)
   if (selectedEl === el && selectBox) positionBox(selectBox, el)
-  return true
+  return liveStyleState(el)
 }
 
-function resetStyle(id: number, prop: string): boolean {
+function resetStyle(id: number, prop: string): StyleResult {
   const el = getEl(id)
-  if (!el) return false
+  if (!el) return { ok: false }
   const original = pristine.get(id)?.inline.get(prop)
   if (original) el.style.setProperty(prop, original)
   else el.style.removeProperty(prop)
   pristine.get(id)?.inline.delete(prop)
   if (selectedEl === el && selectBox) positionBox(selectBox, el)
-  return true
+  return liveStyleState(el)
 }
 
 function setText(id: number, value: string): boolean {
@@ -2884,10 +2896,10 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
 
   switch (msg.type) {
     case 'PTR_APPLY_STYLE':
-      sendResponse({ ok: applyStyle(msg.elementId, msg.prop, msg.value) })
+      sendResponse(applyStyle(msg.elementId, msg.prop, msg.value))
       break
     case 'PTR_RESET_STYLE':
-      sendResponse({ ok: resetStyle(msg.elementId, msg.prop) })
+      sendResponse(resetStyle(msg.elementId, msg.prop))
       break
     case 'PTR_SET_TEXT':
       sendResponse({ ok: setText(msg.elementId, msg.value) })

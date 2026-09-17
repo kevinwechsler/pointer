@@ -519,12 +519,44 @@ const TYPOGRAPHY_FIELDS: StyleField[] = [
 // ---------- Layout: dimensions with Hug / Fixed / Fill ----------
 type SizeMode = 'fixed' | 'hug' | 'fill'
 
+/**
+ * Which of the parent's axes this one is. "Fill" is a different CSS property
+ * for each: along the parent's main axis it's flex-grow, across it it's
+ * align-self, and in a parent that isn't a flex container neither does
+ * anything at all — there it takes a plain percentage.
+ */
+type AxisRole = 'main' | 'cross' | 'none'
+
+function axisRole(
+  axis: 'width' | 'height',
+  parentLayout: SelectionPayload['parentLayout']
+): AxisRole {
+  if (!parentLayout?.display?.includes('flex')) return 'none'
+  const mainAxis = parentLayout.flexDirection?.startsWith('column') ? 'height' : 'width'
+  return axis === mainAxis ? 'main' : 'cross'
+}
+
+/** The inline property that makes this axis fill, and the value that means it. */
+function fillProp(role: AxisRole, axis: 'width' | 'height'): { prop: string; on: string; off: string } {
+  if (role === 'main') return { prop: 'flexGrow', on: '1', off: '0' }
+  if (role === 'cross') return { prop: 'alignSelf', on: 'stretch', off: 'auto' }
+  return { prop: axis, on: '100%', off: 'auto' }
+}
+
+const HUG_VALUES = ['', 'auto', 'fit-content', 'max-content', 'min-content']
+
 /** Figma's Hug/Fixed/Fill, read back from the CSS that produces each. */
-function currentSizeMode(axis: 'width' | 'height', inline: Record<string, string>): SizeMode {
-  const v = (inline[axis] || '').trim()
-  if (inline.flexGrow === '1' || inline.alignSelf === 'stretch' || v === '100%') return 'fill'
-  if (v === 'fit-content' || v === 'max-content' || v === 'auto') return 'hug'
-  if (v) return 'fixed'
+function currentSizeMode(
+  axis: 'width' | 'height',
+  inline: Record<string, string>,
+  role: AxisRole
+): SizeMode {
+  const size = (inline[axis] || '').trim()
+  const { prop, on } = fillProp(role, axis)
+  // An explicit length always wins: an element that's both grown and given a
+  // width reads as Fixed, since that's the number the field would show.
+  if (!HUG_VALUES.includes(size) && size !== '100%') return 'fixed'
+  if ((inline[prop] || '').trim() === on) return 'fill'
   return 'hug'
 }
 
@@ -536,18 +568,21 @@ function DimensionField({
   axis,
   label,
   selection,
-  draft,
   onApply,
 }: {
   axis: 'width' | 'height'
   label: string
   selection: SelectionPayload
-  draft: Record<string, string>
   onApply: ApplyFn
 }) {
-  const mode = currentSizeMode(axis, selection.inline)
+  const role = axisRole(axis, selection.parentLayout)
+  const mode = currentSizeMode(axis, selection.inline, role)
   const px = axis === 'width' ? selection.rect.width : selection.rect.height
-  const shown = Math.round(parseFloat(draft[axis] ?? '') || px)
+  // Show the exact number that was typed when there is one, so a box-sizing
+  // difference can't make the field disagree with the value it just set.
+  // Anything else (a %, a rem, or a browser-chosen size) shows as measured.
+  const typed = parseUnit((selection.inline[axis] || '').trim())
+  const shown = Math.round(mode === 'fixed' && typed?.unit === 'px' ? Number(typed.num) : px)
   return (
     <div className="flex h-8 items-center rounded-md border bg-background pl-2 focus-within:ring-1 focus-within:ring-ring">
       <span className="w-4 font-mono text-[11px] text-muted-foreground">{label}</span>
@@ -560,19 +595,23 @@ function DimensionField({
       <Select
         value={mode}
         onValueChange={(m: SizeMode) => {
-          if (m === 'hug') {
+          // Each axis only ever touches its own axis's property. Setting both
+          // flex-grow and align-self (as this used to, "so it reads as fill
+          // either way") meant choosing Fill for the width silently stretched
+          // the height too, and choosing Hug for the width cancelled the
+          // height's Fill — so the two controls kept undoing each other.
+          const fill = fillProp(role, axis)
+          // In a parent that isn't flex, filling *is* the size (100%), so
+          // there's no separate property to turn off.
+          if (fill.prop !== axis) onApply(fill.prop, m === 'fill' ? fill.on : fill.off)
+          if (m === 'fill') {
+            // A length would override growing/stretching, so it has to go.
+            onApply(axis, fill.prop === axis ? fill.on : 'auto')
+          } else if (m === 'hug') {
+            // fit-content also opts out of the parent's default stretch,
+            // which plain "auto" would leave in place on the cross axis.
             onApply(axis, 'fit-content')
-            onApply('flexGrow', '0')
-            if (axis === 'height') onApply('alignSelf', 'auto')
-          } else if (m === 'fill') {
-            // Fill along the parent's main axis is flex-grow; across it,
-            // it's stretch. We set both so it reads as "fill" either way.
-            onApply('flexGrow', '1')
-            onApply('alignSelf', 'stretch')
-            onApply(axis, 'auto')
           } else {
-            onApply('flexGrow', '0')
-            onApply('alignSelf', 'auto')
             onApply(axis, `${Math.round(px)}px`)
           }
         }}
@@ -1691,18 +1730,41 @@ export default function App() {
     })
   }
 
+  /**
+   * Refresh the parts of the selection that an edit can change under us.
+   *
+   * Every other control in the panel reads `draft`, which is updated on each
+   * edit. The sizing controls can't: Hug/Fixed/Fill is only legible from the
+   * author-set inline values (computed styles always report plain pixels, so
+   * "fit-content" and "240px" look identical there), and those were captured
+   * once, when the element was selected. So the control kept reporting the
+   * mode the element had on selection no matter what you picked — and since
+   * the number field is only enabled in Fixed mode, switching to Fixed left
+   * it greyed out. Re-selecting the element refreshed the snapshot, which is
+   * exactly why it only broke *sometimes*. The page now reports the element's
+   * real state back after every edit, so the panel never reasons about a
+   * version of the element that no longer exists.
+   */
+  function syncLiveState(elementId: number, r: { inline?: Record<string, string>; rect?: SelectionPayload['rect'] }) {
+    if (!r?.inline || !r.rect) return
+    setSelection((s) =>
+      s && s.elementId === elementId ? { ...s, inline: r.inline!, rect: r.rect! } : s
+    )
+  }
+
   async function applyStyle(prop: string, value: string, record = true) {
     if (!selection) return
     const from = draft[prop] ?? selection.styles[prop]
     setDraft((d) => ({ ...d, [prop]: value }))
     try {
-      await sendToPage({
+      const r = await sendToPage({
         type: 'PTR_APPLY_STYLE',
         frameToken: selection.frameToken,
         elementId: selection.elementId,
         prop: toKebab(prop),
         value,
       })
+      syncLiveState(selection.elementId, r)
     } catch {
       return
     }
@@ -1717,12 +1779,13 @@ export default function App() {
     const from = draft[prop]
     const original = selection.styles[prop]
     try {
-      await sendToPage({
+      const r = await sendToPage({
         type: 'PTR_RESET_STYLE',
         frameToken: selection.frameToken,
         elementId: selection.elementId,
         prop: toKebab(prop),
       })
+      syncLiveState(selection.elementId, r)
     } catch {
       return
     }
@@ -2802,14 +2865,12 @@ export default function App() {
                             axis="width"
                             label="W"
                             selection={selection}
-                            draft={draft}
                             onApply={applyStyle}
                           />
                           <DimensionField
                             axis="height"
                             label="H"
                             selection={selection}
-                            draft={draft}
                             onApply={applyStyle}
                           />
                         </div>
@@ -2822,8 +2883,30 @@ export default function App() {
                               <AlignmentGrid draft={draft} onApply={applyStyle} />
                             </FieldRow>
                           )}
+                          {/* Never the `gap` shorthand: it can hold two
+                              different lengths ("10px 20px"), and unset it
+                              reads back as the keyword "normal" — neither of
+                              which a number+unit field can represent, so it
+                              kept collapsing into a plain text box. The two
+                              sides are read and written separately, and only
+                              the ones that actually do something are shown:
+                              a single row has nothing to space between rows,
+                              and a single column nothing between columns. */}
                           <div className="min-w-0 flex-1 space-y-2">
-                            {renderField({ prop: 'gap', label: 'Gap', type: 'unit' })}
+                            {flow !== 'vertical' &&
+                              renderField({
+                                prop: 'columnGap',
+                                label: flow === 'horizontal' ? 'Gap' : 'Gap between columns',
+                                type: 'unit',
+                                zeroKeyword: 'normal',
+                              })}
+                            {flow !== 'horizontal' &&
+                              renderField({
+                                prop: 'rowGap',
+                                label: flow === 'vertical' ? 'Gap' : 'Gap between rows',
+                                type: 'unit',
+                                zeroKeyword: 'normal',
+                              })}
                           </div>
                         </div>
                       )}
