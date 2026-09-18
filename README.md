@@ -2,17 +2,11 @@
 
 Point at elements in your localhost app, tweak them visually, and get a precise prompt to paste into Claude.
 
-## How it works
+## Setup
 
-1. Open your app running on `localhost` in Chrome.
-2. Click the Pointer icon in the toolbar → the side panel opens.
-3. Turn on **Inspect**, then click any element on the page.
-4. Edit its properties in the panel (colors, typography, spacing, borders, text). Changes preview live on the page.
-5. Go to the **Changes** tab → **Copy prompt** → paste into Claude Code.
+Two separate installs — the browser extension (required) and the Figma plugin (only if you want to send selections into Figma).
 
-The prompt references the exact source file and line when the app exposes that info (React apps in dev mode), or a precise CSS selector otherwise.
-
-## Install (dev)
+### 1. Install the browser extension
 
 ```bash
 npm install
@@ -25,30 +19,34 @@ Then in Chrome:
 2. Enable **Developer mode** (top right)
 3. Click **Load unpacked** and select the `dist/` folder of this repo
 
-After making code changes, run `npm run build` again and hit the refresh icon on the extension card.
+The Pointer icon appears in the toolbar. After pulling code changes, run `npm run build` again and hit the refresh icon on the extension card in `chrome://extensions`.
+
+### 2. Install the Figma plugin (optional, one-time)
+
+Only needed if you want **Copy for Figma** to work. It isn't published to the Figma Community — it's a **local development plugin**, a setup Figma supports for personal/internal tools with no review and no account needed. You only do this once per computer:
+
+1. Open the **Figma desktop app** (not figma.com in a browser — dev plugins only load from the desktop app).
+2. Figma menu (top left) → **Plugins → Development → Import plugin from manifest…**
+3. Pick `figma-plugin/manifest.json` from this repo.
+4. Done. It now shows up under **Plugins → Development → Pointer** in every file, like any other plugin.
+
+## How it works
+
+1. Open your app running on `localhost` in Chrome.
+2. Click the Pointer icon in the toolbar → the side panel opens.
+3. Turn on **Inspect**, then click any element on the page.
+4. Edit its properties in the panel (colors, typography, spacing, borders, text). Changes preview live on the page.
+5. Go to the **Changes** tab → **Copy prompt** → paste into Claude Code.
+
+The prompt references the exact source file and line when the app exposes that info (React apps in dev mode), or a precise CSS selector otherwise.
 
 ## Send a selection to Figma
 
-Select an element and hit **Copy for Figma** in the panel. It copies a real
-design tree (frames, auto layout, text — not an SVG), which the companion
-Figma plugin turns into native layers.
+Requires the Figma plugin installed above.
 
-The plugin isn't published to the Figma Community — it runs as a **local
-development plugin**, a one-time, no-review, no-account setup Figma supports
-for exactly this kind of personal/internal tool. You only do this once per
-computer:
-
-1. Open the **Figma desktop app** — dev plugins can't be loaded from
-   figma.com in a browser, only the desktop app.
-2. Figma menu (top left) → **Plugins → Development → Import plugin from
-   manifest…**
-3. Pick `figma-plugin/manifest.json` from this repo.
-4. Done — it now shows up under **Plugins → Development → Pointer** in
-   every file, same as any other plugin.
-
-To use it: select an element in Pointer → **Copy for Figma** → in Figma,
-run **Plugins → Development → Pointer** → paste (⌘V) into the box that
-opens. It imports as soon as you paste.
+1. Select an element in Pointer, hit **Copy for Figma**. It copies a real design tree (frames, auto layout, text — not an SVG or a screenshot).
+2. In Figma, run **Plugins → Development → Pointer**.
+3. Paste (⌘V) into the box that opens — it imports as native layers as soon as you paste.
 
 Why not publish it to the Figma Community instead (like html.to.design)? Publishing
 means a public listing, Figma's review process, and an ongoing obligation to
