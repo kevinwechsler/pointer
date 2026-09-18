@@ -42,11 +42,11 @@ export type SelectionPayload = {
 export type Edit = {
   id: string
   target: SelectionPayload
-  kind: 'style' | 'text' | 'move' | 'insert' | 'remove'
+  kind: 'style' | 'text' | 'move' | 'insert' | 'remove' | 'group'
   prop: string
   from: string
   to: string
-  // move: the containing element. insert: the new element's markup.
+  // move: the containing element. insert/group: the new element's markup.
   detail?: string
 }
 
@@ -133,6 +133,17 @@ export function generatePrompt(edits: Edit[], tokenEdits: TokenEdit[] = []): str
       : `selector: \`${t.selector}\``
     if (e.kind === 'insert') {
       lines.push(`${i + 1}. Add a new element inside ${e.detail ?? 'the selected container'}:`)
+      lines.push(`   ${e.to}`)
+      lines.push(
+        '   (Inline styles are just a starting point — use the project’s own components, classes, or tokens.)'
+      )
+      lines.push('')
+      return
+    }
+    if (e.kind === 'group') {
+      lines.push(
+        `${i + 1}. Wrap these elements (${e.from}) in a new flex container (auto layout), inside ${e.detail ?? 'their shared parent'}:`
+      )
       lines.push(`   ${e.to}`)
       lines.push(
         '   (Inline styles are just a starting point — use the project’s own components, classes, or tokens.)'

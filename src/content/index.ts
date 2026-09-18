@@ -478,6 +478,184 @@ function selectElement(el: Element) {
   clearHighlight()
   drawGridOverlay(el)
   chrome.runtime.sendMessage({ type: 'PTR_SELECTED', payload: buildPayload(el) })
+  // A plain (non-shift) select always resets to a single element, same as
+  // clicking empty canvas space and re-picking one in Figma.
+  if (extraSelectedIds.size) {
+    extraSelectedIds = new Set()
+    drawExtraBoxes()
+  }
+  broadcastMultiSelection()
+}
+
+// ---------- multi-select ----------
+// Shift+click adds or removes an element from the selection, Figma-style.
+// The most recently clicked element stays `selectedEl` — the one the
+// Element tab reads and edits — while everything picked up along the way
+// lives in this set, drawn with a plainer outline of its own and with no
+// individual editing. Right now the only thing a multi-selection is for is
+// grouping into a new auto-layout container.
+let extraSelectedIds = new Set<number>()
+let extraBoxes: HTMLDivElement[] = []
+
+function drawExtraBoxes() {
+  for (const b of extraBoxes) b.remove()
+  extraBoxes = []
+  for (const id of extraSelectedIds) {
+    const el = getEl(id)
+    if (!el) continue
+    const r = el.getBoundingClientRect()
+    const box = document.createElement('div')
+    box.dataset.pointerUi = '1'
+    Object.assign(box.style, {
+      position: 'fixed',
+      pointerEvents: 'none',
+      zIndex: '2147483646',
+      top: `${r.top}px`,
+      left: `${r.left}px`,
+      width: `${r.width}px`,
+      height: `${r.height}px`,
+      border: '2px solid #3b82f6',
+      borderRadius: '2px',
+      boxSizing: 'border-box',
+    })
+    document.documentElement.appendChild(box)
+    extraBoxes.push(box)
+  }
+}
+
+/** Every currently selected element — the primary plus the extras — in DOM
+ * order, as the descriptor list the panel's "N selected" view is built from. */
+function broadcastMultiSelection() {
+  const ids = new Set(extraSelectedIds)
+  if (selectedEl) ids.add(registerEl(selectedEl))
+  const items = Array.from(ids)
+    .map((id) => ({ id, el: getEl(id) }))
+    .filter((x): x is { id: number; el: HTMLElement } => !!x.el)
+    .sort((a, b) =>
+      a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+    )
+    .map(({ id, el }) => ({ elementId: id, descriptor: shortDescriptor(el) }))
+  chrome.runtime.sendMessage({ type: 'PTR_MULTI_SELECTED', payload: { items } })
+}
+
+function toggleMultiSelect(el: Element) {
+  if (editingEl && editingEl !== el) exitTextEdit(true)
+  hidePadBand()
+  const id = registerEl(el)
+  if (selectedEl === el) {
+    // Shift-clicking the primary drops it and promotes the most recently
+    // added extra, if there is one — it just becomes the one every other
+    // control (Position, Fill, ...) reads from.
+    selectedEl = null
+    const remaining = Array.from(extraSelectedIds)
+    const promoted = remaining.pop()
+    extraSelectedIds = new Set(remaining)
+    if (promoted != null) selectedEl = getEl(promoted)
+  } else if (extraSelectedIds.has(id)) {
+    extraSelectedIds.delete(id)
+  } else {
+    if (selectedEl) extraSelectedIds.add(registerEl(selectedEl))
+    selectedEl = el
+  }
+
+  ensureOverlay()
+  clearHighlight()
+  if (selectedEl) {
+    positionBox(selectBox!, selectedEl)
+    drawGridOverlay(selectedEl)
+    chrome.runtime.sendMessage({ type: 'PTR_SELECTED', payload: buildPayload(selectedEl) })
+  } else {
+    hideBox(selectBox)
+    clearGridOverlay()
+    chrome.runtime.sendMessage({ type: 'PTR_DESELECTED' })
+  }
+  drawExtraBoxes()
+  broadcastMultiSelection()
+}
+
+// The general form of Figma's "Add auto layout": wrap two or more selected
+// elements in a new flex container without touching anything about them
+// individually. Requires them to already be siblings — grouping elements
+// from different parents would mean deciding whose coordinate space wins,
+// and guessing silently is worse than asking for siblings.
+function createAutoLayout(ids: number[]): {
+  ok: boolean
+  reason?: 'too-few' | 'different-parent'
+  payload?: SelectionPayload
+  html?: string
+  parentDesc?: string
+} {
+  const els = Array.from(new Set(ids))
+    .map((id) => getEl(id))
+    .filter((el): el is HTMLElement => !!el)
+  if (els.length < 2) return { ok: false, reason: 'too-few' }
+  const parent = els[0].parentElement
+  if (!parent || els.some((el) => el.parentElement !== parent)) {
+    return { ok: false, reason: 'different-parent' }
+  }
+  const ordered = els.sort((a, b) => siblingIndex(a) - siblingIndex(b))
+
+  const wrapper = document.createElement('div')
+  Object.assign(wrapper.style, {
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: '8px',
+    width: 'fit-content',
+  })
+  wrapper.setAttribute('data-pointer-new', 'layout')
+  parent.insertBefore(wrapper, ordered[0])
+
+  for (const child of ordered) {
+    const cid = registerEl(child)
+    if (!movePristine.has(cid)) {
+      movePristine.set(cid, { parent: child.parentElement!, nextSibling: child.nextSibling })
+    }
+    wrapper.appendChild(child)
+  }
+
+  const wid = registerEl(wrapper)
+  insertedEls.set(wid, wrapper)
+  selectElement(wrapper)
+  schedulePinUpdate()
+  return {
+    ok: true,
+    payload: buildPayload(wrapper),
+    html: wrapper.outerHTML,
+    parentDesc: shortDescriptor(parent),
+  }
+}
+
+/**
+ * Reverses createAutoLayout: puts every current child of the wrapper back
+ * where it came from — via the same movePristine records reparentElement
+ * and friends already rely on — then removes the now-empty wrapper.
+ *
+ * Restoring in reverse DOM order matters: two originally-adjacent children
+ * point at each other as their recorded "next sibling", so the later one
+ * has to land back first, or the earlier one's anchor won't exist yet.
+ */
+function ungroup(wrapperId: number): boolean {
+  const wrapper = getEl(wrapperId)
+  if (!wrapper) return false
+  const children = Array.from(wrapper.children)
+  for (let i = children.length - 1; i >= 0; i--) {
+    const child = children[i]
+    const cid = registerEl(child)
+    if (!resetMove(cid)) {
+      // No recorded original spot (e.g. added after grouping) — drop it
+      // next to the wrapper rather than losing it.
+      wrapper.parentElement?.insertBefore(child, wrapper)
+    }
+  }
+  wrapper.remove()
+  insertedEls.delete(wrapperId)
+  if (selectedEl === wrapper) {
+    selectedEl = null
+    hideBox(selectBox)
+  }
+  schedulePinUpdate()
+  return true
 }
 
 // ---------- edit operations ----------
@@ -824,6 +1002,8 @@ function removeInserted(id: number): boolean {
     selectedEl = null
     hideBox(selectBox)
   }
+  if (extraSelectedIds.delete(id)) drawExtraBoxes()
+  broadcastMultiSelection()
   return true
 }
 
@@ -848,6 +1028,8 @@ function deleteElement(id: number): { ok: boolean; desc?: string; inserted?: boo
     selectedEl = null
     hideBox(selectBox)
   }
+  if (extraSelectedIds.delete(id)) drawExtraBoxes()
+  broadcastMultiSelection()
   schedulePinUpdate()
   return { ok: true, desc }
 }
@@ -1521,6 +1703,11 @@ function selectParentOrDeselect() {
   hideBox(selectBox)
   clearGridOverlay()
   chrome.runtime.sendMessage({ type: 'PTR_DESELECTED' })
+  if (extraSelectedIds.size) {
+    extraSelectedIds = new Set()
+    drawExtraBoxes()
+  }
+  broadcastMultiSelection()
 }
 
 // Figma's Enter/Return: dive into the first child of the current selection.
@@ -1917,7 +2104,8 @@ function onClick(e: MouseEvent) {
     setCommentMode(false)
     return
   }
-  selectElement(el)
+  if (e.shiftKey) toggleMultiSelect(el)
+  else selectElement(el)
 }
 
 function setCommentMode(on: boolean) {
@@ -1944,6 +2132,7 @@ function onScrollOrResize() {
   hideBox(hoverBox)
   hideBox(hoverLabel as any)
   hideMeasure()
+  drawExtraBoxes()
 }
 
 // Forces the crosshair cursor everywhere while Inspect is on. Setting
@@ -2944,6 +3133,12 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       sendResponse({ ok: !!el })
       break
     }
+    case 'PTR_TOGGLE_SELECT': {
+      const el = getEl(msg.elementId)
+      if (el) toggleMultiSelect(el)
+      sendResponse({ ok: !!el })
+      break
+    }
     case 'PTR_MOVE_ELEMENT':
       sendResponse(moveElement(msg.elementId, msg.dir))
       break
@@ -2973,6 +3168,12 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     case 'PTR_DUPLICATE_ELEMENT':
       sendResponse(duplicateElement(msg.elementId))
+      break
+    case 'PTR_CREATE_AUTOLAYOUT':
+      sendResponse(createAutoLayout(msg.elementIds))
+      break
+    case 'PTR_UNGROUP':
+      sendResponse({ ok: ungroup(msg.elementId) })
       break
     case 'PTR_SET_TRANSFORM': {
       const r = setTransform(msg.elementId, msg.parts)

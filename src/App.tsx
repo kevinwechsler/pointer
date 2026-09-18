@@ -58,6 +58,7 @@ import {
   LayoutGrid,
   Eye,
   EyeOff,
+  Group,
 } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -98,6 +99,11 @@ type StyleField = {
 }
 
 const UNITS = ['px', 'rem', 'em', '%']
+
+/** Stable empty set for LayerTree's `multiIds` prop outside an active
+ * multi-selection, so that common case doesn't allocate a new Set every
+ * render. */
+const EMPTY_ID_SET = new Set<number>()
 
 // Splits "16px" into { num: "16", unit: "px" }. Non-numeric values
 // (e.g. "normal") return null so the field can fall back gracefully.
@@ -1114,7 +1120,7 @@ function startLayerDrag(
   id: number,
   tree: LayerNode[],
   cb: {
-    onClick: (id: number) => void
+    onClick: (id: number, shiftKey: boolean) => void
     onDrop: (id: number, target: LayerDropTarget) => void
     onExpand: (id: number) => void
     setDragged: (id: number | null) => void
@@ -1126,6 +1132,9 @@ function startLayerDrag(
   const viewport = row.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')
   const startX = e.clientX
   const startY = e.clientY
+  // A shift-click is never a drag, so it's fine to read this once up front
+  // rather than track it through the gesture.
+  const shiftKey = e.shiftKey
   const excluded = subtreeIds(tree, id)
 
   let dragging = false
@@ -1253,7 +1262,7 @@ function startLayerDrag(
     cb.setDragged(null)
     cb.setDropTarget(null)
     if (!dragging) {
-      if (drop) cb.onClick(id)
+      if (drop) cb.onClick(id, shiftKey)
       return
     }
     if (drop && finalTarget) cb.onDrop(id, finalTarget)
@@ -1272,6 +1281,7 @@ function LayerTree({
   depth,
   expanded,
   selectedId,
+  multiIds,
   draggedId,
   dropTarget,
   onToggle,
@@ -1282,6 +1292,10 @@ function LayerTree({
   depth: number
   expanded: Set<number>
   selectedId: number | null
+  /** Every id in a multi-selection (including the primary), when there is
+   * one — empty otherwise. Rows in here beyond the primary get a plainer
+   * highlight, matching the extra outline drawn on the page itself. */
+  multiIds: Set<number>
   draggedId: number | null
   dropTarget: LayerDropTarget | null
   onToggle: (id: number) => void
@@ -1294,6 +1308,7 @@ function LayerTree({
         const hasChildren = n.children.length > 0
         const open = expanded.has(n.id)
         const isSelected = n.id === selectedId
+        const isMultiSelected = !isSelected && multiIds.has(n.id)
         const drop = dropTarget?.id === n.id ? dropTarget.position : null
         return (
           <div key={n.id}>
@@ -1324,7 +1339,9 @@ function LayerTree({
                   ? 'bg-primary/15 outline outline-primary'
                   : isSelected
                     ? 'bg-primary/10 text-foreground'
-                    : 'hover:bg-muted') +
+                    : isMultiSelected
+                      ? 'bg-blue-500/10 text-foreground'
+                      : 'hover:bg-muted') +
                 (draggedId === n.id ? ' opacity-40' : '')
               }
               style={{ paddingLeft: 4 + depth * 14 }}
@@ -1373,6 +1390,7 @@ function LayerTree({
                 depth={depth + 1}
                 expanded={expanded}
                 selectedId={selectedId}
+                multiIds={multiIds}
                 draggedId={draggedId}
                 dropTarget={dropTarget}
                 onToggle={onToggle}
@@ -1439,6 +1457,11 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [colorFormat, setColorFormat] = useState<ColorFormat>('hex')
   const [activeTab, setActiveTab] = useState('element')
+  // Shift+click multi-select (canvas or Layers tab). `selection` always stays
+  // the primary/most-recently-clicked element; this holds every element
+  // currently selected (including the primary) whenever there's more than
+  // one — length < 2 means "no multi-selection, ignore this".
+  const [multiSelection, setMultiSelection] = useState<{ elementId: number; descriptor: string }[]>([])
 
   // Layers
   const [tree, setTree] = useState<LayerNode[]>([])
@@ -1537,6 +1560,9 @@ export default function App() {
       }
       if (msg.type === 'PTR_DESELECTED') {
         setSelection(null)
+      }
+      if (msg.type === 'PTR_MULTI_SELECTED') {
+        setMultiSelection(msg.payload.items)
       }
       if (msg.type === 'PTR_COMMENT_CLICKED') {
         lastFrameRef.current = msg.payload.frameToken
@@ -1861,6 +1887,13 @@ export default function App() {
           elementId: edit.target.elementId,
         })
         if (selection?.elementId === edit.target.elementId) setSelection(null)
+      } else if (edit.kind === 'group') {
+        await sendToPage({
+          type: 'PTR_UNGROUP',
+          frameToken: edit.target.frameToken,
+          elementId: edit.target.elementId,
+        })
+        if (selection?.elementId === edit.target.elementId) setSelection(null)
       } else if (edit.kind === 'move') {
         await sendToPage({
           type: 'PTR_RESET_MOVE',
@@ -1961,6 +1994,14 @@ export default function App() {
     }).catch(() => {})
   }
 
+  function toggleSelectLayer(id: number) {
+    sendToPage({
+      type: 'PTR_TOGGLE_SELECT',
+      frameToken: lastFrameRef.current ?? undefined,
+      elementId: id,
+    }).catch(() => {})
+  }
+
   function selectTab(v: string) {
     setActiveTab(v)
     if (v !== 'element') loadCommentsAndTokens()
@@ -2054,6 +2095,39 @@ export default function App() {
         elementId: selection.elementId,
       })
       if (r?.ok && r.payload) upsertEdit(r.payload, 'insert', 'element', '', r.html, r.parentDesc)
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  /** Figma's "Add auto layout" for a multi-selection: wrap every selected
+   * element in a new flex container. Requires them to already share a
+   * parent — the page rejects it otherwise rather than guessing which
+   * parent's coordinate space should win. */
+  async function createAutoLayoutFromSelection() {
+    if (multiSelection.length < 2) return
+    try {
+      const r = await sendToPage({
+        type: 'PTR_CREATE_AUTOLAYOUT',
+        frameToken: lastFrameRef.current ?? undefined,
+        elementIds: multiSelection.map((m) => m.elementId),
+      })
+      if (!r?.ok || !r.payload) {
+        setError(
+          r?.reason === 'different-parent'
+            ? 'Select layers that share the same parent to group them into an auto layout.'
+            : 'Could not create the auto layout.'
+        )
+        return
+      }
+      upsertEdit(
+        r.payload,
+        'group',
+        'children',
+        multiSelection.map((m) => m.descriptor).join(', '),
+        r.html,
+        r.parentDesc
+      )
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -2629,7 +2703,34 @@ export default function App() {
 
       <TabsContent value="element" className="min-h-0 flex-1">
         <ScrollArea className="h-full">
-          {!selection ? (
+          {multiSelection.length >= 2 ? (
+            <div className="space-y-3 p-4">
+              <div>
+                <p className="text-sm font-medium">{multiSelection.length} layers selected</p>
+                <p className="text-[11px] text-muted-foreground">
+                  Shift-click a layer (here or in the page) to add or remove it.
+                </p>
+              </div>
+              <div className="max-h-40 space-y-1 overflow-y-auto rounded-md border p-1.5">
+                {multiSelection.map((m) => (
+                  <p
+                    key={m.elementId}
+                    className="truncate rounded px-1.5 py-1 font-mono text-[11px] text-muted-foreground"
+                  >
+                    {m.descriptor}
+                  </p>
+                ))}
+              </div>
+              <Button size="sm" className="w-full" onClick={createAutoLayoutFromSelection}>
+                <Group className="size-3.5" />
+                Create auto layout
+              </Button>
+              <p className="text-[11px] text-muted-foreground">
+                Wraps the selected layers in a new flex container. They need to share
+                the same parent.
+              </p>
+            </div>
+          ) : !selection ? (
             <p className="p-4 pt-8 text-center text-sm text-muted-foreground">
               {active
                 ? 'Click an element on the page to select it. If elements overlap, right-click the same spot repeatedly to cycle through them.'
@@ -3123,6 +3224,11 @@ export default function App() {
                 depth={0}
                 expanded={expanded}
                 selectedId={selection?.elementId ?? null}
+                multiIds={
+                  multiSelection.length >= 2
+                    ? new Set(multiSelection.map((m) => m.elementId))
+                    : EMPTY_ID_SET
+                }
                 draggedId={draggedLayerId}
                 dropTarget={layerDropTarget}
                 onPointerDownRow={(e, id) =>
@@ -3131,7 +3237,11 @@ export default function App() {
                     setDropTarget: setLayerDropTarget,
                     onExpand: (id) => setExpanded((prev) => new Set(prev).add(id)),
                     onDrop: (id, target) => reparentLayer(id, target.id, target.position),
-                    onClick: (id) => {
+                    onClick: (id, shiftKey) => {
+                      if (shiftKey) {
+                        toggleSelectLayer(id)
+                        return
+                      }
                       // Clicking the already-selected layer toggles it off,
                       // same as clicking empty canvas space in Figma.
                       if (id === selection?.elementId) {
@@ -3203,6 +3313,10 @@ export default function App() {
                             {e.kind === 'insert' ? (
                               <span className="font-medium text-foreground">
                                 added new element
+                              </span>
+                            ) : e.kind === 'group' ? (
+                              <span className="font-medium text-foreground">
+                                grouped into auto layout
                               </span>
                             ) : e.kind === 'remove' ? (
                               <span className="font-medium text-destructive">
