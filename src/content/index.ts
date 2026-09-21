@@ -619,6 +619,7 @@ function selectElement(el: Element) {
     drawExtraBoxes()
   }
   broadcastMultiSelection()
+  refreshTextCursor(document.elementFromPoint(lastPointer.x, lastPointer.y))
 }
 
 // ---------- multi-select ----------
@@ -1884,6 +1885,7 @@ function nudgeSelected(dx: number, dy: number) {
  * Shift+Return there, not Escape — see selectParent.) */
 function deselectAll() {
   selectedEl = null
+  refreshTextCursor(null)
   hideBox(selectBox)
   clearGridOverlay()
   chrome.runtime.sendMessage({ type: 'PTR_DESELECTED' })
@@ -2188,6 +2190,37 @@ function onMouseLeave() {
   hideMeasure()
 }
 
+/** Whether double-click / Enter would edit this element's text in place —
+ * the same test onDblClick applies, kept in one place so the cursor never
+ * promises an edit the gesture won't deliver. Only a text leaf qualifies:
+ * editing a container's joined text would wipe its children. */
+function isEditableText(el: Element | null): el is HTMLElement {
+  return (
+    el instanceof HTMLElement &&
+    !isPointerUi(el) &&
+    el.children.length === 0 &&
+    !!(el.textContent || '').trim()
+  )
+}
+
+// The I-beam only appears over text that is *already selected*, like Figma:
+// an unselected layer under the cursor is just something to click on, and a
+// text cursor there would suggest you could start typing into it.
+let textCursorEl: HTMLElement | null = null
+
+function refreshTextCursor(hovered: Element | null) {
+  const want =
+    active && hovered && hovered === selectedEl && !editingEl && isEditableText(hovered)
+      ? hovered
+      : null
+  // Also checks the attribute itself: leaving text edit strips it from the
+  // element, so "same element as last time" isn't enough to skip re-applying.
+  if (want === textCursorEl && (!want || want.dataset.ptrCursor === 'text')) return
+  if (textCursorEl && textCursorEl !== editingEl) delete textCursorEl.dataset.ptrCursor
+  textCursorEl = want
+  if (want) want.dataset.ptrCursor = 'text'
+}
+
 /**
  * Figma's Option-hover measuring, which always runs *from* the current
  * selection:
@@ -2232,6 +2265,7 @@ function onMouseMove(e: MouseEvent) {
   if (!el) return
   if (isPointerUi(el)) return
   if (editingEl) return
+  refreshTextCursor(el)
 
   if (e.altKey && updateMeasureOverlay(e.clientX, e.clientY, e.metaKey || e.ctrlKey)) {
     hoverEl = el
@@ -2944,10 +2978,7 @@ let editingFrom = ''
 function onDblClick(e: MouseEvent) {
   if (!active) return
   const el = document.elementFromPoint(e.clientX, e.clientY)
-  if (!(el instanceof HTMLElement) || isPointerUi(el)) return
-  // Only a text leaf: editing a container's joined text would wipe its
-  // children (see buildPayload).
-  if (el.children.length > 0 || !(el.textContent || '').trim()) return
+  if (!isEditableText(el)) return
   e.preventDefault()
   e.stopPropagation()
   if (editingEl && editingEl !== el) exitTextEdit(true)
@@ -3043,6 +3074,7 @@ function setActive(on: boolean) {
     document.removeEventListener('dblclick', onDblClick, true)
     document.removeEventListener('keydown', onKeyDown, true)
     exitTextEdit(true)
+    refreshTextCursor(null)
     hideKeyHint()
     hideHandles()
     hidePadBand()
@@ -3623,6 +3655,7 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
     }
     case 'PTR_DESELECT':
       selectedEl = null
+      refreshTextCursor(null)
       hideBox(selectBox)
       clearGridOverlay()
       sendResponse({ ok: true })
