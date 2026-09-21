@@ -2,7 +2,7 @@
 // declared twice, once on each side, which let them drift apart in
 // silence. Type-only imports are erased at build time, so sharing the
 // single definition costs the content script nothing at runtime.
-import type { SelectionPayload, SourceInfo } from '@/lib/pointer'
+import type { SelectionPayload, SizeMode, SourceInfo } from '@/lib/pointer'
 
 // Pointer content script: runs inside the localhost page.
 // Handles hover highlighting, element selection, live style edits with
@@ -76,6 +76,10 @@ const STYLE_PROPS = [
 
 let active = false
 let hoverEl: Element | null = null
+// Where the cursor last was, so holding Option can bring the measurements up
+// on the spot — in Figma they appear the moment you press it, without having
+// to jiggle the mouse first.
+let lastPointer = { x: 0, y: 0 }
 let selectedEl: Element | null = null
 
 // ---------- element registry & pristine state ----------
@@ -436,7 +440,8 @@ function buildPayload(el: Element): SelectionPayload {
       left: Math.round(rect.left),
       top: Math.round(rect.top),
     },
-    inline: readInline(el),
+    sizing: readSizing(el),
+    specified: readSpecified(el),
     parentLayout: readParentLayout(el),
     transform: getTransformParts(registerEl(el)),
   }
@@ -452,21 +457,150 @@ function readParentLayout(el: Element): SelectionPayload['parentLayout'] {
   return { display: cs.display, flexDirection: cs.flexDirection }
 }
 
-const INLINE_PROPS = [
-  'width',
-  'height',
-  'flexGrow',
-  'flexBasis',
-  'alignSelf',
-  'marginLeft',
-  'marginRight',
-] as const
+// ---------- Hug / Fixed / Fill ----------
+// Computed styles can't answer this: getComputedStyle always reports a used
+// pixel length, so "width: 100%", "width: fit-content" and "width: 240px"
+// all come back as the same "240px". The panel used to read the element's
+// inline style instead, which is blind to every size that comes from a
+// stylesheet — i.e. nearly all of them in a real app — so anything sized by
+// a class read as "Hug" no matter what it actually did. What's needed is the
+// *specified* value, which means reading the stylesheets the way the
+// browser's own Styles pane does.
 
-function readInline(el: Element): Record<string, string> {
-  const out: Record<string, string> = {}
-  if (!(el instanceof HTMLElement)) return out
-  for (const p of INLINE_PROPS) out[p] = el.style[p as any] || ''
+/** Style rules that set a width or height, gathered once — matching one
+ * element against only these (usually a few dozen) instead of against every
+ * rule in a framework's stylesheet (often thousands) is what keeps this
+ * cheap enough to redo after every edit. */
+type SizeRule = { selector: string; width: string; height: string; spec: number }
+let sizeRules: SizeRule[] | null = null
+let sizeRulesStamp = ''
+
+/** Rough CSS specificity: ids, then classes/attributes/pseudo-classes, then
+ * element names, with !important on top. Enough to pick the winner among the
+ * handful of rules that size one element; a faithful implementation would
+ * need the whole selector grammar. */
+function specificityOf(selector: string): number {
+  const ids = (selector.match(/#[\w-]+/g) || []).length
+  const classes = (selector.match(/\.[\w-]+|\[[^\]]+\]|:(?!:)[\w-]+/g) || []).length
+  const els = (selector.match(/(^|[\s>+~])[a-zA-Z][\w-]*/g) || []).length
+  return ids * 10000 + classes * 100 + els
+}
+
+function collectSizeRules(): SizeRule[] {
+  // Stylesheets change when a dev server hot-reloads CSS; the count plus the
+  // last sheet's rule count is a cheap enough stand-in for "still the same".
+  const sheets = Array.from(document.styleSheets)
+  let lastCount = 0
+  try {
+    lastCount = sheets[sheets.length - 1]?.cssRules.length ?? 0
+  } catch {
+    lastCount = 0
+  }
+  const stamp = `${sheets.length}:${lastCount}`
+  if (sizeRules && sizeRulesStamp === stamp) return sizeRules
+
+  const out: SizeRule[] = []
+  const visit = (rules: CSSRuleList) => {
+    for (const rule of Array.from(rules)) {
+      if (rule instanceof CSSMediaRule) {
+        // Only rules that apply right now, at this viewport.
+        if (window.matchMedia(rule.conditionText).matches) visit(rule.cssRules)
+      } else if (rule instanceof CSSSupportsRule) {
+        visit(rule.cssRules)
+      } else if (rule instanceof CSSStyleRule) {
+        const width = rule.style.getPropertyValue('width')
+        const height = rule.style.getPropertyValue('height')
+        if (!width && !height) continue
+        const important =
+          rule.style.getPropertyPriority('width') === 'important' ||
+          rule.style.getPropertyPriority('height') === 'important'
+        out.push({
+          selector: rule.selectorText,
+          width,
+          height,
+          spec: specificityOf(rule.selectorText) + (important ? 1e6 : 0),
+        })
+      }
+    }
+  }
+  for (const sheet of sheets) {
+    try {
+      visit(sheet.cssRules)
+    } catch {
+      // A cross-origin stylesheet — unreadable by design, nothing to do.
+    }
+  }
+  sizeRules = out
+  sizeRulesStamp = stamp
   return out
+}
+
+/** The size the author actually asked for on this axis ('', 'auto', '100%',
+ * 'fit-content', '240px', ...) — inline style first, then the winning rule. */
+function specifiedSize(el: HTMLElement, axis: 'width' | 'height'): string {
+  const inline = el.style.getPropertyValue(axis)
+  if (inline) return inline.trim()
+  let best = ''
+  let bestSpec = -1
+  for (const rule of collectSizeRules()) {
+    const v = rule[axis]
+    if (!v || rule.spec < bestSpec) continue
+    try {
+      if (!el.matches(rule.selector)) continue
+    } catch {
+      continue // a selector this browser can't parse (::v-deep and friends)
+    }
+    // Ties go to whichever comes last in document order, like the cascade.
+    bestSpec = rule.spec
+    best = v.trim()
+  }
+  return best
+}
+
+/** Sizes that ask to hug the content outright, as opposed to "auto", which
+ * only means "no opinion" — what that ends up doing depends entirely on the
+ * parent, so it has to be worked out rather than taken at face value. */
+const HUG_KEYWORDS = ['fit-content', 'max-content', 'min-content']
+
+/** Displays whose width shrinks to fit their content rather than filling the
+ * space available to them. */
+const SHRINK_TO_FIT = /^(inline|table|inline-table|table-cell)/
+
+function sizeModeFor(el: HTMLElement, axis: 'width' | 'height'): SizeMode {
+  const spec = specifiedSize(el, axis)
+  if (HUG_KEYWORDS.includes(spec)) return 'hug'
+  if (spec.endsWith('%')) return spec === '100%' ? 'fill' : 'fixed'
+  if (spec !== '' && spec !== 'auto') return 'fixed'
+
+  const cs = getComputedStyle(el)
+  const parent = el.parentElement
+  const pcs = parent ? getComputedStyle(parent) : null
+  if (pcs?.display.includes('flex')) {
+    const mainAxis = pcs.flexDirection.startsWith('column') ? 'height' : 'width'
+    if (axis === mainAxis) return (parseFloat(cs.flexGrow) || 0) > 0 ? 'fill' : 'hug'
+    // Across the parent's main axis it's align-self that decides, falling
+    // back to the parent's align-items — which defaults to stretch, so a
+    // flex child really does fill this axis unless told otherwise.
+    const self = cs.alignSelf === 'auto' ? pcs.alignItems : cs.alignSelf
+    return self === 'stretch' || self === 'normal' ? 'fill' : 'hug'
+  }
+  // Outside flex, only a block-level box in normal flow fills its line;
+  // floated, absolutely positioned and inline boxes shrink to fit. Height
+  // is always content-driven when it isn't given a length.
+  if (axis === 'height') return 'hug'
+  if (cs.position === 'absolute' || cs.position === 'fixed') return 'hug'
+  if (cs.float !== 'none') return 'hug'
+  return SHRINK_TO_FIT.test(cs.display) ? 'hug' : 'fill'
+}
+
+function readSizing(el: Element): SelectionPayload['sizing'] {
+  if (!(el instanceof HTMLElement)) return { width: 'fixed', height: 'fixed' }
+  return { width: sizeModeFor(el, 'width'), height: sizeModeFor(el, 'height') }
+}
+
+function readSpecified(el: Element): SelectionPayload['specified'] {
+  if (!(el instanceof HTMLElement)) return { width: '', height: '' }
+  return { width: specifiedSize(el, 'width'), height: specifiedSize(el, 'height') }
 }
 
 function selectElement(el: Element) {
@@ -660,18 +794,22 @@ function ungroup(wrapperId: number): boolean {
 
 // ---------- edit operations ----------
 
-/** What an element looks like right after an edit. The panel's sizing
- * controls (Hug/Fixed/Fill) can't be read off computed styles — those always
- * resolve to pixels — so they depend on the author-set inline values, which
- * means the panel has to be told the new ones every time rather than reusing
- * the ones captured back when the element was selected. */
-type StyleResult = { ok: boolean; inline?: Record<string, string>; rect?: SelectionPayload['rect'] }
+/** What an element looks like right after an edit — the parts of the
+ * selection an edit can change under the panel, which it would otherwise
+ * keep reading from the snapshot taken when the element was selected. */
+type StyleResult = {
+  ok: boolean
+  sizing?: SelectionPayload['sizing']
+  specified?: SelectionPayload['specified']
+  rect?: SelectionPayload['rect']
+}
 
 function liveStyleState(el: Element): StyleResult {
   const r = el.getBoundingClientRect()
   return {
     ok: true,
-    inline: readInline(el),
+    sizing: readSizing(el),
+    specified: readSpecified(el),
     rect: {
       width: Math.round(r.width),
       height: Math.round(r.height),
@@ -1320,9 +1458,12 @@ const measure: {
   vLine: HTMLDivElement | null
   hLabel: HTMLDivElement | null
   vLabel: HTMLDivElement | null
-  edgeLines: HTMLDivElement[]
-  edgeLabels: HTMLDivElement[]
-} = { hLine: null, vLine: null, hLabel: null, vLabel: null, edgeLines: [], edgeLabels: [] }
+  // Shaded regions with a number in them — the four padding sides plus one
+  // per gap between children, so the count isn't fixed.
+  bands: HTMLDivElement[]
+  bandLabels: HTMLDivElement[]
+  bandsUsed: number
+} = { hLine: null, vLine: null, hLabel: null, vLabel: null, bands: [], bandLabels: [], bandsUsed: 0 }
 
 function ensureMeasure() {
   if (measure.hLine) return
@@ -1330,10 +1471,31 @@ function ensureMeasure() {
   measure.vLine = makeMeasureLine()
   measure.hLabel = makeMeasureLabel()
   measure.vLabel = makeMeasureLabel()
-  for (let i = 0; i < 4; i++) {
-    measure.edgeLines.push(makeMeasureLine())
-    measure.edgeLabels.push(makeMeasureLabel())
+}
+
+function resetBands() {
+  measure.bandsUsed = 0
+  for (const b of measure.bands) hideBox(b)
+  for (const l of measure.bandLabels) hideBox(l)
+}
+
+/** Shade one spacing region and print its value in the middle. */
+function addBand(left: number, top: number, width: number, height: number, value: number) {
+  if (value <= 0.5 || width <= 0 || height <= 0) return
+  const i = measure.bandsUsed++
+  if (i === measure.bands.length) {
+    measure.bands.push(makeMeasureLine())
+    measure.bandLabels.push(makeMeasureLabel())
   }
+  Object.assign(measure.bands[i].style, {
+    display: 'block',
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${width}px`,
+    height: `${height}px`,
+    background: 'rgba(244, 63, 94, 0.25)',
+  })
+  placeLabel(measure.bandLabels[i], left + width / 2 - 8, top + height / 2 - 8, `${Math.round(value)}`)
 }
 
 function hideMeasure() {
@@ -1342,8 +1504,7 @@ function hideMeasure() {
   hideBox(measure.vLine)
   hideBox(measure.hLabel)
   hideBox(measure.vLabel)
-  for (const l of measure.edgeLines) hideBox(l)
-  for (const l of measure.edgeLabels) hideBox(l)
+  resetBands()
 }
 
 function placeHLine(line: HTMLDivElement, x1: number, x2: number, y: number) {
@@ -1428,64 +1589,93 @@ function drawDistanceOverlay(a: Element, b: Element) {
   positionBox(hoverBox!, b)
 }
 
-// Alt+Shift + hover: this element's padding on all four sides.
-function drawPaddingOverlay(el: Element) {
+/**
+ * What Figma shows while you hold Option with an auto-layout frame selected:
+ * the frame's four padding bands and the gaps between its children, each
+ * labelled with its value.
+ *
+ * Anchored on the *selection*, never on whatever the cursor happens to be
+ * over. Deriving it from the deepest element under the pointer is how a DOM
+ * inspector works, and it's why this used to appear only over the handful of
+ * pixels the container itself owned — step onto a child and the readout was
+ * suddenly about the child instead.
+ */
+function drawSpacingOverlay(el: Element) {
   ensureMeasure()
   ensureOverlay()
   positionBox(hoverBox!, el)
+  resetBands()
+  hideBox(measure.hLine)
+  hideBox(measure.vLine)
+  hideBox(measure.hLabel)
+  hideBox(measure.vLabel)
+
   const r = el.getBoundingClientRect()
   const s = getComputedStyle(el)
-  const pt = parseFloat(s.paddingTop) || 0
-  const pr = parseFloat(s.paddingRight) || 0
-  const pb = parseFloat(s.paddingBottom) || 0
-  const pl = parseFloat(s.paddingLeft) || 0
+  const pt = pf(s.paddingTop)
+  const pr = pf(s.paddingRight)
+  const pb = pf(s.paddingBottom)
+  const pl = pf(s.paddingLeft)
+  const innerTop = r.top + pt
+  const innerHeight = Math.max(0, r.height - pt - pb)
+  addBand(r.left, r.top, r.width, pt, pt)
+  addBand(r.left, r.bottom - pb, r.width, pb, pb)
+  addBand(r.left, innerTop, pl, innerHeight, pl)
+  addBand(r.right - pr, innerTop, pr, innerHeight, pr)
 
-  const edges: [number, number, number, number, number][] = [
-    [r.left, r.top, r.width, pt, pt], // top
-    [r.left, r.bottom - pb, r.width, pb, pb], // bottom
-    [r.left, r.top + pt, pl, Math.max(0, r.height - pt - pb), pl], // left
-    [r.right - pr, r.top + pt, pr, Math.max(0, r.height - pt - pb), pr], // right
-  ]
-
-  edges.forEach(([x, y, w, h, value], i) => {
-    const line = measure.edgeLines[i]
-    const label = measure.edgeLabels[i]
-    if (value <= 0 || w <= 0 || h <= 0) {
-      hideBox(line)
-      hideBox(label)
-      return
-    }
-    Object.assign(line.style, {
-      display: 'block',
-      left: `${x}px`,
-      top: `${y}px`,
-      width: `${w}px`,
-      height: `${h}px`,
-      background: 'rgba(244, 63, 94, 0.25)',
-    })
-    placeLabel(label, x + w / 2 - 8, y + h / 2 - 8, `${Math.round(value)}`)
-  })
+  drawChildGaps(el, s)
 }
 
-// Alt+Ctrl + hover: distance from this element to each viewport edge.
-function drawViewportOverlay(el: Element) {
-  ensureMeasure()
-  ensureOverlay()
-  positionBox(hoverBox!, el)
-  const r = el.getBoundingClientRect()
-  const vw = window.innerWidth
-  const vh = window.innerHeight
-  const cx = r.left + r.width / 2
-  const cy = r.top + r.height / 2
+/** The spacing between an auto layout's items — the other half of what
+ * Option reveals in Figma, and the part a padding-only readout misses. */
+function drawChildGaps(el: Element, s: CSSStyleDeclaration) {
+  const rects = Array.from(el.children)
+    .filter((c) => !isPointerUi(c) && !SKIP_TAGS.has(c.tagName))
+    .map((c) => c.getBoundingClientRect())
+    .filter((k) => k.width > 0 && k.height > 0)
+  if (rects.length < 2) return
 
-  placeVLine(measure.edgeLines[0], 0, r.top, cx)
-  placeLabel(measure.edgeLabels[0], cx + 4, r.top / 2 - 8, `${Math.round(r.top)}`)
-  placeVLine(measure.edgeLines[1], r.bottom, vh, cx)
-  placeLabel(measure.edgeLabels[1], cx + 4, r.bottom + (vh - r.bottom) / 2 - 8, `${Math.round(vh - r.bottom)}`)
-  placeHLine(measure.edgeLines[2], 0, r.left, cy)
-  placeLabel(measure.edgeLabels[2], r.left / 2 - 12, cy - 18, `${Math.round(r.left)}`)
-  placeHLine(measure.edgeLines[3], r.right, vw, cy)
-  placeLabel(measure.edgeLabels[3], r.right + (vw - r.right) / 2 - 12, cy - 18, `${Math.round(vw - r.right)}`)
+  const byTop = rects.slice().sort((a, b) => a.top - b.top)
+  const byLeft = rects.slice().sort((a, b) => a.left - b.left)
+  const stacksDown = byTop.every((k, i) => i === 0 || k.top >= byTop[i - 1].bottom - 0.5)
+  const stacksAcross = byLeft.every((k, i) => i === 0 || k.left >= byLeft[i - 1].right - 0.5)
+  // Flex says which way it runs; anything else has to be read off the
+  // geometry, and children that overlap aren't a stack at all.
+  const vertical = s.display.includes('flex')
+    ? s.flexDirection.startsWith('column')
+    : stacksDown
+  if (vertical ? !stacksDown : !stacksAcross) return
+
+  const order = vertical ? byTop : byLeft
+  for (let i = 1; i < order.length; i++) {
+    const prev = order[i - 1]
+    const next = order[i]
+    if (vertical) {
+      const gap = next.top - prev.bottom
+      const left = Math.max(prev.left, next.left)
+      const right = Math.min(prev.right, next.right)
+      addBand(left, prev.bottom, Math.max(0, right - left), gap, gap)
+    } else {
+      const gap = next.left - prev.right
+      const top = Math.max(prev.top, next.top)
+      const bottom = Math.min(prev.bottom, next.bottom)
+      addBand(prev.right, top, gap, Math.max(0, bottom - top), gap)
+    }
+  }
+}
+
+/**
+ * Which element a measurement runs to. Figma's plain Option measures to the
+ * object sitting at the same level as the selection, and ⌘Option drills into
+ * whatever is nested under the cursor. A DOM pointer always lands on the
+ * deepest node, so plain Option is the one that has to walk back up.
+ */
+function measureTarget(el: Element, deep: boolean): Element {
+  const parent = selectedEl?.parentElement
+  if (deep || !parent) return el
+  let node: Element | null = el
+  while (node?.parentElement && node.parentElement !== parent) node = node.parentElement
+  return node?.parentElement === parent ? node : el
 }
 
 // Grid overlay: automatically shown while a CSS grid container is selected.
@@ -1690,15 +1880,9 @@ function nudgeSelected(dx: number, dy: number) {
   })
 }
 
-// Figma's Escape: step up one level, then deselect once you're at the top —
-// so repeated presses walk out of the hierarchy and finally clear selection.
-function selectParentOrDeselect() {
-  if (!selectedEl) return
-  const parent = selectedEl.parentElement
-  if (parent && parent !== document.body) {
-    selectElement(parent)
-    return
-  }
+/** Figma's Escape: clear the selection outright. (Stepping *up* a level is
+ * Shift+Return there, not Escape — see selectParent.) */
+function deselectAll() {
   selectedEl = null
   hideBox(selectBox)
   clearGridOverlay()
@@ -1710,49 +1894,197 @@ function selectParentOrDeselect() {
   broadcastMultiSelection()
 }
 
-// Figma's Enter/Return: dive into the first child of the current selection.
-function selectFirstChild() {
-  if (!selectedEl) return
-  const child = selectedEl.children[0]
-  if (child) selectElement(child)
+/** Figma's Shift+Return (and backslash): select the parent layer. */
+function selectParent(): boolean {
+  const parent = selectedEl?.parentElement
+  if (!parent || parent === document.documentElement) return false
+  selectElement(parent)
+  return true
 }
 
-function onKeyDown(e: KeyboardEvent) {
-  if (!active) return
-  const target = e.target as HTMLElement | null
-  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)))
-    return
+// Figma's Enter/Return: dive into the first child of the current selection.
+function selectFirstChild(): boolean {
+  const child = selectedEl?.children[0]
+  if (!child) return false
+  selectElement(child)
+  return true
+}
 
-  // Figma: Return dives into the first child, Escape steps back up (and
-  // eventually deselects). Bare Tab is left alone — in real Figma it
-  // toggles the UI chrome, so Pointer doesn't repurpose it.
-  if (e.key === 'Enter' && selectedEl) {
+/** Figma's Tab / Shift+Tab: move to the next or previous sibling layer,
+ * stepping over Pointer's own overlay nodes and non-visual tags. */
+function selectSibling(dir: 'next' | 'prev'): boolean {
+  if (!selectedEl) return false
+  let sib = dir === 'next' ? selectedEl.nextElementSibling : selectedEl.previousElementSibling
+  while (sib && (SKIP_TAGS.has(sib.tagName) || isPointerUi(sib))) {
+    sib = dir === 'next' ? sib.nextElementSibling : sib.previousElementSibling
+  }
+  if (!sib) return false
+  selectElement(sib)
+  return true
+}
+
+// ---------- the pressed-keys overlay ----------
+// A read-out of the shortcut that just fired, bottom-centre over the page.
+// It only appears for combinations Pointer actually acted on, so it doubles
+// as confirmation that the shortcut registered — the thing you're left
+// guessing about when a key does nothing.
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+
+const KEY_SYMBOLS: Record<string, string> = {
+  Enter: '↩',
+  Escape: 'esc',
+  Backspace: '⌫',
+  Delete: '⌦',
+  Tab: '⇥',
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  ' ': 'space',
+}
+
+function keyHintFor(e: KeyboardEvent): string[] {
+  const parts: string[] = []
+  if (e.ctrlKey) parts.push(IS_MAC ? '⌃' : 'Ctrl')
+  if (e.altKey) parts.push(IS_MAC ? '⌥' : 'Alt')
+  if (e.shiftKey) parts.push(IS_MAC ? '⇧' : 'Shift')
+  if (e.metaKey) parts.push(IS_MAC ? '⌘' : 'Win')
+  const key = KEY_SYMBOLS[e.key] ?? (e.key.length === 1 ? e.key.toUpperCase() : e.key)
+  parts.push(key)
+  return parts
+}
+
+let keyHintEl: HTMLDivElement | null = null
+let keyHintTimer: number | null = null
+
+function showKeyHint(e: KeyboardEvent) {
+  if (!keyHintEl) {
+    keyHintEl = document.createElement('div')
+    keyHintEl.dataset.pointerUi = '1'
+    Object.assign(keyHintEl.style, {
+      position: 'fixed',
+      bottom: '24px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      zIndex: '2147483647',
+      display: 'flex',
+      gap: '4px',
+      alignItems: 'center',
+      padding: '6px 8px',
+      borderRadius: '8px',
+      background: 'rgba(23,23,23,0.92)',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.25)',
+      pointerEvents: 'none',
+      opacity: '0',
+      transition: 'opacity 120ms ease',
+    })
+    document.documentElement.appendChild(keyHintEl)
+  }
+  keyHintEl.textContent = ''
+  for (const part of keyHintFor(e)) {
+    const cap = document.createElement('span')
+    cap.textContent = part
+    Object.assign(cap.style, {
+      font: '600 12px/1 ui-sans-serif, -apple-system, system-ui, sans-serif',
+      color: '#fafafa',
+      background: 'rgba(255,255,255,0.14)',
+      borderRadius: '4px',
+      padding: '5px 7px',
+      minWidth: '12px',
+      textAlign: 'center',
+    })
+    keyHintEl.appendChild(cap)
+  }
+  keyHintEl.style.opacity = '1'
+  if (keyHintTimer != null) window.clearTimeout(keyHintTimer)
+  keyHintTimer = window.setTimeout(() => {
+    if (keyHintEl) keyHintEl.style.opacity = '0'
+  }, 900)
+}
+
+function hideKeyHint() {
+  if (keyHintTimer != null) window.clearTimeout(keyHintTimer)
+  keyHintTimer = null
+  keyHintEl?.remove()
+  keyHintEl = null
+}
+
+/**
+ * Figma's macOS bindings, as documented, with three deliberate departures:
+ *
+ *  - Arrow keys reorder among siblings instead of nudging by a pixel. In a
+ *    DOM there's nowhere for a nudge to go — layout puts a normal-flow
+ *    element wherever the flow dictates — so an offset would be a visual
+ *    hack sitting on top of it. Elements taken out of flow still nudge.
+ *  - Alt+H highlights everything sharing the selection's classes. It has no
+ *    Figma counterpart, and bare H is Figma's Hand tool.
+ *  - Bare C/V/etc. stay untouched: those pick tools on a canvas Pointer
+ *    doesn't have, and swallowing them would only break the page's own keys.
+ *
+ * Returns whether the key was acted on, so the caller can show the key
+ * overlay for exactly the combinations that did something.
+ */
+function handleShortcut(e: KeyboardEvent): boolean {
+  const mod = e.metaKey || e.ctrlKey
+
+  // --- selection ---
+  // Figma: Return selects the child, Shift+Return (or \) the parent, Tab and
+  // Shift+Tab the siblings, Escape deselects. Escape used to walk *up* the
+  // tree here, which is Shift+Return's job.
+  if (e.key === 'Enter' && !mod && selectedEl) {
     e.preventDefault()
-    selectFirstChild()
-    return
+    return e.shiftKey ? selectParent() : selectFirstChild()
+  }
+  if (e.key === '\\' && !mod && selectedEl) {
+    e.preventDefault()
+    return selectParent()
+  }
+  if (e.key === 'Tab' && !mod && selectedEl) {
+    e.preventDefault()
+    return selectSibling(e.shiftKey ? 'prev' : 'next')
   }
   if (e.key === 'Escape' && selectedEl) {
     e.preventDefault()
-    selectParentOrDeselect()
-    return
+    deselectAll()
+    return true
   }
-  // Undo/redo history lives in the panel (it's what drives the Undo/Redo
-  // buttons), so these just ask it to act — same as clicking them. Cmd on
-  // Mac, Ctrl elsewhere; redo is the Shift variant either way (there's no
-  // separate Cmd+Y path here since the panel is the one place this fires).
-  if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey)) {
+
+  // --- history ---
+  // Held by the panel (it's what the Undo/Redo buttons drive), so these just
+  // ask it to act.
+  if (e.key.toLowerCase() === 'z' && mod) {
     e.preventDefault()
     chrome.runtime.sendMessage({ type: e.shiftKey ? 'PTR_REQUEST_REDO' : 'PTR_REQUEST_UNDO' })
-    return
+    return true
   }
-  if (e.key.startsWith('Arrow') && selectedEl && !e.altKey && !e.metaKey && !e.ctrlKey) {
+
+  // --- auto layout (Figma: Shift+A) ---
+  if (e.key.toLowerCase() === 'a' && e.shiftKey && !mod && !e.altKey) {
     e.preventDefault()
-    // X/Y only mean something for an element taken out of normal flow —
-    // otherwise the browser's layout puts it wherever the flow dictates and
-    // an offset is just a visual hack sitting on top of that. For a normal
-    // flow child (the overwhelming majority of elements), what arrow keys
-    // actually move is where it sits *among its siblings* — same thing
-    // Cmd+[ / Cmd+] and Position → Order already do.
+    chrome.runtime.sendMessage({ type: 'PTR_REQUEST_AUTOLAYOUT' })
+    return true
+  }
+
+  // --- ordering ---
+  // Figma: bare [ and ] jump to the very back/front, Cmd+[ and Cmd+] move
+  // one step. Pointer has no z-stacking of its own, so both act on the
+  // element's position among its siblings.
+  if ((e.key === '[' || e.key === ']') && !e.altKey && selectedEl) {
+    e.preventDefault()
+    const id = registerEl(selectedEl)
+    const target = buildPayload(selectedEl)
+    const back = e.key === '['
+    const r = mod ? moveElement(id, back ? 'prev' : 'next') : moveToEdge(id, back ? 'back' : 'front')
+    if (!r.ok) return false
+    chrome.runtime.sendMessage({
+      type: 'PTR_MOVED',
+      payload: { elementId: id, target, from: r.from, to: r.to, parentDesc: r.parentDesc },
+    })
+    return true
+  }
+
+  if (e.key.startsWith('Arrow') && selectedEl && !e.altKey && !mod) {
+    e.preventDefault()
     if (isOutOfFlow(selectedEl)) {
       const step = e.shiftKey ? 10 : 1
       const deltas: Record<string, [number, number]> = {
@@ -1762,90 +2094,88 @@ function onKeyDown(e: KeyboardEvent) {
         ArrowRight: [step, 0],
       }
       const d = deltas[e.key]
-      if (d) nudgeSelected(d[0], d[1])
-    } else {
-      const earlier = e.key === 'ArrowUp' || e.key === 'ArrowLeft'
-      const later = e.key === 'ArrowDown' || e.key === 'ArrowRight'
-      if (earlier || later) {
-        const id = registerEl(selectedEl)
-        const target = buildPayload(selectedEl)
-        const r = e.shiftKey
-          ? moveToEdge(id, earlier ? 'back' : 'front')
-          : moveElement(id, earlier ? 'prev' : 'next')
-        if (r.ok) {
-          chrome.runtime.sendMessage({
-            type: 'PTR_MOVED',
-            payload: { elementId: id, target, from: r.from, to: r.to, parentDesc: r.parentDesc },
-          })
-        }
-      }
+      if (!d) return false
+      nudgeSelected(d[0], d[1])
+      return true
     }
-    return
+    const earlier = e.key === 'ArrowUp' || e.key === 'ArrowLeft'
+    const later = e.key === 'ArrowDown' || e.key === 'ArrowRight'
+    if (!earlier && !later) return false
+    const id = registerEl(selectedEl)
+    const target = buildPayload(selectedEl)
+    const r = e.shiftKey
+      ? moveToEdge(id, earlier ? 'back' : 'front')
+      : moveElement(id, earlier ? 'prev' : 'next')
+    if (!r.ok) return false
+    chrome.runtime.sendMessage({
+      type: 'PTR_MOVED',
+      payload: { elementId: id, target, from: r.from, to: r.to, parentDesc: r.parentDesc },
+    })
+    return true
   }
-  // Figma's actual "copy/paste properties" shortcut — bare C and V are its
-  // Comment and Move tool shortcuts, so those stay untouched.
-  if (e.key.toLowerCase() === 'c' && (e.metaKey || e.ctrlKey) && e.altKey && selectedEl) {
+
+  // --- copy/paste properties (Figma: Cmd+Opt+C / Cmd+Opt+V) ---
+  if (e.key.toLowerCase() === 'c' && mod && e.altKey && selectedEl) {
     e.preventDefault()
     copyStyleFromSelected()
-    return
+    return true
   }
-  if (e.key.toLowerCase() === 'v' && (e.metaKey || e.ctrlKey) && e.altKey && hoverEl) {
+  if (e.key.toLowerCase() === 'v' && mod && e.altKey && hoverEl) {
     e.preventDefault()
     pasteStyleToHovered()
-    return
+    return true
   }
-  // Bare H is Figma's Hand tool, so "highlight elements like this one" —
-  // which has no Figma equivalent — lives on Alt+H instead.
-  if (e.key.toLowerCase() === 'h' && e.altKey && !e.metaKey && !e.ctrlKey) {
+
+  if (e.key.toLowerCase() === 'h' && e.altKey && !mod) {
     e.preventDefault()
     toggleHighlightSiblings()
-    return
+    return true
   }
+
   if ((e.key === 'Delete' || e.key === 'Backspace') && selectedEl) {
     e.preventDefault()
     const id = registerEl(selectedEl)
     const target = buildPayload(selectedEl)
     const r = deleteElement(id)
-    if (r.ok) {
-      chrome.runtime.sendMessage({
-        type: 'PTR_DELETED',
-        payload: { elementId: id, target, desc: r.desc, inserted: r.inserted },
-      })
-    }
-    return
+    if (!r.ok) return false
+    chrome.runtime.sendMessage({
+      type: 'PTR_DELETED',
+      payload: { elementId: id, target, desc: r.desc, inserted: r.inserted },
+    })
+    return true
   }
-  if ((e.key === 'd' || e.key === 'D') && (e.metaKey || e.ctrlKey) && selectedEl) {
+
+  if (e.key.toLowerCase() === 'd' && mod && selectedEl) {
     e.preventDefault()
     const r = duplicateElement(registerEl(selectedEl))
-    if (r.ok) {
-      chrome.runtime.sendMessage({
-        type: 'PTR_DUPLICATED',
-        payload: { payload: r.payload, html: r.html, parentDesc: r.parentDesc },
-      })
-    }
+    if (!r.ok) return false
+    chrome.runtime.sendMessage({
+      type: 'PTR_DUPLICATED',
+      payload: { payload: r.payload, html: r.html, parentDesc: r.parentDesc },
+    })
+    return true
+  }
+
+  return false
+}
+
+function onKeyDown(e: KeyboardEvent) {
+  if (!active) return
+  const target = e.target as HTMLElement | null
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)))
+    return
+  // Option on its own isn't a shortcut, it's the measuring modifier: bring
+  // the overlay up where the cursor already is instead of waiting for it to
+  // move. No key hint for it — nothing was "done".
+  if (e.key === 'Alt' || ((e.key === 'Meta' || e.key === 'Control') && e.altKey)) {
+    updateMeasureOverlay(lastPointer.x, lastPointer.y, e.metaKey || e.ctrlKey)
     return
   }
-  // Figma's send-backward/bring-forward (Cmd+[ / Cmd+]) and send-to-back/
-  // bring-to-front (Cmd+Shift+[ / Cmd+Shift+]), repurposed as sibling
-  // reordering since Pointer has no z-index stacking of its own.
-  if ((e.key === '[' || e.key === ']') && (e.metaKey || e.ctrlKey) && selectedEl) {
-    e.preventDefault()
-    const id = registerEl(selectedEl)
-    const target = buildPayload(selectedEl)
-    const r = e.shiftKey
-      ? moveToEdge(id, e.key === '[' ? 'back' : 'front')
-      : moveElement(id, e.key === '[' ? 'prev' : 'next')
-    if (r.ok) {
-      chrome.runtime.sendMessage({
-        type: 'PTR_MOVED',
-        payload: { elementId: id, target, from: r.from, to: r.to, parentDesc: r.parentDesc },
-      })
-    }
-  }
+  if (handleShortcut(e)) showKeyHint(e)
 }
 
 function onKeyUp(e: KeyboardEvent) {
-  if (e.key === 'Alt' || e.key === 'Shift' || e.key === 'Control') hideMeasure()
+  if (e.key === 'Alt' || e.key === 'Meta' || e.key === 'Control') hideMeasure()
 }
 
 // The cursor left the page — into the side panel, another window, wherever.
@@ -1858,20 +2188,53 @@ function onMouseLeave() {
   hideMeasure()
 }
 
+/**
+ * Figma's Option-hover measuring, which always runs *from* the current
+ * selection:
+ *
+ *   - cursor anywhere inside the selection → its padding and item gaps
+ *   - cursor on anything else             → the distance between the two
+ *   - ⌘/Ctrl held                          → measure to the nested element
+ *                                            under the cursor rather than to
+ *                                            its top-level peer
+ *
+ * Returns whether it took over the hover, so plain hovering can carry on
+ * when Option isn't held.
+ */
+function updateMeasureOverlay(x: number, y: number, deep: boolean): boolean {
+  if (!active || commentMode) return false
+  // Nothing selected means nothing to measure from — Figma stays quiet too,
+  // rather than reporting on whatever the pointer is grazing.
+  if (!selectedEl) {
+    hideMeasure()
+    return true
+  }
+  hidePadBand()
+  hideBox(hoverLabel)
+  const r = selectedEl.getBoundingClientRect()
+  if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+    drawSpacingOverlay(selectedEl)
+    return true
+  }
+  const el = document.elementFromPoint(x, y)
+  if (!el || isPointerUi(el) || el === selectedEl) {
+    hideMeasure()
+    return true
+  }
+  drawDistanceOverlay(selectedEl, measureTarget(el, deep))
+  return true
+}
+
 function onMouseMove(e: MouseEvent) {
   if (!active && !commentMode) return
+  lastPointer = { x: e.clientX, y: e.clientY }
   const el = document.elementFromPoint(e.clientX, e.clientY)
   if (!el) return
   if (isPointerUi(el)) return
   if (editingEl) return
 
-  if (active && !commentMode && e.altKey) {
+  if (e.altKey && updateMeasureOverlay(e.clientX, e.clientY, e.metaKey || e.ctrlKey)) {
     hoverEl = el
-    hideBox(hoverLabel)
-    if (e.ctrlKey) drawViewportOverlay(el)
-    else if (e.shiftKey) drawPaddingOverlay(el)
-    else if (selectedEl && el !== selectedEl) drawDistanceOverlay(selectedEl, el)
-    else drawPaddingOverlay(el)
     return
   }
   hideMeasure()
@@ -2479,6 +2842,15 @@ function updatePaddingHover(x: number, y: number) {
     return
   }
   const cs = getComputedStyle(el)
+  // Padding is an auto-layout property in Figma, and its drag handles only
+  // exist on auto-layout frames. Offering them on every element that happens
+  // to have padding is what made this feel like poking around an inspector
+  // rather than working on a canvas. The numeric fields in the Element panel
+  // still edit padding anywhere, exactly as Figma's own inspector does.
+  if (!cs.display.includes('flex') && !cs.display.includes('grid')) {
+    hidePadBand()
+    return
+  }
   const t = pf(cs.paddingTop)
   const rt = pf(cs.paddingRight)
   const b = pf(cs.paddingBottom)
@@ -2671,6 +3043,7 @@ function setActive(on: boolean) {
     document.removeEventListener('dblclick', onDblClick, true)
     document.removeEventListener('keydown', onKeyDown, true)
     exitTextEdit(true)
+    hideKeyHint()
     hideHandles()
     hidePadBand()
     resizeState = null
@@ -2700,6 +3073,8 @@ function setActive(on: boolean) {
 // not shapes glued together by coordinates.
 
 export type DesignColor = { r: number; g: number; b: number; a: number }
+
+export type DesignSizing = 'FIXED' | 'FILL' | 'HUG'
 
 export type DesignLayout = {
   direction: 'HORIZONTAL' | 'VERTICAL'
@@ -2738,7 +3113,7 @@ export type DesignNode = {
   clip?: boolean
   layout?: DesignLayout
   // How this node should behave inside ITS parent's auto layout, if any.
-  sizing?: { h: 'FIXED' | 'FILL'; v: 'FIXED' | 'FILL' }
+  sizing?: { h: DesignSizing; v: DesignSizing }
   text?: DesignText
   image?: { dataUrl: string | null }
   vector?: { svg: string }
@@ -2854,9 +3229,73 @@ function mapTextCase(v: string): DesignText['case'] {
 }
 
 /** FILL if this element grows on the main axis or is sized ~100% of its parent, else FIXED. */
-function sizingFor(style: CSSStyleDeclaration): 'FIXED' | 'FILL' {
-  if ((parseFloat(style.flexGrow) || 0) > 0) return 'FILL'
+/**
+ * How a child should size itself inside its parent's auto layout.
+ *
+ * This used to be `flexGrow > 0 ? FILL : FIXED`, applied to *both* axes from
+ * the same test — so anything that wasn't explicitly growing got pinned to
+ * the pixel size it happened to have on the page. Pinned text is what breaks
+ * first: Figma re-measures it with its own font, the measurement differs by
+ * a hair, and the text wraps or clips. Hugging and filling are what keep a
+ * layout alive, so they're used wherever the page is really doing them —
+ * which is exactly the question sizeModeFor already answers.
+ */
+function sizingFor(el: HTMLElement, axis: 'width' | 'height', canHug: boolean): DesignSizing {
+  const mode = sizeModeFor(el, axis)
+  if (mode === 'fill') return 'FILL'
+  // Only text and auto-layout frames can hug in Figma; a plain frame has no
+  // content to hug, so it keeps the size it was measured at.
+  if (mode === 'hug' && canHug) return 'HUG'
   return 'FIXED'
+}
+
+/** Children stack consistently along this axis — the spacing between them and
+ * the space left around them, measured rather than read off the CSS. Margins,
+ * `space-y-*` utilities and collapsed margins all land in the real geometry
+ * but not in `gap`, so measuring is what actually reproduces the layout. */
+function measureStack(
+  children: DesignNode[],
+  dir: 'VERTICAL' | 'HORIZONTAL',
+  size: { width: number; height: number },
+  // Room left past the last child along the stacking direction is only
+  // padding if something actually claims it — a container sized by its
+  // content, or a child stretching to fill. Otherwise it's just slack, and
+  // recording it would show up in Figma as an absurd 200px pad after a row
+  // of two small chips. Across the stack there's no such ambiguity: a
+  // filling child's measured size already has the real padding subtracted
+  // from it, so dropping it there would make every such child too wide.
+  keepTrailing: boolean
+): { gap: number; padding: [number, number, number, number] } | null {
+  const pos = dir === 'VERTICAL' ? 'y' : 'x'
+  const len = dir === 'VERTICAL' ? 'height' : 'width'
+  const crossPos = dir === 'VERTICAL' ? 'x' : 'y'
+  const crossLen = dir === 'VERTICAL' ? 'width' : 'height'
+  const sorted = children.slice().sort((a, b) => a[pos] - b[pos])
+
+  const gaps: number[] = []
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i][pos] - (sorted[i - 1][pos] + sorted[i - 1][len])
+    if (gap < -0.5) return null // they overlap: not a stack
+    gaps.push(Math.max(0, gap))
+  }
+  // A single inconsistent gap means the spacing is doing something auto
+  // layout can't express, so the frame keeps its absolute positioning.
+  if (gaps.length && Math.max(...gaps) - Math.min(...gaps) > 1) return null
+
+  const first = sorted[0]
+  const last = sorted[sorted.length - 1]
+  const before = first[pos]
+  const after = keepTrailing ? size[len] - (last[pos] + last[len]) : 0
+  const crossBefore = Math.min(...sorted.map((c) => c[crossPos]))
+  const crossAfter = size[crossLen] - Math.max(...sorted.map((c) => c[crossPos] + c[crossLen]))
+  const round = (n: number) => Math.max(0, Math.round(n))
+  return {
+    gap: gaps.length ? Math.round(gaps[0]) : 0,
+    padding:
+      dir === 'VERTICAL'
+        ? [round(before), round(crossAfter), round(after), round(crossBefore)]
+        : [round(crossBefore), round(after), round(crossAfter), round(before)],
+  }
 }
 
 /** Fetch every <img> in the subtree and convert it to a data URI — the plugin
@@ -2901,6 +3340,13 @@ function textNodeFor(node: Text, style: CSSStyleDeclaration, parentRect: DOMRect
   if (!characters) return null
   const color = figmaColor(style.color) ?? { r: 0, g: 0, b: 0, a: 1 }
   const lh = style.lineHeight === 'normal' ? null : parseFloat(style.lineHeight)
+  // One client rect per line box, so this is the page telling us whether the
+  // text wrapped. It decides everything about how the text should size in
+  // Figma: a single line that's pinned to its measured width clips or wraps
+  // the moment Figma re-measures it in a slightly different font, so it must
+  // hug instead; a paragraph that really did wrap needs to keep filling its
+  // container's width and let Figma recompute the height.
+  const lines = range.getClientRects().length
   return {
     type: 'TEXT',
     name: characters.slice(0, 24),
@@ -2908,6 +3354,7 @@ function textNodeFor(node: Text, style: CSSStyleDeclaration, parentRect: DOMRect
     y: r.top - parentRect.top,
     width: r.width,
     height: r.height,
+    sizing: lines > 1 ? { h: 'FILL', v: 'HUG' } : { h: 'HUG', v: 'HUG' },
     text: {
       characters,
       fontFamily: style.fontFamily.split(',')[0].replace(/["']/g, '').trim(),
@@ -2988,23 +3435,10 @@ function walkDesignTree(
     node.clip = true
   }
 
-  if (style.display.includes('flex')) {
-    node.layout = {
-      direction: style.flexDirection.startsWith('column') ? 'VERTICAL' : 'HORIZONTAL',
-      gap: parseFloat(style.columnGap) || parseFloat(style.rowGap) || 0,
-      padding: [
-        parseFloat(style.paddingTop) || 0,
-        parseFloat(style.paddingRight) || 0,
-        parseFloat(style.paddingBottom) || 0,
-        parseFloat(style.paddingLeft) || 0,
-      ],
-      primary: mapJustify(style.justifyContent),
-      counter: mapAlign(style.alignItems),
-      wrap: style.flexWrap === 'wrap',
-    }
-  }
-
   const children: DesignNode[] = []
+  // Children that auto layout can't describe at all, so their presence has
+  // to keep the frame on absolute positioning.
+  let hasOutOfFlowChild = false
   for (const child of Array.from(el.childNodes)) {
     if (budget.count >= TREE_EXPORT_MAX_NODES) break
     if (child.nodeType === Node.TEXT_NODE && (child.textContent || '').trim()) {
@@ -3016,12 +3450,81 @@ function walkDesignTree(
     } else if (child.nodeType === Node.ELEMENT_NODE) {
       const sub = walkDesignTree(child as Element, rect, imgData, budget)
       if (sub) {
-        const childStyle = getComputedStyle(child as Element)
-        sub.sizing = { h: sizingFor(childStyle), v: sizingFor(childStyle) }
+        const childEl = child as HTMLElement
+        const childStyle = getComputedStyle(childEl)
+        if (childStyle.position === 'absolute' || childStyle.position === 'fixed') {
+          hasOutOfFlowChild = true
+        }
+        // Only text and auto-layout frames have something to hug.
+        const canHug = !!sub.layout || sub.type === 'TEXT'
+        sub.sizing =
+          childEl instanceof HTMLElement
+            ? { h: sizingFor(childEl, 'width', canHug), v: sizingFor(childEl, 'height', canHug) }
+            : { h: 'FIXED', v: 'FIXED' }
         children.push(sub)
       }
     }
   }
+
+  const size = { width: rect.width, height: rect.height }
+  const hugsWidth = el instanceof HTMLElement && sizeModeFor(el, 'width') === 'hug'
+  const hugsHeight = el instanceof HTMLElement && sizeModeFor(el, 'height') === 'hug'
+  const keepTrailingFor = (dir: 'VERTICAL' | 'HORIZONTAL') => {
+    const axis = dir === 'VERTICAL' ? 'v' : 'h'
+    return (
+      (dir === 'VERTICAL' ? hugsHeight : hugsWidth) ||
+      children.some((c) => c.sizing?.[axis] === 'FILL')
+    )
+  }
+
+  const isFlex = style.display.includes('flex')
+  if (isFlex) {
+    const direction = style.flexDirection.startsWith('column') ? 'VERTICAL' : 'HORIZONTAL'
+    // Prefer what the children actually measure: `gap` is frequently unset
+    // while the real spacing comes from margins or a `space-y-*` utility,
+    // and CSS padding misses margins on the first/last child.
+    const measured =
+      !hasOutOfFlowChild && children.length && style.flexWrap !== 'wrap'
+        ? measureStack(children, direction, size, keepTrailingFor(direction))
+        : null
+    node.layout = {
+      direction,
+      gap: measured?.gap ?? (parseFloat(style.columnGap) || parseFloat(style.rowGap) || 0),
+      padding: measured?.padding ?? [
+        parseFloat(style.paddingTop) || 0,
+        parseFloat(style.paddingRight) || 0,
+        parseFloat(style.paddingBottom) || 0,
+        parseFloat(style.paddingLeft) || 0,
+      ],
+      primary: mapJustify(style.justifyContent),
+      counter: mapAlign(style.alignItems),
+      wrap: style.flexWrap === 'wrap',
+    }
+  } else if (children.length && !hasOutOfFlowChild) {
+    // A plain block container whose children simply stack *is* an auto layout
+    // in Figma's vocabulary. Exporting it as a bare frame instead pinned
+    // every child to the pixel size and position it happened to have, which
+    // is what made text and nested boxes break the moment anything reflowed.
+    // Layouts that genuinely need absolute positioning fail the stacking
+    // test below and keep their coordinates.
+    const vertical = measureStack(children, 'VERTICAL', size, keepTrailingFor('VERTICAL'))
+    const horizontal =
+      children.length > 1 ? measureStack(children, 'HORIZONTAL', size, keepTrailingFor('HORIZONTAL')) : null
+    // With one child either reading works; vertical matches how block
+    // layout actually flows, so it wins ties.
+    const pick = vertical ? { dir: 'VERTICAL' as const, m: vertical } : horizontal ? { dir: 'HORIZONTAL' as const, m: horizontal } : null
+    if (pick) {
+      node.layout = {
+        direction: pick.dir,
+        gap: pick.m.gap,
+        padding: pick.m.padding,
+        primary: 'MIN',
+        counter: 'MIN',
+        wrap: false,
+      }
+    }
+  }
+
   if (children.length) node.children = children
   return node
 }

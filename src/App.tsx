@@ -85,6 +85,7 @@ import {
   type PointerComment,
   type LayerNode,
   type Placement,
+  type SizeMode,
   sendToPage,
   generatePrompt,
 } from '@/lib/pointer'
@@ -523,8 +524,6 @@ const TYPOGRAPHY_FIELDS: StyleField[] = [
 ]
 
 // ---------- Layout: dimensions with Hug / Fixed / Fill ----------
-type SizeMode = 'fixed' | 'hug' | 'fill'
-
 /**
  * Which of the parent's axes this one is. "Fill" is a different CSS property
  * for each: along the parent's main axis it's flex-grow, across it it's
@@ -549,23 +548,6 @@ function fillProp(role: AxisRole, axis: 'width' | 'height'): { prop: string; on:
   return { prop: axis, on: '100%', off: 'auto' }
 }
 
-const HUG_VALUES = ['', 'auto', 'fit-content', 'max-content', 'min-content']
-
-/** Figma's Hug/Fixed/Fill, read back from the CSS that produces each. */
-function currentSizeMode(
-  axis: 'width' | 'height',
-  inline: Record<string, string>,
-  role: AxisRole
-): SizeMode {
-  const size = (inline[axis] || '').trim()
-  const { prop, on } = fillProp(role, axis)
-  // An explicit length always wins: an element that's both grown and given a
-  // width reads as Fixed, since that's the number the field would show.
-  if (!HUG_VALUES.includes(size) && size !== '100%') return 'fixed'
-  if ((inline[prop] || '').trim() === on) return 'fill'
-  return 'hug'
-}
-
 /**
  * One Figma-style dimension control: the value on the left, the sizing
  * mode on the right, in a single field.
@@ -582,12 +564,15 @@ function DimensionField({
   onApply: ApplyFn
 }) {
   const role = axisRole(axis, selection.parentLayout)
-  const mode = currentSizeMode(axis, selection.inline, role)
+  // Worked out by the page, which is the only side that can see the
+  // stylesheets deciding this — see sizeModeFor in the content script.
+  const mode = selection.sizing[axis]
   const px = axis === 'width' ? selection.rect.width : selection.rect.height
-  // Show the exact number that was typed when there is one, so a box-sizing
-  // difference can't make the field disagree with the value it just set.
-  // Anything else (a %, a rem, or a browser-chosen size) shows as measured.
-  const typed = parseUnit((selection.inline[axis] || '').trim())
+  // Show the exact number that was asked for when there is one, so a
+  // box-sizing difference can't make the field disagree with the value it
+  // just set. Anything else (a %, a rem, a browser-chosen size) shows as
+  // measured, which is the number that's actually on screen.
+  const typed = parseUnit(selection.specified[axis])
   const shown = Math.round(mode === 'fixed' && typed?.unit === 'px' ? Number(typed.num) : px)
   return (
     <div className="flex h-8 items-center rounded-md border bg-background pl-2 focus-within:ring-1 focus-within:ring-ring">
@@ -1647,6 +1632,7 @@ export default function App() {
       // own, so it just asks the panel to do what the Undo/Redo buttons do.
       if (msg.type === 'PTR_REQUEST_UNDO') undo()
       if (msg.type === 'PTR_REQUEST_REDO') redo()
+      if (msg.type === 'PTR_REQUEST_AUTOLAYOUT') createAutoLayoutFromSelection()
     }
     chrome.runtime.onMessage.addListener(listener)
     return () => chrome.runtime.onMessage.removeListener(listener)
@@ -1771,10 +1757,19 @@ export default function App() {
    * real state back after every edit, so the panel never reasons about a
    * version of the element that no longer exists.
    */
-  function syncLiveState(elementId: number, r: { inline?: Record<string, string>; rect?: SelectionPayload['rect'] }) {
-    if (!r?.inline || !r.rect) return
+  function syncLiveState(
+    elementId: number,
+    r: {
+      sizing?: SelectionPayload['sizing']
+      specified?: SelectionPayload['specified']
+      rect?: SelectionPayload['rect']
+    }
+  ) {
+    if (!r?.sizing || !r.specified || !r.rect) return
     setSelection((s) =>
-      s && s.elementId === elementId ? { ...s, inline: r.inline!, rect: r.rect! } : s
+      s && s.elementId === elementId
+        ? { ...s, sizing: r.sizing!, specified: r.specified!, rect: r.rect! }
+        : s
     )
   }
 
@@ -3666,24 +3661,41 @@ type ShortcutGroup = { title: string; note?: string; items: { keys: string; desc
 const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: 'Selecting',
-    note: 'Matches Figma: Enter dives into a group, Escape steps back out.',
+    note: "Figma's own bindings: Return goes down a level, Shift + Return goes up.",
     items: [
       { keys: 'Click', desc: 'Select the element under the cursor' },
+      { keys: 'Shift + Click', desc: 'Add or remove an element from the selection' },
       {
         keys: 'Right-click (repeat on the same spot)',
         desc: 'Cycle through elements stacked at that point, when one hides another',
       },
       { keys: 'Return / Enter', desc: "Select the current element's first child" },
-      { keys: 'Escape', desc: "Select the parent, or deselect once you're at the top" },
+      { keys: 'Shift + Return', desc: 'Select the parent' },
+      { keys: '\\', desc: 'Select the parent (same as Shift + Return)' },
+      { keys: 'Tab / Shift + Tab', desc: 'Select the next or previous sibling' },
+      { keys: 'Escape', desc: 'Deselect' },
     ],
   },
   {
     title: 'Measuring',
-    note: 'Hold while hovering — the same Alt-based measurement Figma uses on its canvas.',
+    note: 'Exactly like Figma: everything is measured from the selected element, so select something first, then hold Alt.',
     items: [
-      { keys: 'Alt + hover another element', desc: 'Show the gap between it and the current selection' },
-      { keys: 'Alt + Shift + hover', desc: "Show the hovered element's padding on all four sides" },
-      { keys: 'Alt + Ctrl + hover', desc: 'Show the distance from the hovered element to the viewport edges' },
+      {
+        keys: 'Alt + hover inside the selection',
+        desc: "Show the selected element's padding and the gaps between its children — anywhere inside it, including over its children",
+      },
+      {
+        keys: 'Alt + hover another element',
+        desc: 'Show the horizontal and vertical distance between it and the selection',
+      },
+      {
+        keys: 'Cmd + Alt + hover',
+        desc: 'Measure to the nested element directly under the cursor instead of its top-level peer',
+      },
+      {
+        keys: 'Hover the padding of a selected auto layout',
+        desc: 'Drag that side to change its padding (hold Alt while dragging to change both sides)',
+      },
     ],
   },
   {
@@ -3700,10 +3712,11 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
         keys: 'Shift + Arrow keys',
         desc: 'Move to the very start/end among siblings — or nudge 10px if absolute/fixed',
       },
-      { keys: 'Cmd + [', desc: 'Move the selected element earlier among its siblings' },
-      { keys: 'Cmd + ]', desc: 'Move the selected element later among its siblings' },
-      { keys: 'Cmd + Shift + [', desc: 'Move it to the very start among its siblings' },
-      { keys: 'Cmd + Shift + ]', desc: 'Move it to the very end among its siblings' },
+      { keys: 'Cmd + [', desc: 'Move the selected element one step earlier among its siblings' },
+      { keys: 'Cmd + ]', desc: 'Move the selected element one step later among its siblings' },
+      { keys: '[', desc: 'Move it to the very start among its siblings' },
+      { keys: ']', desc: 'Move it to the very end among its siblings' },
+      { keys: 'Shift + A', desc: 'Wrap the selected elements in a new auto layout' },
       { keys: 'Cmd + Z', desc: 'Undo — same as the Undo button' },
       { keys: 'Cmd + Shift + Z', desc: 'Redo — same as the Redo button' },
       { keys: 'Drag', desc: 'Drag the selected element to move it freely' },
@@ -3719,6 +3732,10 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { keys: 'Alt + H', desc: 'Highlight every other element that shares the same classes as the selection' },
       { keys: '(automatic)', desc: 'Selecting a CSS grid container shows its column/row lines' },
+      {
+        keys: '(automatic)',
+        desc: 'Any shortcut you press shows up briefly at the bottom of the page, so you can tell it registered',
+      },
     ],
   },
 ]

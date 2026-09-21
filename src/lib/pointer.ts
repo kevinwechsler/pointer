@@ -2,6 +2,10 @@
 
 export type SourceInfo = { fileName: string; lineNumber: number } | null
 
+/** Figma's three sizing modes, shared by the Element panel and the Figma
+ * export so both describe an element's sizing the same way. */
+export type SizeMode = 'fixed' | 'hug' | 'fill'
+
 export type SelectionPayload = {
   // Identifies which frame (top page or an iframe) owns this element, so
   // follow-up messages route to the right copy of the content script.
@@ -22,10 +26,15 @@ export type SelectionPayload = {
   styles: Record<string, string>
   rect: { width: number; height: number; left: number; top: number }
   /**
-   * Author-set inline values. Computed styles always resolve to pixels, so
-   * these are what tell Hug/Fixed/Fill apart.
+   * How the element is sized on each axis, resolved by the page itself.
+   * Computed styles can't answer this (they always report a used pixel
+   * length) and inline styles only see sizes the author wrote inline, so
+   * the content script works it out from the stylesheets and reports it.
    */
-  inline: Record<string, string>
+  sizing: { width: SizeMode; height: SizeMode }
+  /** The size each axis actually asks for ('', 'auto', '100%', '240px', ...),
+   * so a typed length can be shown back exactly as it was written. */
+  specified: { width: string; height: string }
   /** The parent's layout mode, which decides what Hug/Fixed/Fill have to
    * write: grow along the parent's main axis, stretch across it, or a plain
    * percentage when the parent isn't a flex container at all. */

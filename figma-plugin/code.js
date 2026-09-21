@@ -85,6 +85,26 @@ function applyCornerRadius(node, radii) {
   node.bottomLeftRadius = bl;
 }
 
+// Figma throws rather than ignoring a sizing mode a node can't take — HUG on
+// something with no content to hug, or any of them on a node type that
+// doesn't support independent sizing (vectors). Applying each axis in its
+// own try means one unsupported axis doesn't take the other down with it,
+// and anything rejected just keeps the size it was measured at.
+function setSizing(node, prop, value) {
+  if (!value) return;
+  try {
+    node[prop] = value;
+  } catch {
+    if (value === 'HUG') {
+      try {
+        node[prop] = 'FIXED';
+      } catch {
+        /* nothing more to try */
+      }
+    }
+  }
+}
+
 async function buildNode(d, parent, stats) {
   let node;
 
@@ -152,23 +172,29 @@ async function buildNode(d, parent, stats) {
       for (const c of d.children) {
         const child = await buildNode(c, node, stats);
         if (child && node.layoutMode !== 'NONE' && c.sizing) {
-          try {
-            child.layoutSizingHorizontal = c.sizing.h;
-            child.layoutSizingVertical = c.sizing.v;
-          } catch {
-            // Some node types (vectors) don't support independent sizing —
-            // the fixed x/y/width/height already placed it correctly.
-          }
+          // Each axis is set on its own: one of them being unsupported for
+          // this node type shouldn't cost us the other. HUG in particular is
+          // rejected on nodes with nothing to hug, and losing the FILL next
+          // to it is what leaves a child pinned to a stale pixel width.
+          setSizing(child, 'layoutSizingHorizontal', c.sizing.h);
+          setSizing(child, 'layoutSizingVertical', c.sizing.v);
         }
       }
     }
   } else if (d.type === 'TEXT') {
     await applyText(node, d.text, stats);
-    node.resize(Math.max(1, d.width), Math.max(1, d.height));
-    // Fix the width to what the page wrapped to and let Figma's own text
-    // engine compute height at that width — far more reliable than us
-    // pre-computing line breaks with the source page's font metrics.
-    node.textAutoResize = 'HEIGHT';
+    const hugsWidth = d.sizing && d.sizing.h === 'HUG';
+    if (hugsWidth) {
+      // A single line on the page. Pinning it to the width we measured there
+      // is what clips or wraps it here, because Figma re-measures it with its
+      // own copy of the font — so let the text size itself instead.
+      node.textAutoResize = 'WIDTH_AND_HEIGHT';
+    } else {
+      // Text that genuinely wrapped: keep the width and let Figma's text
+      // engine recompute the line breaks and height at that width.
+      node.resize(Math.max(1, d.width), Math.max(1, d.height));
+      node.textAutoResize = 'HEIGHT';
+    }
   } else if (d.type === 'IMAGE') {
     if (d.image && d.image.dataUrl) {
       try {
