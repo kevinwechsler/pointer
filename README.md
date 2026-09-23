@@ -2,6 +2,8 @@
 
 Point at elements in your localhost app, tweak them visually, and get a precise prompt to paste into Claude.
 
+![Pointer's side panel next to a localhost page, with a button selected on the page and its position, layout and padding controls in the panel](docs/pointer-window.jpg)
+
 ## Setup
 
 Two separate installs — the browser extension (required) and the Figma plugin (only if you want to send selections into Figma).
@@ -39,6 +41,8 @@ Only needed if you want **Copy for Figma** to work. It isn't published to the Fi
 5. Go to the **Changes** tab → **Copy prompt** → paste into Claude Code.
 
 The prompt references the exact source file and line when the app exposes that info (React apps in dev mode), or a precise CSS selector otherwise.
+
+<p align="center"><img src="docs/pointer-edits.jpg" width="480" alt="Edited fields in Pointer's panel, Gap and Corner radius outlined as changed, and the Copy prompt button counting 4 changes"></p>
 
 ## Send a selection to Figma
 
