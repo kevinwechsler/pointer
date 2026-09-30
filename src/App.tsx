@@ -59,6 +59,8 @@ import {
   Eye,
   EyeOff,
   Group,
+  Ungroup,
+  Minus,
 } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -228,13 +230,55 @@ const CHECKER =
 
 // ---------- Figma-style panel building blocks ----------
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({
+  title,
+  action,
+  children,
+}: {
+  title: string
+  /** Figma puts a section's add/remove control in its header, on the right. */
+  action?: React.ReactNode
+  children: React.ReactNode
+}) {
   return (
     <div className="space-y-2 p-4">
-      <p className="text-xs font-semibold">{title}</p>
+      <div className="flex h-5 items-center justify-between">
+        <p className="text-xs font-semibold">{title}</p>
+        {action}
+      </div>
       {children}
     </div>
   )
+}
+
+/** The small "+" / "−" that Figma uses to add or remove a fill, stroke or
+ * auto layout, right in the section header. */
+function HeaderIconButton({
+  icon: Icon,
+  title,
+  onClick,
+}: {
+  icon: typeof Plus
+  title: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+    >
+      <Icon className="size-3.5" />
+    </button>
+  )
+}
+
+/** A color that will actually paint something. */
+function isVisibleColor(value: string | undefined): boolean {
+  if (!value) return false
+  const c = parseColor(value)
+  return !c.transparent && !c.unknown
 }
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -916,10 +960,14 @@ function ColorRow({
   value,
   edited,
   onChange,
+  onRemove,
 }: {
   value: string
   edited: boolean
   onChange: (v: string) => void
+  /** Figma's "−": the row disappears entirely, unlike the eye which only
+   * hides the paint and keeps the row for turning it back on. */
+  onRemove?: () => void
 }) {
   const parsed = parseColor(value)
   // Seed for the picker when there's no color yet. Was #000000, which made
@@ -982,6 +1030,16 @@ function ColorRow({
       >
         {visible ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />}
       </button>
+      {onRemove && (
+        <button
+          type="button"
+          className="shrink-0 text-muted-foreground hover:text-foreground"
+          title="Remove"
+          onClick={onRemove}
+        >
+          <Minus className="size-3.5" />
+        </button>
+      )}
     </div>
   )
 }
@@ -1320,13 +1378,13 @@ function LayerTree({
               }}
               className={
                 'relative flex h-7 cursor-default items-center gap-1 rounded-sm pr-2 text-xs select-none ' +
+                // Figma's layer list: a pale blue for every selected row, a
+                // barely-there gray on hover, and its blue for drop targets.
                 (drop === 'inside'
-                  ? 'bg-primary/15 outline outline-primary'
-                  : isSelected
-                    ? 'bg-primary/10 text-foreground'
-                    : isMultiSelected
-                      ? 'bg-blue-500/10 text-foreground'
-                      : 'hover:bg-muted') +
+                  ? 'bg-[#E5F4FF] outline outline-1 -outline-offset-1 outline-[#0D99FF] dark:bg-[#0D99FF]/20'
+                  : isSelected || isMultiSelected
+                    ? 'bg-[#E5F4FF] text-foreground dark:bg-[#0D99FF]/20'
+                    : 'hover:bg-[#F5F5F5] dark:hover:bg-white/5') +
                 (draggedId === n.id ? ' opacity-40' : '')
               }
               style={{ paddingLeft: 4 + depth * 14 }}
@@ -1337,13 +1395,13 @@ function LayerTree({
                   a slot beside it. */}
               {drop === 'before' && (
                 <div
-                  className="pointer-events-none absolute top-0 right-0 h-0.5 bg-primary"
+                  className="pointer-events-none absolute top-0 right-0 h-0.5 bg-[#0D99FF]"
                   style={{ left: 4 + depth * 14 }}
                 />
               )}
               {drop === 'after' && (
                 <div
-                  className="pointer-events-none absolute right-0 bottom-0 h-0.5 bg-primary"
+                  className="pointer-events-none absolute right-0 bottom-0 h-0.5 bg-[#0D99FF]"
                   style={{ left: 4 + depth * 14 }}
                 />
               )}
@@ -1459,6 +1517,8 @@ export default function App() {
   // Last frame the user interacted with; frame-scoped requests that aren't
   // tied to a specific element (tokens, comments) go to this frame.
   const lastFrameRef = useRef<string | null>(null)
+  const activeTabRef = useRef('element')
+  const loadTreeRef = useRef<(revealId?: number) => Promise<void>>(async () => {})
 
   // Undo/redo stack. historyRef holds ops; index points AFTER the last applied op.
   const historyRef = useRef<HistoryOp[]>([])
@@ -1519,6 +1579,14 @@ export default function App() {
   // than a focus gap. historyIndexRef makes undo/redo safe to call from a
   // stale closure here, same as from the content-script message listener.
   useEffect(() => {
+    // Every shortcut is forwarded to the page's dispatcher, so the Layers
+    // tab (or any tab) behaves exactly like the canvas: Delete, Cmd+C/V,
+    // Tab, Enter, brackets — without switching to the Element tab first.
+    // Undo/redo stay here because the history itself lives in the panel.
+    const PLAIN_SHORTCUT_KEYS = new Set([
+      'Enter', 'Escape', 'Tab', 'Backspace', 'Delete', '[', ']', '\\',
+      'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+    ])
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null
       if (
@@ -1526,10 +1594,24 @@ export default function App() {
         (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
       )
         return
-      if (e.key.toLowerCase() !== 'z' || !(e.metaKey || e.ctrlKey)) return
+      if (['Alt', 'Shift', 'Meta', 'Control'].includes(e.key)) return
+      // A dialog or menu owns its own Escape/Enter/arrows.
+      if (document.querySelector('[data-state="open"][role="dialog"], [data-state="open"][role="menu"]')) return
+      const mod = e.metaKey || e.ctrlKey
+      const isShortcut =
+        mod || e.altKey || PLAIN_SHORTCUT_KEYS.has(e.key) || (e.shiftKey && e.key.toLowerCase() === 'a')
+      if (!isShortcut) return
       e.preventDefault()
-      if (e.shiftKey) redo()
-      else undo()
+      if (mod && e.key.toLowerCase() === 'z') {
+        if (e.shiftKey) redo()
+        else undo()
+        return
+      }
+      sendToPage({
+        type: 'PTR_KEY',
+        frameToken: lastFrameRef.current ?? undefined,
+        event: { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey },
+      }).catch(() => {})
     }
     window.addEventListener('keydown', onKeyDown, true)
     return () => window.removeEventListener('keydown', onKeyDown, true)
@@ -1565,10 +1647,23 @@ export default function App() {
           upsertEdit(target, 'remove', 'element', 'present', 'removed')
         }
         setSelection(null)
+        refreshTreeIfShown()
+      }
+      if (msg.type === 'PTR_UNWRAPPED') {
+        const { elementId, target, pointerMade } = msg.payload
+        if (pointerMade) {
+          // Undoing a wrapper Pointer created is just dropping that edit.
+          setEdits((prev) => prev.filter((e) => e.target.elementId !== elementId))
+        } else if (target) {
+          upsertEdit(target, 'unwrap', 'element', 'present', 'unwrapped')
+        }
+        setSelection(null)
+        refreshTreeIfShown()
       }
       if (msg.type === 'PTR_DUPLICATED') {
         const { payload, html, parentDesc } = msg.payload
         if (payload) upsertEdit(payload, 'insert', 'element', '', html, parentDesc)
+        refreshTreeIfShown()
       }
       if (msg.type === 'PTR_MOVED') {
         const { elementId, target, from, to, parentDesc } = msg.payload
@@ -1582,6 +1677,7 @@ export default function App() {
         })
         upsertEdit(target, 'move', 'order', String(from), String(to), parentDesc)
         if (selection?.elementId === elementId) setSelection((s) => (s ? { ...s, index: to } : s))
+        refreshTreeIfShown()
       }
       if (msg.type === 'PTR_COMMENT_TARGET') {
         lastFrameRef.current = msg.payload.frameToken
@@ -1659,6 +1755,15 @@ export default function App() {
       )
     }
   }
+
+  /** The Layers tree is a snapshot; anything that adds, removes or moves an
+   * element on the page has to refresh it while it's showing. Reached
+   * through refs because the message listener is a one-time closure. */
+  function refreshTreeIfShown() {
+    if (activeTabRef.current === 'layers') loadTreeRef.current()
+  }
+  activeTabRef.current = activeTab
+  loadTreeRef.current = loadTree
 
   async function loadTree(revealId?: number) {
     try {
@@ -1889,6 +1994,13 @@ export default function App() {
           elementId: edit.target.elementId,
         })
         if (selection?.elementId === edit.target.elementId) setSelection(null)
+      } else if (edit.kind === 'unwrap') {
+        await sendToPage({
+          type: 'PTR_RESTORE_UNWRAP',
+          frameToken: edit.target.frameToken,
+          elementId: edit.target.elementId,
+        })
+        refreshTreeIfShown()
       } else if (edit.kind === 'move') {
         await sendToPage({
           type: 'PTR_RESET_MOVE',
@@ -2076,6 +2188,16 @@ export default function App() {
         upsertEdit(selection, 'remove', 'element', 'present', 'removed')
       }
       setSelection(null)
+    } catch {
+      setError('Could not reach the page. Reload the localhost tab and try again.')
+    }
+  }
+
+  /** Figma's Cmd+Delete: the wrapper goes, its contents stay put. */
+  async function unwrapSelected() {
+    if (!selection) return
+    try {
+      await sendToPage({ type: 'PTR_UNWRAP', frameToken: selection.frameToken, elementId: selection.elementId })
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -2800,6 +2922,14 @@ export default function App() {
                   <Button
                     size="sm"
                     variant="outline"
+                    onClick={unwrapSelected}
+                    title="Unframe — remove this element but keep its contents (Cmd + Delete)"
+                  >
+                    <Ungroup className="size-3.5" />
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
                     className="text-destructive hover:text-destructive"
                     onClick={deleteSelected}
                     title="Delete"
@@ -2893,7 +3023,18 @@ export default function App() {
               </Section>
 
               {/* Layout */}
-              <Section title="Layout">
+              <Section
+                title="Layout"
+                action={
+                  currentFlow(draft) !== 'none' && (
+                    <HeaderIconButton
+                      icon={Minus}
+                      title="Remove auto layout (Shift + Alt + A)"
+                      onClick={() => applyFlow('none', applyStyle, draft)}
+                    />
+                  )
+                }
+              >
                 {(() => {
                   const flow = currentFlow(draft)
                   const cols = trackCount(draft.gridTemplateColumns)
@@ -2916,17 +3057,6 @@ export default function App() {
                               </Button>
                             ))}
                           </div>
-                          {flow !== 'none' && (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-7 w-7 shrink-0 px-0"
-                              title="Remove auto layout"
-                              onClick={() => applyFlow('none', applyStyle, draft)}
-                            >
-                              <X className="size-3.5" />
-                            </Button>
-                          )}
                         </div>
                       </FieldRow>
 
@@ -3076,54 +3206,84 @@ export default function App() {
                   is the fill empty?"). Text leaves get Fill = color, with the
                   background as its own row underneath; everything else keeps
                   Fill = background. */}
-              <Section title="Fill">
-                {selection.text ? (
-                  <>
-                    <ColorRow
-                      value={draft.color ?? ''}
-                      edited={isEdited('color')}
-                      onChange={(v) => applyStyle('color', v)}
-                    />
-                    <FieldRow label="Background">
+              {/* Figma's fill section: nothing at all when there is no fill,
+                  a "+" in the header to add one (seeded with Figma's default
+                  gray), and a "−" on each row to take it away again. For a
+                  text layer the fill *is* the text color; its background is a
+                  second paint underneath. */}
+              {(() => {
+                const hasColor = !!selection.text && isVisibleColor(draft.color)
+                const hasBg = isVisibleColor(draft.backgroundColor)
+                const canAdd = selection.text ? !hasColor || !hasBg : !hasBg
+                const add = () => {
+                  if (selection.text && !hasColor) applyStyle('color', '#000000')
+                  else applyStyle('backgroundColor', '#d9d9d9')
+                }
+                return (
+                  <Section
+                    title="Fill"
+                    action={canAdd && <HeaderIconButton icon={Plus} title="Add fill" onClick={add} />}
+                  >
+                    {hasColor && (
+                      <ColorRow
+                        value={draft.color ?? ''}
+                        edited={isEdited('color')}
+                        onChange={(v) => applyStyle('color', v)}
+                        onRemove={() => applyStyle('color', 'transparent')}
+                      />
+                    )}
+                    {hasBg && (
                       <ColorRow
                         value={draft.backgroundColor ?? ''}
                         edited={isEdited('backgroundColor')}
                         onChange={(v) => applyStyle('backgroundColor', v)}
+                        onRemove={() => applyStyle('backgroundColor', 'transparent')}
                       />
-                    </FieldRow>
-                  </>
-                ) : (
-                  <ColorRow
-                    value={draft.backgroundColor ?? ''}
-                    edited={isEdited('backgroundColor')}
-                    onChange={(v) => applyStyle('backgroundColor', v)}
-                  />
-                )}
-              </Section>
+                    )}
+                  </Section>
+                )
+              })()}
 
-              {/* Stroke */}
-              <Section title="Stroke">
-                <ColorRow
-                  value={draft.borderColor ?? ''}
-                  edited={isEdited('borderColor')}
-                  onChange={(v) => {
-                    applyStyle('borderColor', v)
-                    // A stroke with no style or weight is invisible; give it
-                    // sensible defaults the first time a color is chosen.
-                    if (draft.borderStyle === 'none') applyStyle('borderStyle', 'solid')
-                    if (!parseFloat(draft.borderWidth ?? '0')) applyStyle('borderWidth', '1px')
-                  }}
-                />
-                <div className="grid grid-cols-2 gap-2">
-                  {renderField({ prop: 'borderWidth', label: 'Weight', type: 'unit' })}
-                  {renderField({
-                    prop: 'borderStyle',
-                    label: 'Style',
-                    type: 'select',
-                    options: ['none', 'solid', 'dashed', 'dotted'],
-                  })}
-                </div>
-              </Section>
+              {/* Stroke: same shape. Removing sets the style to none rather
+                  than clearing the color, so adding it back brings back the
+                  weight and color it had. */}
+              {(() => {
+                const hasStroke =
+                  draft.borderStyle !== 'none' &&
+                  parseFloat(draft.borderWidth ?? '0') > 0 &&
+                  isVisibleColor(draft.borderColor)
+                const add = () => {
+                  if (!isVisibleColor(draft.borderColor)) applyStyle('borderColor', '#000000')
+                  if (!parseFloat(draft.borderWidth ?? '0')) applyStyle('borderWidth', '1px')
+                  applyStyle('borderStyle', 'solid')
+                }
+                return (
+                  <Section
+                    title="Stroke"
+                    action={!hasStroke && <HeaderIconButton icon={Plus} title="Add stroke" onClick={add} />}
+                  >
+                    {hasStroke && (
+                      <>
+                        <ColorRow
+                          value={draft.borderColor ?? ''}
+                          edited={isEdited('borderColor')}
+                          onChange={(v) => applyStyle('borderColor', v)}
+                          onRemove={() => applyStyle('borderStyle', 'none')}
+                        />
+                        <div className="grid grid-cols-2 gap-2">
+                          {renderField({ prop: 'borderWidth', label: 'Weight', type: 'unit' })}
+                          {renderField({
+                            prop: 'borderStyle',
+                            label: 'Style',
+                            type: 'select',
+                            options: ['solid', 'dashed', 'dotted'],
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </Section>
+                )
+              })()}
 
               {/* Typography */}
               {(() => {
@@ -3312,6 +3472,10 @@ export default function App() {
                             ) : e.kind === 'group' ? (
                               <span className="font-medium text-foreground">
                                 grouped into auto layout
+                              </span>
+                            ) : e.kind === 'unwrap' ? (
+                              <span className="font-medium text-destructive">
+                                removed wrapper, kept contents
                               </span>
                             ) : e.kind === 'remove' ? (
                               <span className="font-medium text-destructive">
@@ -3721,7 +3885,11 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: 'Cmd + Shift + Z', desc: 'Redo — same as the Redo button' },
       { keys: 'Drag', desc: 'Drag the selected element to move it freely' },
       { keys: 'Delete / Backspace', desc: 'Remove the selected element' },
+      { keys: 'Cmd + Delete', desc: 'Unframe: remove the selected element but keep its contents in place' },
+      { keys: 'Shift + Alt + A', desc: 'Remove auto layout (the element stays, its children stop being laid out)' },
       { keys: 'Cmd + D', desc: 'Duplicate the selected element' },
+      { keys: 'Cmd + C / Cmd + X', desc: 'Copy / cut the selected layer' },
+      { keys: 'Cmd + V', desc: 'Paste it inside the selected container, or right after the selected layer' },
       { keys: 'Cmd + Alt + C', desc: "Copy the selected element's style" },
       { keys: 'Cmd + Alt + V', desc: 'Paste the copied style onto whatever is hovered' },
     ],
@@ -3744,8 +3912,8 @@ function ShortcutsList() {
   return (
     <div className="space-y-4 text-sm">
       <p className="text-xs text-muted-foreground">
-        These work on the page while <span className="font-medium text-foreground">Inspect</span>{' '}
-        is turned on.
+        These work while <span className="font-medium text-foreground">Inspect</span> is turned on —
+        both on the page and from any tab of this panel, so you never have to leave the Layers tab.
       </p>
       {SHORTCUT_GROUPS.map((group) => (
         <div key={group.title} className="space-y-2">

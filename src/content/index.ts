@@ -132,7 +132,7 @@ function makeBox(color: string, bg: string): HTMLDivElement {
     zIndex: '2147483646',
     border: `2px solid ${color}`,
     background: bg,
-    borderRadius: '2px',
+    borderRadius: '0',
     display: 'none',
     boxSizing: 'border-box',
   })
@@ -140,14 +140,22 @@ function makeBox(color: string, bg: string): HTMLDivElement {
   return box
 }
 
+
+// Figma's own canvas palette (UI3), so Pointer reads as an extension of it
+// rather than a browser inspector: one blue for hover, selection and handles,
+// one red for measurements.
+const FIGMA_BLUE = '#0D99FF'
+const FIGMA_RED = '#F24822'
+
 let hoverBox: HTMLDivElement | null = null
 let selectBox: HTMLDivElement | null = null
 let hoverLabel: HTMLDivElement | null = null
 
 function ensureOverlay() {
   if (hoverBox) return
-  hoverBox = makeBox('#3b82f6', 'rgba(59,130,246,0.08)')
-  selectBox = makeBox('#f59e0b', 'transparent')
+  hoverBox = makeBox(FIGMA_BLUE, 'transparent')
+  hoverBox.style.borderWidth = '1px'
+  selectBox = makeBox(FIGMA_BLUE, 'transparent')
   hoverLabel = document.createElement('div')
   Object.assign(hoverLabel.style, {
     position: 'fixed',
@@ -649,7 +657,7 @@ function drawExtraBoxes() {
       left: `${r.left}px`,
       width: `${r.width}px`,
       height: `${r.height}px`,
-      border: '2px solid #3b82f6',
+      border: `2px solid ${FIGMA_BLUE}`,
       borderRadius: '2px',
       boxSizing: 'border-box',
     })
@@ -1083,7 +1091,7 @@ function buildNewElement(kind: InsertKind): HTMLElement {
       Object.assign(el.style, {
         width: '120px',
         height: '80px',
-        background: '#3b82f6',
+        background: FIGMA_BLUE,
         borderRadius: '8px',
       })
       break
@@ -1427,7 +1435,7 @@ function makeMeasureLine(): HTMLDivElement {
     position: 'fixed',
     pointerEvents: 'none',
     zIndex: '2147483645',
-    background: '#f43f5e',
+    background: FIGMA_RED,
     display: 'none',
   })
   document.documentElement.appendChild(line)
@@ -1440,7 +1448,7 @@ function makeMeasureLabel(): HTMLDivElement {
     position: 'fixed',
     pointerEvents: 'none',
     zIndex: '2147483647',
-    background: '#f43f5e',
+    background: FIGMA_RED,
     color: '#fff',
     font: 'bold 10px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
     padding: '1px 4px',
@@ -1494,7 +1502,7 @@ function addBand(left: number, top: number, width: number, height: number, value
     top: `${top}px`,
     width: `${width}px`,
     height: `${height}px`,
-    background: 'rgba(244, 63, 94, 0.25)',
+    background: 'rgba(242, 72, 34, 0.22)',
   })
   placeLabel(measure.bandLabels[i], left + width / 2 - 8, top + height / 2 - 8, `${Math.round(value)}`)
 }
@@ -1925,6 +1933,149 @@ function selectSibling(dir: 'next' | 'prev'): boolean {
   return true
 }
 
+
+// ---------- layer clipboard ----------
+// Figma's Cmd+C / Cmd+V on layers. What's copied is a detached clone, so the
+// original can be edited or deleted afterwards without changing what gets
+// pasted, exactly as a clipboard should behave.
+let layerClipboard: Element | null = null
+
+function copyLayer() {
+  if (!selectedEl) return
+  const clone = selectedEl.cloneNode(true) as Element
+  clone.removeAttribute('data-pointer-cid')
+  clone.querySelectorAll('[data-pointer-cid]').forEach((n) => n.removeAttribute('data-pointer-cid'))
+  layerClipboard = clone
+}
+
+/** Figma pastes into the selected frame when there is one, otherwise next
+ * to the selected layer; with nothing selected, at the end of the page. */
+function pasteLayer(): { ok: boolean; payload?: SelectionPayload; html?: string; parentDesc?: string } {
+  if (!layerClipboard) return { ok: false }
+  const clone = layerClipboard.cloneNode(true) as Element
+  clone.setAttribute('data-pointer-new', 'paste')
+  let parent: Element = document.body
+  let before: Node | null = null
+  if (selectedEl) {
+    const isContainer = selectedEl.children.length > 0 && !isEditableText(selectedEl)
+    if (isContainer) parent = selectedEl
+    else if (selectedEl.parentElement) {
+      parent = selectedEl.parentElement
+      before = selectedEl.nextSibling
+    }
+  }
+  parent.insertBefore(clone, before)
+  const id = registerEl(clone)
+  insertedEls.set(id, clone)
+  selectElement(clone)
+  schedulePinUpdate()
+  return { ok: true, payload: buildPayload(clone), html: clone.outerHTML, parentDesc: shortDescriptor(parent) }
+}
+
+function notifyDeleted(id: number): boolean {
+  const el = getEl(id)
+  if (!el) return false
+  const target = buildPayload(el)
+  const r = deleteElement(id)
+  if (!r.ok) return false
+  chrome.runtime.sendMessage({
+    type: 'PTR_DELETED',
+    payload: { elementId: id, target, desc: r.desc, inserted: r.inserted },
+  })
+  return true
+}
+
+// ---------- unframe ----------
+// Figma's Cmd+Delete ("Unframe"): the wrapper goes away, its contents stay
+// exactly where they were. Everything is recorded so it can be put back —
+// the wrapper through the same detached-node record deletion uses, its
+// children through the same move records the Layers drag uses.
+// Every node that was lifted out, with the sibling it sat before inside the
+// wrapper, so restoring can put each one back in its exact slot — bare text
+// included, which has no element id to hang a move record on.
+const unwrapped = new Map<number, { node: Node; next: Node | null; recordedMove: number | null }[]>()
+
+function unwrapElement(id: number): { ok: boolean; target?: SelectionPayload; desc?: string; pointerMade?: boolean } {
+  const el = getEl(id)
+  const parent = el?.parentElement
+  if (!el || !parent || el === document.body) return { ok: false }
+  // A wrapper Pointer itself created (Create auto layout) is simply undone.
+  if (insertedEls.has(id)) {
+    ungroup(id)
+    return { ok: true, pointerMade: true }
+  }
+  const target = buildPayload(el)
+  const desc = shortDescriptor(el)
+  const lifted: { node: Node; next: Node | null; recordedMove: number | null }[] = []
+  for (const kid of Array.from(el.childNodes)) {
+    if (kid.nodeType !== Node.ELEMENT_NODE && !(kid.textContent || '').trim()) continue
+    let recordedMove: number | null = null
+    if (kid instanceof Element) {
+      // Same move record the Layers drag keeps, so "reset move" on the child
+      // later still knows where it came from.
+      const cid = registerEl(kid)
+      if (!movePristine.has(cid)) {
+        movePristine.set(cid, { parent: el, nextSibling: kid.nextSibling })
+        recordedMove = cid
+      }
+    }
+    lifted.push({ node: kid, next: kid.nextSibling, recordedMove })
+    parent.insertBefore(kid, el)
+  }
+  unwrapped.set(id, lifted)
+  deletedEls.set(id, { el, parent, nextSibling: el.nextSibling })
+  el.remove()
+  if (selectedEl === el) {
+    selectedEl = null
+    hideBox(selectBox)
+    clearGridOverlay()
+  }
+  schedulePinUpdate()
+  broadcastMultiSelection()
+  return { ok: true, target, desc }
+}
+
+function restoreUnwrapped(id: number): boolean {
+  if (!restoreElement(id)) return false
+  const wrapper = getEl(id)
+  const lifted = unwrapped.get(id) ?? []
+  unwrapped.delete(id)
+  if (!wrapper) return false
+  // Back to front, so each node's "next" anchor is already in place.
+  for (let i = lifted.length - 1; i >= 0; i--) {
+    const { node, next, recordedMove } = lifted[i]
+    wrapper.insertBefore(node, next && next.parentNode === wrapper ? next : null)
+    if (recordedMove != null) movePristine.delete(recordedMove)
+  }
+  return true
+}
+
+function notifyUnwrapped(id: number): boolean {
+  const r = unwrapElement(id)
+  if (!r.ok) return false
+  chrome.runtime.sendMessage({
+    type: 'PTR_UNWRAPPED',
+    payload: { elementId: id, target: r.target, desc: r.desc, pointerMade: !!r.pointerMade },
+  })
+  return true
+}
+
+/** Figma's Shift+Opt+A: the frame stays, only the auto layout goes. In CSS
+ * that is the container falling back to plain block flow. */
+function removeAutoLayout(id: number): boolean {
+  const el = getEl(id)
+  if (!el) return false
+  const from = getComputedStyle(el).display
+  if (!from.includes('flex') && !from.includes('grid')) return false
+  applyStyle(id, 'display', 'block')
+  chrome.runtime.sendMessage({
+    type: 'PTR_STYLES_CHANGED',
+    payload: { target: buildPayload(el), changes: [{ prop: 'display', from, to: 'block' }] },
+  })
+  if (selectedEl === el) drawGridOverlay(el)
+  return true
+}
+
 // ---------- the pressed-keys overlay ----------
 // A read-out of the shortcut that just fired, bottom-centre over the page.
 // It only appears for combinations Pointer actually acted on, so it doubles
@@ -1945,7 +2096,21 @@ const KEY_SYMBOLS: Record<string, string> = {
   ' ': 'space',
 }
 
-function keyHintFor(e: KeyboardEvent): string[] {
+
+/** The parts of a key event the shortcuts care about. The panel forwards
+ * its own key presses as plain objects of this shape, so one dispatcher
+ * serves both documents — otherwise a shortcut only worked while the *page*
+ * had focus, and focus lands in the panel the moment you click a layer. */
+type KeyLike = {
+  key: string
+  metaKey: boolean
+  ctrlKey: boolean
+  shiftKey: boolean
+  altKey: boolean
+  preventDefault(): void
+}
+
+function keyHintFor(e: KeyLike): string[] {
   const parts: string[] = []
   if (e.ctrlKey) parts.push(IS_MAC ? '⌃' : 'Ctrl')
   if (e.altKey) parts.push(IS_MAC ? '⌥' : 'Alt')
@@ -1959,7 +2124,7 @@ function keyHintFor(e: KeyboardEvent): string[] {
 let keyHintEl: HTMLDivElement | null = null
 let keyHintTimer: number | null = null
 
-function showKeyHint(e: KeyboardEvent) {
+function showKeyHint(e: KeyLike) {
   if (!keyHintEl) {
     keyHintEl = document.createElement('div')
     keyHintEl.dataset.pointerUi = '1'
@@ -2026,7 +2191,7 @@ function hideKeyHint() {
  * Returns whether the key was acted on, so the caller can show the key
  * overlay for exactly the combinations that did something.
  */
-function handleShortcut(e: KeyboardEvent): boolean {
+function handleShortcut(e: KeyLike): boolean {
   const mod = e.metaKey || e.ctrlKey
 
   // --- selection ---
@@ -2116,6 +2281,38 @@ function handleShortcut(e: KeyboardEvent): boolean {
     return true
   }
 
+  // --- layer clipboard (Figma: Cmd+C / Cmd+X / Cmd+V) ---
+  if (e.key.toLowerCase() === 'c' && mod && !e.altKey && !e.shiftKey && selectedEl) {
+    e.preventDefault()
+    copyLayer()
+    return true
+  }
+  if (e.key.toLowerCase() === 'x' && mod && !e.altKey && selectedEl) {
+    e.preventDefault()
+    copyLayer()
+    return notifyDeleted(registerEl(selectedEl))
+  }
+  if (e.key.toLowerCase() === 'v' && mod && !e.altKey && !e.shiftKey && layerClipboard) {
+    e.preventDefault()
+    const r = pasteLayer()
+    if (!r.ok) return false
+    chrome.runtime.sendMessage({
+      type: 'PTR_DUPLICATED',
+      payload: { payload: r.payload, html: r.html, parentDesc: r.parentDesc },
+    })
+    return true
+  }
+
+  // --- unframe (Figma: Cmd+Delete) and remove auto layout (Shift+Opt+A) ---
+  if ((e.key === 'Backspace' || e.key === 'Delete') && mod && selectedEl) {
+    e.preventDefault()
+    return notifyUnwrapped(registerEl(selectedEl))
+  }
+  if (e.key.toLowerCase() === 'a' && e.shiftKey && e.altKey && !mod && selectedEl) {
+    e.preventDefault()
+    return removeAutoLayout(registerEl(selectedEl))
+  }
+
   // --- copy/paste properties (Figma: Cmd+Opt+C / Cmd+Opt+V) ---
   if (e.key.toLowerCase() === 'c' && mod && e.altKey && selectedEl) {
     e.preventDefault()
@@ -2136,15 +2333,7 @@ function handleShortcut(e: KeyboardEvent): boolean {
 
   if ((e.key === 'Delete' || e.key === 'Backspace') && selectedEl) {
     e.preventDefault()
-    const id = registerEl(selectedEl)
-    const target = buildPayload(selectedEl)
-    const r = deleteElement(id)
-    if (!r.ok) return false
-    chrome.runtime.sendMessage({
-      type: 'PTR_DELETED',
-      payload: { elementId: id, target, desc: r.desc, inserted: r.inserted },
-    })
-    return true
+    return notifyDeleted(registerEl(selectedEl))
   }
 
   if (e.key.toLowerCase() === 'd' && mod && selectedEl) {
@@ -2615,7 +2804,7 @@ function ensureHandles() {
       width: `${d.w}px`,
       height: `${d.h}px`,
       background: '#fff',
-      border: '1.5px solid #3b82f6',
+      border: `1.5px solid ${FIGMA_BLUE}`,
       borderRadius: '2px',
       pointerEvents: 'auto',
       zIndex: '2147483647',
@@ -2624,7 +2813,7 @@ function ensureHandles() {
     handles.push({ side: d.side, w: d.w, h: d.h, el })
   }
   sizeLabel = makeUiNode('', {
-    background: '#3b82f6',
+    background: FIGMA_BLUE,
     color: '#fff',
     font: 'bold 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
     padding: '1px 6px',
@@ -2808,7 +2997,7 @@ function ensurePadUi() {
     if (!padDrag) hidePadBand()
   })
   padBadge = makeUiNode('', {
-    background: '#3b82f6',
+    background: FIGMA_BLUE,
     color: '#fff',
     font: 'bold 10px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
     padding: '1px 5px',
@@ -3707,6 +3896,33 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     case 'PTR_CREATE_AUTOLAYOUT':
       sendResponse(createAutoLayout(msg.elementIds))
+      break
+    case 'PTR_KEY': {
+      // A key press forwarded from the panel. Same dispatcher as the page's
+      // own keydown, so every shortcut works from the Layers tab too.
+      const ev: KeyLike = { ...msg.event, preventDefault() {} }
+      const ok = active && handleShortcut(ev)
+      if (ok) showKeyHint(ev)
+      sendResponse({ ok })
+      break
+    }
+    case 'PTR_UNWRAP':
+      sendResponse({ ok: notifyUnwrapped(msg.elementId) })
+      break
+    case 'PTR_RESTORE_UNWRAP':
+      sendResponse({ ok: restoreUnwrapped(msg.elementId) })
+      break
+    case 'PTR_REMOVE_AUTOLAYOUT':
+      sendResponse({ ok: removeAutoLayout(msg.elementId) })
+      break
+    case 'PTR_PASTE_LAYER': {
+      const r = pasteLayer()
+      sendResponse(r)
+      break
+    }
+    case 'PTR_COPY_LAYER':
+      copyLayer()
+      sendResponse({ ok: !!layerClipboard })
       break
     case 'PTR_UNGROUP':
       sendResponse({ ok: ungroup(msg.elementId) })

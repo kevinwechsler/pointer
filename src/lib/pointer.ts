@@ -51,7 +51,7 @@ export type SelectionPayload = {
 export type Edit = {
   id: string
   target: SelectionPayload
-  kind: 'style' | 'text' | 'move' | 'insert' | 'remove' | 'group'
+  kind: 'style' | 'text' | 'move' | 'insert' | 'remove' | 'group' | 'unwrap'
   prop: string
   from: string
   to: string
@@ -163,6 +163,10 @@ export function generatePrompt(edits: Edit[], tokenEdits: TokenEdit[] = []): str
     lines.push(`${i + 1}. Element: ${describeTarget(t)} — ${loc}`)
     if (e.kind === 'remove') {
       lines.push('   Remove this element.')
+    } else if (e.kind === 'unwrap') {
+      lines.push(
+        '   Remove this wrapper element but keep everything inside it: its children should end up in its place, in the same order, as direct children of its former parent.'
+      )
     } else if (e.kind === 'text') {
       lines.push(`   Change the text from "${e.from}" to "${e.to}".`)
     } else if (e.kind === 'move' && e.prop === 'parent') {
