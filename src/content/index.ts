@@ -433,6 +433,7 @@ function buildPayload(el: Element): SelectionPayload {
     index: el.parentElement ? Array.from(el.parentElement.children).indexOf(el) : 0,
     siblingCount: el.parentElement ? el.parentElement.children.length : 1,
     isNew: el.hasAttribute('data-pointer-new'),
+    childCount: el.children.length,
     tag: el.tagName.toLowerCase(),
     id: el.id || '',
     classes: Array.from(el.classList),
@@ -731,7 +732,7 @@ function createAutoLayout(ids: number[]): {
   const els = Array.from(new Set(ids))
     .map((id) => getEl(id))
     .filter((el): el is HTMLElement => !!el)
-  if (els.length < 2) return { ok: false, reason: 'too-few' }
+  if (els.length < 1) return { ok: false, reason: 'too-few' }
   const parent = els[0].parentElement
   if (!parent || els.some((el) => el.parentElement !== parent)) {
     return { ok: false, reason: 'different-parent' }
@@ -778,25 +779,47 @@ function createAutoLayout(ids: number[]): {
  * point at each other as their recorded "next sibling", so the later one
  * has to land back first, or the earlier one's anchor won't exist yet.
  */
+/** What ungroup took apart, so redo can rebuild it with the *same* wrapper —
+ * any later edit recorded against the wrapper's id keeps pointing at a node
+ * that exists, instead of at one that was thrown away and replaced. */
+const groupRecords = new Map<number, { wrapper: Element; childIds: number[] }>()
+
 function ungroup(wrapperId: number): boolean {
   const wrapper = getEl(wrapperId)
   if (!wrapper) return false
   const children = Array.from(wrapper.children)
+  const childIds = children.map((c) => registerEl(c))
   for (let i = children.length - 1; i >= 0; i--) {
-    const child = children[i]
-    const cid = registerEl(child)
-    if (!resetMove(cid)) {
+    if (!resetMove(childIds[i])) {
       // No recorded original spot (e.g. added after grouping) — drop it
       // next to the wrapper rather than losing it.
-      wrapper.parentElement?.insertBefore(child, wrapper)
+      wrapper.parentElement?.insertBefore(children[i], wrapper)
     }
   }
   wrapper.remove()
-  insertedEls.delete(wrapperId)
+  groupRecords.set(wrapperId, { wrapper, childIds })
   if (selectedEl === wrapper) {
     selectedEl = null
     hideBox(selectBox)
   }
+  schedulePinUpdate()
+  broadcastMultiSelection()
+  return true
+}
+
+function regroup(wrapperId: number): boolean {
+  const rec = groupRecords.get(wrapperId)
+  if (!rec) return false
+  const kids = rec.childIds.map((id) => getEl(id)).filter((el): el is HTMLElement => !!el)
+  const parent = kids[0]?.parentElement
+  if (!parent) return false
+  parent.insertBefore(rec.wrapper, kids[0])
+  for (const kid of kids) {
+    const cid = registerEl(kid)
+    if (!movePristine.has(cid)) movePristine.set(cid, { parent: kid.parentElement!, nextSibling: kid.nextSibling })
+    rec.wrapper.appendChild(kid)
+  }
+  groupRecords.delete(wrapperId)
   schedulePinUpdate()
   return true
 }
@@ -1163,8 +1186,21 @@ function deleteElement(id: number): { ok: boolean; desc?: string; inserted?: boo
   // Elements Pointer itself added are simply dropped — there's nothing in
   // the real page to restore.
   if (insertedEls.has(id)) {
-    const desc = shortDescriptor(insertedEls.get(id)!)
-    return { ok: removeInserted(id), desc, inserted: true }
+    // Detached rather than destroyed, like any other delete, so undo can put
+    // it back. It stays registered as Pointer-made either way.
+    const el = insertedEls.get(id)!
+    if (!el.parentElement) return { ok: false }
+    const desc = shortDescriptor(el)
+    deletedEls.set(id, { el, parent: el.parentElement, nextSibling: el.nextSibling })
+    el.remove()
+    if (selectedEl === el) {
+      selectedEl = null
+      hideBox(selectBox)
+    }
+    if (extraSelectedIds.delete(id)) drawExtraBoxes()
+    broadcastMultiSelection()
+    schedulePinUpdate()
+    return { ok: true, desc, inserted: true }
   }
   const el = getEl(id)
   if (!el?.parentElement) return { ok: false }
@@ -2103,11 +2139,22 @@ const KEY_SYMBOLS: Record<string, string> = {
  * had focus, and focus lands in the panel the moment you click a layer. */
 type KeyLike = {
   key: string
+  /** Physical key ("KeyA"). Letter shortcuts must match on this: on a Mac,
+   * holding Option changes the *character* — Option+A types "å", Option+H
+   * "˙" — so matching `key` made every Option shortcut silently dead. */
+  code?: string
   metaKey: boolean
   ctrlKey: boolean
   shiftKey: boolean
   altKey: boolean
   preventDefault(): void
+}
+
+/** The letter a shortcut is bound to, regardless of what character the
+ * modifiers turned it into. */
+function letterOf(e: KeyLike): string {
+  if (e.code?.startsWith('Key')) return e.code.slice(3).toLowerCase()
+  return e.key.toLowerCase()
 }
 
 function keyHintFor(e: KeyLike): string[] {
@@ -2116,7 +2163,9 @@ function keyHintFor(e: KeyLike): string[] {
   if (e.altKey) parts.push(IS_MAC ? '⌥' : 'Alt')
   if (e.shiftKey) parts.push(IS_MAC ? '⇧' : 'Shift')
   if (e.metaKey) parts.push(IS_MAC ? '⌘' : 'Win')
-  const key = KEY_SYMBOLS[e.key] ?? (e.key.length === 1 ? e.key.toUpperCase() : e.key)
+  const key =
+    KEY_SYMBOLS[e.key] ??
+    (e.code?.startsWith('Key') ? e.code.slice(3) : e.key.length === 1 ? e.key.toUpperCase() : e.key)
   parts.push(key)
   return parts
 }
@@ -2219,14 +2268,14 @@ function handleShortcut(e: KeyLike): boolean {
   // --- history ---
   // Held by the panel (it's what the Undo/Redo buttons drive), so these just
   // ask it to act.
-  if (e.key.toLowerCase() === 'z' && mod) {
+  if (letterOf(e) === 'z' && mod) {
     e.preventDefault()
     chrome.runtime.sendMessage({ type: e.shiftKey ? 'PTR_REQUEST_REDO' : 'PTR_REQUEST_UNDO' })
     return true
   }
 
   // --- auto layout (Figma: Shift+A) ---
-  if (e.key.toLowerCase() === 'a' && e.shiftKey && !mod && !e.altKey) {
+  if (letterOf(e) === 'a' && e.shiftKey && !mod && !e.altKey) {
     e.preventDefault()
     chrome.runtime.sendMessage({ type: 'PTR_REQUEST_AUTOLAYOUT' })
     return true
@@ -2282,17 +2331,17 @@ function handleShortcut(e: KeyLike): boolean {
   }
 
   // --- layer clipboard (Figma: Cmd+C / Cmd+X / Cmd+V) ---
-  if (e.key.toLowerCase() === 'c' && mod && !e.altKey && !e.shiftKey && selectedEl) {
+  if (letterOf(e) === 'c' && mod && !e.altKey && !e.shiftKey && selectedEl) {
     e.preventDefault()
     copyLayer()
     return true
   }
-  if (e.key.toLowerCase() === 'x' && mod && !e.altKey && selectedEl) {
+  if (letterOf(e) === 'x' && mod && !e.altKey && selectedEl) {
     e.preventDefault()
     copyLayer()
     return notifyDeleted(registerEl(selectedEl))
   }
-  if (e.key.toLowerCase() === 'v' && mod && !e.altKey && !e.shiftKey && layerClipboard) {
+  if (letterOf(e) === 'v' && mod && !e.altKey && !e.shiftKey && layerClipboard) {
     e.preventDefault()
     const r = pasteLayer()
     if (!r.ok) return false
@@ -2308,24 +2357,24 @@ function handleShortcut(e: KeyLike): boolean {
     e.preventDefault()
     return notifyUnwrapped(registerEl(selectedEl))
   }
-  if (e.key.toLowerCase() === 'a' && e.shiftKey && e.altKey && !mod && selectedEl) {
+  if (letterOf(e) === 'a' && e.shiftKey && e.altKey && !mod && selectedEl) {
     e.preventDefault()
     return removeAutoLayout(registerEl(selectedEl))
   }
 
   // --- copy/paste properties (Figma: Cmd+Opt+C / Cmd+Opt+V) ---
-  if (e.key.toLowerCase() === 'c' && mod && e.altKey && selectedEl) {
+  if (letterOf(e) === 'c' && mod && e.altKey && selectedEl) {
     e.preventDefault()
     copyStyleFromSelected()
     return true
   }
-  if (e.key.toLowerCase() === 'v' && mod && e.altKey && hoverEl) {
+  if (letterOf(e) === 'v' && mod && e.altKey && hoverEl) {
     e.preventDefault()
     pasteStyleToHovered()
     return true
   }
 
-  if (e.key.toLowerCase() === 'h' && e.altKey && !mod) {
+  if (letterOf(e) === 'h' && e.altKey && !mod) {
     e.preventDefault()
     toggleHighlightSiblings()
     return true
@@ -2336,7 +2385,7 @@ function handleShortcut(e: KeyLike): boolean {
     return notifyDeleted(registerEl(selectedEl))
   }
 
-  if (e.key.toLowerCase() === 'd' && mod && selectedEl) {
+  if (letterOf(e) === 'd' && mod && selectedEl) {
     e.preventDefault()
     const r = duplicateElement(registerEl(selectedEl))
     if (!r.ok) return false
@@ -3907,7 +3956,12 @@ chrome.runtime.onMessage.addListener((msg: any, _sender: any, sendResponse: any)
       break
     }
     case 'PTR_UNWRAP':
-      sendResponse({ ok: notifyUnwrapped(msg.elementId) })
+      // `silent` is undo/redo replaying it: the panel already has the history
+      // entry, and a notification would record it a second time.
+      sendResponse({ ok: msg.silent ? unwrapElement(msg.elementId).ok : notifyUnwrapped(msg.elementId) })
+      break
+    case 'PTR_REGROUP':
+      sendResponse({ ok: regroup(msg.elementId) })
       break
     case 'PTR_RESTORE_UNWRAP':
       sendResponse({ ok: restoreUnwrapped(msg.elementId) })

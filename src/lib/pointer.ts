@@ -46,6 +46,9 @@ export type SelectionPayload = {
   siblingCount: number
   /** True for elements Pointer created (insert or duplicate). */
   isNew: boolean
+  /** Direct element children — decides whether Shift+A turns this element
+   * into an auto layout or wraps it in one. */
+  childCount: number
 }
 
 export type Edit = {

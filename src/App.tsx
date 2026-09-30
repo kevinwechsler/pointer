@@ -1480,14 +1480,31 @@ function groupTokens(tokens: Token[]): { title: string; items: Token[] }[] {
 }
 
 // One history entry per user action, so it can be undone/redone on the page.
-type HistoryOp = {
+type ValueOp = {
   frameToken: string
   elementId: number
   kind: 'style' | 'text' | 'move'
   prop: string // css prop (camelCase), 'text', or 'order'
   from: string
   to: string
+  /** Filled in by pushHistory: the value before Pointer ever touched this
+   * prop, and the element's payload — together they let undo/redo rebuild
+   * the Changes-tab entry, not just edit one that happens to still exist. */
+  origin?: string
+  target?: SelectionPayload | null
+  detail?: string
 }
+
+/** Adding, deleting, grouping and unframing change the tree itself, so they
+ * can't be replayed as "set this value" — each records how to undo and redo
+ * itself instead. Without this, undo silently skipped over them. */
+type StructOp = {
+  kind: 'structure'
+  undo: () => Promise<void>
+  redo: () => Promise<void>
+}
+
+type HistoryOp = ValueOp | StructOp
 
 export default function App() {
   const [active, setActive] = useState(false)
@@ -1517,6 +1534,15 @@ export default function App() {
   // Last frame the user interacted with; frame-scoped requests that aren't
   // tied to a specific element (tokens, comments) go to this frame.
   const lastFrameRef = useRef<string | null>(null)
+  // Current values for code that runs later than the render it was created
+  // in (async undo/redo, history bookkeeping).
+  const selectionRef = useRef<SelectionPayload | null>(null)
+  const editsRef = useRef<Edit[]>([])
+  // Undo/redo run one at a time, in order. Holding Cmd+Z fires repeats
+  // faster than the page answers; unqueued, two presses read the same index
+  // and applied the same step twice.
+  const historyQueue = useRef<Promise<void>>(Promise.resolve())
+  const replayingRef = useRef(false)
   const activeTabRef = useRef('element')
   const loadTreeRef = useRef<(revealId?: number) => Promise<void>>(async () => {})
 
@@ -1598,11 +1624,14 @@ export default function App() {
       // A dialog or menu owns its own Escape/Enter/arrows.
       if (document.querySelector('[data-state="open"][role="dialog"], [data-state="open"][role="menu"]')) return
       const mod = e.metaKey || e.ctrlKey
+      // By physical key: Option changes the character on a Mac (Option+A
+      // types "å"), which is why Shift+Option+A never matched.
+      const letter = e.code.startsWith('Key') ? e.code.slice(3).toLowerCase() : e.key.toLowerCase()
       const isShortcut =
-        mod || e.altKey || PLAIN_SHORTCUT_KEYS.has(e.key) || (e.shiftKey && e.key.toLowerCase() === 'a')
+        mod || e.altKey || PLAIN_SHORTCUT_KEYS.has(e.key) || (e.shiftKey && letter === 'a')
       if (!isShortcut) return
       e.preventDefault()
-      if (mod && e.key.toLowerCase() === 'z') {
+      if (mod && letter === 'z') {
         if (e.shiftKey) redo()
         else undo()
         return
@@ -1610,12 +1639,12 @@ export default function App() {
       sendToPage({
         type: 'PTR_KEY',
         frameToken: lastFrameRef.current ?? undefined,
-        event: { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey },
+        event: { key: e.key, code: e.code, metaKey: e.metaKey, ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey },
       }).catch(() => {})
     }
     window.addEventListener('keydown', onKeyDown, true)
     return () => window.removeEventListener('keydown', onKeyDown, true)
-  }, [])
+  })
 
   useEffect(() => {
     const listener = (msg: any) => {
@@ -1639,31 +1668,15 @@ export default function App() {
       }
       if (msg.type === 'PTR_DELETED') {
         const { elementId, target, inserted } = msg.payload
-        if (inserted) {
-          // It was an element Pointer added; drop its insert edit instead of
-          // recording a deletion the codebase knows nothing about.
-          setEdits((prev) => prev.filter((e) => e.target.elementId !== elementId))
-        } else {
-          upsertEdit(target, 'remove', 'element', 'present', 'removed')
-        }
-        setSelection(null)
-        refreshTreeIfShown()
+        recordDeleted(target.frameToken, elementId, target, !!inserted)
       }
       if (msg.type === 'PTR_UNWRAPPED') {
         const { elementId, target, pointerMade } = msg.payload
-        if (pointerMade) {
-          // Undoing a wrapper Pointer created is just dropping that edit.
-          setEdits((prev) => prev.filter((e) => e.target.elementId !== elementId))
-        } else if (target) {
-          upsertEdit(target, 'unwrap', 'element', 'present', 'unwrapped')
-        }
-        setSelection(null)
-        refreshTreeIfShown()
+        recordUnwrapped(lastFrameRef.current ?? '', elementId, target, !!pointerMade)
       }
       if (msg.type === 'PTR_DUPLICATED') {
         const { payload, html, parentDesc } = msg.payload
-        if (payload) upsertEdit(payload, 'insert', 'element', '', html, parentDesc)
-        refreshTreeIfShown()
+        if (payload) recordInserted(payload, html, parentDesc)
       }
       if (msg.type === 'PTR_MOVED') {
         const { elementId, target, from, to, parentDesc } = msg.payload
@@ -1728,11 +1741,11 @@ export default function App() {
       // own, so it just asks the panel to do what the Undo/Redo buttons do.
       if (msg.type === 'PTR_REQUEST_UNDO') undo()
       if (msg.type === 'PTR_REQUEST_REDO') redo()
-      if (msg.type === 'PTR_REQUEST_AUTOLAYOUT') createAutoLayoutFromSelection()
+      if (msg.type === 'PTR_REQUEST_AUTOLAYOUT') addAutoLayout()
     }
     chrome.runtime.onMessage.addListener(listener)
     return () => chrome.runtime.onMessage.removeListener(listener)
-  }, [])
+  })
 
   async function loadCommentsAndTokens() {
     try {
@@ -1764,6 +1777,8 @@ export default function App() {
   }
   activeTabRef.current = activeTab
   loadTreeRef.current = loadTree
+  selectionRef.current = selection
+  editsRef.current = edits
 
   async function loadTree(revealId?: number) {
     try {
@@ -1783,14 +1798,25 @@ export default function App() {
     }
   }
 
+  // Clicking a tab nudges it toward the middle — that shift is what tells you
+  // more tabs are hidden past it. Done with explicit maths on the strip
+  // itself: scrollIntoView also scrolls every ancestor, and on first render
+  // it ran while the side panel was still animating open, so it centred the
+  // first tab in a strip a few pixels wide and left it clipped ("ement").
+  const tabsMounted = useRef(false)
   useEffect(() => {
-    // 'center' (not 'nearest') so clicking a tab near either edge nudges it
-    // toward the middle — that shift is what tells you there are more tabs
-    // hidden off to its side, since a tab flush against the edge looks the
-    // same whether or not anything's hidden past it.
-    tabsListRef.current
-      ?.querySelector<HTMLElement>('[data-state="active"]')
-      ?.scrollIntoView({ block: 'nearest', inline: 'center' })
+    if (!tabsMounted.current) {
+      tabsMounted.current = true
+      return
+    }
+    const list = tabsListRef.current
+    const tab = list?.querySelector<HTMLElement>('[data-state="active"]')
+    if (!list || !tab) return
+    const lr = list.getBoundingClientRect()
+    const tr = tab.getBoundingClientRect()
+    const target = list.scrollLeft + (tr.left - lr.left) - (lr.width - tr.width) / 2
+    const max = list.scrollWidth - list.clientWidth
+    list.scrollTo({ left: Math.max(0, Math.min(max, target)), behavior: 'smooth' })
   }, [activeTab])
 
   // Keep the selected layer revealed as selection changes on the page.
@@ -1816,9 +1842,167 @@ export default function App() {
   }
 
   function pushHistory(op: HistoryOp) {
+    // Replaying history must never write history: a push here would cut off
+    // the redo steps still ahead of the one being replayed.
+    if (replayingRef.current) return
+    if (op.kind !== 'structure') {
+      const v = op
+      const existing = editsRef.current.find(
+        (e) => e.target.elementId === v.elementId && e.prop === v.prop
+      )
+      const sel = selectionRef.current
+      op = {
+        ...v,
+        // The first change's "from" *is* the untouched value; after that,
+        // the Changes entry already remembers it.
+        origin: existing ? existing.from : v.from,
+        target: v.target ?? existing?.target ?? (sel?.elementId === v.elementId ? sel : null),
+        detail: v.detail ?? existing?.detail,
+      }
+    }
     historyRef.current = historyRef.current.slice(0, historyIndexRef.current)
     historyRef.current.push(op)
     setHistoryIndexBoth(historyRef.current.length)
+  }
+
+  // ---------- structural history ----------
+  function makeEdit(
+    target: SelectionPayload,
+    kind: Edit['kind'],
+    prop: string,
+    from: string,
+    to: string,
+    detail?: string
+  ): Edit {
+    return { id: crypto.randomUUID(), target, kind, prop, from, to, detail }
+  }
+  function addEdit(edit: Edit) {
+    setEdits((prev) => [...prev.filter((e) => e.id !== edit.id), edit])
+  }
+  function dropEdit(edit: Edit | undefined) {
+    if (edit) setEdits((prev) => prev.filter((e) => e.id !== edit.id))
+  }
+  function reselect(frameToken: string, elementId: number) {
+    sendToPage({ type: 'PTR_RESELECT_ID', frameToken, elementId }).catch(() => {})
+  }
+
+  /** Something was added to the page (insert, duplicate, paste). */
+  function recordInserted(payload: SelectionPayload, html: string, parentDesc: string) {
+    const { frameToken, elementId } = payload
+    const edit = makeEdit(payload, 'insert', 'element', '', html, parentDesc)
+    addEdit(edit)
+    pushHistory({
+      kind: 'structure',
+      undo: async () => {
+        await sendToPage({ type: 'PTR_DELETE_ELEMENT', frameToken, elementId })
+        dropEdit(edit)
+        setSelection(null)
+      },
+      redo: async () => {
+        await sendToPage({ type: 'PTR_RESTORE_ELEMENT', frameToken, elementId })
+        addEdit(edit)
+        reselect(frameToken, elementId)
+      },
+    })
+    refreshTreeIfShown()
+  }
+
+  /** Something was deleted. A Pointer-made element takes its "added" entry
+   * with it (the codebase never knew about it); a real one gets a "removed"
+   * entry. Either way the node was only detached, so undo can restore it. */
+  function recordDeleted(frameToken: string, elementId: number, target: SelectionPayload, inserted: boolean) {
+    const insertEdit = inserted
+      ? editsRef.current.find((e) => e.target.elementId === elementId && e.kind === 'insert')
+      : undefined
+    const removeEdit = inserted ? undefined : makeEdit(target, 'remove', 'element', 'present', 'removed')
+    const apply = () => {
+      if (insertEdit) dropEdit(insertEdit)
+      if (removeEdit) addEdit(removeEdit)
+    }
+    apply()
+    setSelection(null)
+    pushHistory({
+      kind: 'structure',
+      undo: async () => {
+        await sendToPage({ type: 'PTR_RESTORE_ELEMENT', frameToken, elementId })
+        if (insertEdit) addEdit(insertEdit)
+        dropEdit(removeEdit)
+        reselect(frameToken, elementId)
+      },
+      redo: async () => {
+        await sendToPage({ type: 'PTR_DELETE_ELEMENT', frameToken, elementId })
+        apply()
+        setSelection(null)
+      },
+    })
+    refreshTreeIfShown()
+  }
+
+  /** A wrapper was removed with its contents kept. Unframing a wrapper
+   * Pointer itself made is the same as undoing that grouping. */
+  function recordUnwrapped(
+    frameToken: string,
+    elementId: number,
+    target: SelectionPayload | undefined,
+    pointerMade: boolean
+  ) {
+    setSelection(null)
+    if (pointerMade) {
+      const groupEdit = editsRef.current.find((e) => e.target.elementId === elementId && e.kind === 'group')
+      dropEdit(groupEdit)
+      pushHistory({
+        kind: 'structure',
+        undo: async () => {
+          await sendToPage({ type: 'PTR_REGROUP', frameToken, elementId })
+          if (groupEdit) addEdit(groupEdit)
+          reselect(frameToken, elementId)
+        },
+        redo: async () => {
+          await sendToPage({ type: 'PTR_UNGROUP', frameToken, elementId })
+          dropEdit(groupEdit)
+          setSelection(null)
+        },
+      })
+    } else if (target) {
+      const edit = makeEdit(target, 'unwrap', 'element', 'present', 'unwrapped')
+      addEdit(edit)
+      pushHistory({
+        kind: 'structure',
+        undo: async () => {
+          await sendToPage({ type: 'PTR_RESTORE_UNWRAP', frameToken, elementId })
+          dropEdit(edit)
+          reselect(frameToken, elementId)
+        },
+        redo: async () => {
+          await sendToPage({ type: 'PTR_UNWRAP', frameToken, elementId, silent: true })
+          addEdit(edit)
+          setSelection(null)
+        },
+      })
+    }
+    refreshTreeIfShown()
+  }
+
+  /** Layers were wrapped in a new auto layout. Redo rebuilds it with the same
+   * wrapper node, so anything recorded against it later still applies. */
+  function recordGrouped(payload: SelectionPayload, html: string, parentDesc: string, childDescs: string) {
+    const { frameToken, elementId } = payload
+    const edit = makeEdit(payload, 'group', 'children', childDescs, html, parentDesc)
+    addEdit(edit)
+    pushHistory({
+      kind: 'structure',
+      undo: async () => {
+        await sendToPage({ type: 'PTR_UNGROUP', frameToken, elementId })
+        dropEdit(edit)
+        setSelection(null)
+      },
+      redo: async () => {
+        await sendToPage({ type: 'PTR_REGROUP', frameToken, elementId })
+        addEdit(edit)
+        reselect(frameToken, elementId)
+      },
+    })
+    refreshTreeIfShown()
   }
 
   function upsertEdit(
@@ -2182,12 +2366,7 @@ export default function App() {
         elementId: selection.elementId,
       })
       if (!r?.ok) return
-      if (r.inserted) {
-        setEdits((prev) => prev.filter((e) => e.target.elementId !== selection.elementId))
-      } else {
-        upsertEdit(selection, 'remove', 'element', 'present', 'removed')
-      }
-      setSelection(null)
+      recordDeleted(selection.frameToken, selection.elementId, selection, !!r.inserted)
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -2211,7 +2390,7 @@ export default function App() {
         frameToken: selection.frameToken,
         elementId: selection.elementId,
       })
-      if (r?.ok && r.payload) upsertEdit(r.payload, 'insert', 'element', '', r.html, r.parentDesc)
+      if (r?.ok && r.payload) recordInserted(r.payload, r.html, r.parentDesc)
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -2221,13 +2400,32 @@ export default function App() {
    * element in a new flex container. Requires them to already share a
    * parent — the page rejects it otherwise rather than guessing which
    * parent's coordinate space should win. */
-  async function createAutoLayoutFromSelection() {
-    if (multiSelection.length < 2) return
+  /**
+   * Figma's Shift+A. Several layers: wrap them in a new auto layout. One
+   * container that isn't one yet: turn it into one (its children already
+   * stack in block flow, so vertical). Anything else — a leaf, or something
+   * that's already an auto layout — gets wrapped on its own.
+   */
+  async function addAutoLayout() {
+    const sel = selectionRef.current
+    if (multiSelection.length >= 2) return createAutoLayoutFromSelection()
+    if (!sel) return
+    const display = draft.display ?? sel.styles.display ?? ''
+    const isLayout = display.includes('flex') || display.includes('grid')
+    if (sel.childCount > 0 && !isLayout) {
+      applyFlow('vertical', applyStyle, draft)
+      return
+    }
+    return createAutoLayoutFromSelection([{ elementId: sel.elementId, descriptor: `<${sel.tag}>` }])
+  }
+
+  async function createAutoLayoutFromSelection(items = multiSelection) {
+    if (items.length < 1) return
     try {
       const r = await sendToPage({
         type: 'PTR_CREATE_AUTOLAYOUT',
         frameToken: lastFrameRef.current ?? undefined,
-        elementIds: multiSelection.map((m) => m.elementId),
+        elementIds: items.map((m) => m.elementId),
       })
       if (!r?.ok || !r.payload) {
         setError(
@@ -2237,14 +2435,7 @@ export default function App() {
         )
         return
       }
-      upsertEdit(
-        r.payload,
-        'group',
-        'children',
-        multiSelection.map((m) => m.descriptor).join(', '),
-        r.html,
-        r.parentDesc
-      )
+      recordGrouped(r.payload, r.html, r.parentDesc, items.map((m) => m.descriptor).join(', '))
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
     }
@@ -2263,7 +2454,7 @@ export default function App() {
       // Inserts are tracked as their own edit kind and reverted from the
       // Changes tab; they deliberately stay out of undo/redo, which would
       // otherwise need to resurrect a destroyed node.
-      upsertEdit(r.payload, 'insert', 'element', '', r.html, r.parentDesc)
+      recordInserted(r.payload, r.html, r.parentDesc)
       setActiveTab('element')
     } catch {
       setError('Could not reach the page. Reload the localhost tab and try again.')
@@ -2302,7 +2493,7 @@ export default function App() {
   }
 
   // Apply one history op in a given direction and sync panel state.
-  async function applyOp(op: HistoryOp, value: string) {
+  async function applyOp(op: ValueOp, value: string) {
     try {
       if (op.kind === 'move' && op.prop === 'parent') {
         // A Layers-tab drag may have crossed into another parent, so this
@@ -2335,45 +2526,59 @@ export default function App() {
         await sendToPage({ type: 'PTR_SET_TEXT', frameToken: op.frameToken, elementId: op.elementId, value })
         if (selection?.elementId === op.elementId) setText(value)
       } else {
-        await sendToPage({
+        const r = await sendToPage({
           type: 'PTR_APPLY_STYLE',
           frameToken: op.frameToken,
           elementId: op.elementId,
           prop: toKebab(op.prop),
           value,
         })
-        if (selection?.elementId === op.elementId)
+        if (selection?.elementId === op.elementId) {
           setDraft((d) => ({ ...d, [op.prop]: value }))
+          syncLiveState(op.elementId, r)
+        }
       }
     } catch {
       return
     }
+    // Rebuild the entry rather than only editing one that still exists:
+    // undoing back to the original removes it, and redo used to find
+    // nothing to update — the change was back on the page but gone from
+    // Changes and from the prompt.
     setEdits((prev) => {
-      const existing = prev.find(
-        (e) => e.target.elementId === op.elementId && e.prop === op.prop
-      )
-      if (existing) {
-        if (existing.from === value) return prev.filter((e) => e !== existing)
-        return prev.map((e) => (e === existing ? { ...e, to: value } : e))
-      }
-      return prev
+      const existing = prev.find((e) => e.target.elementId === op.elementId && e.prop === op.prop)
+      const rest = prev.filter((e) => e !== existing)
+      const origin = op.origin ?? existing?.from
+      if (origin !== undefined && value === origin) return rest
+      if (existing) return [...rest, { ...existing, to: value }]
+      if (!op.target || origin === undefined) return prev
+      return [...rest, makeEdit(op.target, op.kind, op.prop, origin, value, op.detail)]
     })
   }
 
-  async function undo() {
-    const i = historyIndexRef.current
-    if (i === 0) return
-    const op = historyRef.current[i - 1]
-    await applyOp(op, op.from)
-    setHistoryIndexBoth(i - 1)
+  function runHistory(step: -1 | 1) {
+    historyQueue.current = historyQueue.current
+      .then(async () => {
+        const i = historyIndexRef.current
+        const op = step < 0 ? historyRef.current[i - 1] : historyRef.current[i]
+        if (!op) return
+        // Move the index first, so nothing queued behind this reads it stale.
+        setHistoryIndexBoth(i + step)
+        replayingRef.current = true
+        try {
+          if (op.kind === 'structure') await (step < 0 ? op.undo() : op.redo())
+          else await applyOp(op, step < 0 ? op.from : op.to)
+        } finally {
+          replayingRef.current = false
+        }
+      })
+      .catch(() => {})
   }
-
-  async function redo() {
-    const i = historyIndexRef.current
-    if (i >= historyRef.current.length) return
-    const op = historyRef.current[i]
-    await applyOp(op, op.to)
-    setHistoryIndexBoth(i + 1)
+  function undo() {
+    runHistory(-1)
+  }
+  function redo() {
+    runHistory(1)
   }
 
   async function clearAll() {
@@ -2838,7 +3043,7 @@ export default function App() {
                   </p>
                 ))}
               </div>
-              <Button size="sm" className="w-full" onClick={createAutoLayoutFromSelection}>
+              <Button size="sm" className="w-full" onClick={() => createAutoLayoutFromSelection()}>
                 <Group className="size-3.5" />
                 Create auto layout
               </Button>
@@ -2857,8 +3062,12 @@ export default function App() {
             <div className="divide-y">
               {/* Identity + actions */}
               <div className="space-y-3 p-4">
+                {/* Figma's layer header: identity on the left, the layer's own
+                    icon actions on the right. Then the two labelled actions on
+                    a row of their own, split evenly — five buttons in one row
+                    ran off the edge at the panel's minimum width. */}
                 <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
+                  <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">
                       {selection.componentChain[0] ?? `<${selection.tag}>`}
                     </p>
@@ -2870,19 +3079,42 @@ export default function App() {
                           : selection.selector}
                     </p>
                   </div>
-                  {selection.isNew && (
-                    <Badge variant="secondary" className="shrink-0">
-                      New
-                    </Badge>
-                  )}
+                  <div className="flex shrink-0 items-center gap-0.5">
+                    {selection.isNew && (
+                      <Badge variant="secondary" className="mr-1">
+                        New
+                      </Badge>
+                    )}
+                    <Button size="icon" variant="ghost" className="size-7" onClick={duplicateSelected} title="Duplicate (Cmd + D)">
+                      <CopyPlus className="size-3.5" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-7"
+                      onClick={unwrapSelected}
+                      title="Unframe — remove this element but keep its contents (Cmd + Delete)"
+                    >
+                      <Ungroup className="size-3.5" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-7 text-destructive hover:text-destructive"
+                      onClick={deleteSelected}
+                      title="Delete (Delete)"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  </div>
                 </div>
 
-                <div className="flex gap-1">
+                <div className="grid grid-cols-2 gap-1.5">
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <Button size="sm" variant="outline">
+                      <Button size="sm" variant="outline" className="min-w-0">
                         <Plus className="size-3.5" />
-                        Insert
+                        <span className="truncate">Insert</span>
                         <ChevronDown className="size-3.5 text-muted-foreground" />
                       </Button>
                     </DropdownMenuTrigger>
@@ -2904,37 +3136,14 @@ export default function App() {
                       ))}
                     </DropdownMenuContent>
                   </DropdownMenu>
-                  {/* The main reason to select something at all, so it gets
-                      the primary/filled treatment — Duplicate and Delete
-                      are secondary, outline-only actions next to it. */}
                   <Button
                     size="sm"
-                    className="flex-1"
+                    className="min-w-0"
                     onClick={copyForFigma}
                     title="Copy for the Pointer Figma plugin (see figma-plugin/ in the repo)"
                   >
                     {figmaCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-                    {figmaCopied ? 'Copied' : 'Copy for Figma'}
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={duplicateSelected} title="Duplicate">
-                    <CopyPlus className="size-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={unwrapSelected}
-                    title="Unframe — remove this element but keep its contents (Cmd + Delete)"
-                  >
-                    <Ungroup className="size-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="text-destructive hover:text-destructive"
-                    onClick={deleteSelected}
-                    title="Delete"
-                  >
-                    <Trash2 className="size-3.5" />
+                    <span className="truncate">{figmaCopied ? 'Copied' : 'Copy for Figma'}</span>
                   </Button>
                 </div>
               </div>
@@ -3880,7 +4089,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: 'Cmd + ]', desc: 'Move the selected element one step later among its siblings' },
       { keys: '[', desc: 'Move it to the very start among its siblings' },
       { keys: ']', desc: 'Move it to the very end among its siblings' },
-      { keys: 'Shift + A', desc: 'Wrap the selected elements in a new auto layout' },
+      { keys: 'Shift + A', desc: 'Add auto layout: wraps the selected layers, or turns a selected container into one' },
       { keys: 'Cmd + Z', desc: 'Undo — same as the Undo button' },
       { keys: 'Cmd + Shift + Z', desc: 'Redo — same as the Redo button' },
       { keys: 'Drag', desc: 'Drag the selected element to move it freely' },
