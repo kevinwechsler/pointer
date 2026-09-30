@@ -1199,6 +1199,8 @@ function ColorRow({
   binding = '',
   resolved,
   onOpen,
+  hidden,
+  onToggleHidden,
 }: {
   value: string
   edited: boolean
@@ -1215,6 +1217,12 @@ function ColorRow({
    * resolve on its own. */
   resolved?: string
   onOpen?: () => void
+  /** Figma's hidden paint: the row stays, dimmed, and remembers its color —
+   * `value` is then the remembered color, not what's on the page. Hiding
+   * used to just write "transparent", which made the section treat the
+   * paint as gone and drop the row, eye button included. */
+  hidden?: boolean
+  onToggleHidden?: () => void
 }) {
   const paint = resolved ?? value
   const parsed = parseColor(paint)
@@ -1224,7 +1232,7 @@ function ColorRow({
   // a newly added fill is this light gray, and it can't be mistaken for a
   // real value.
   const lastVisible = useRef<string>('#d9d9d9')
-  const visible = binding ? true : !parsed.transparent
+  const visible = hidden !== undefined ? !hidden : binding ? true : !parsed.transparent
   if (binding) lastVisible.current = `var(${binding})`
   else if (!parsed.transparent && !parsed.unknown) lastVisible.current = value
   const [open, setOpen] = useState(false)
@@ -1235,6 +1243,8 @@ function ColorRow({
     onOpen?.()
   }
 
+  // A hidden paint still shows what it *would* paint, dimmed, like Figma.
+  const shown = hidden ? true : visible
   return (
     <div
       className={
@@ -1242,6 +1252,7 @@ function ColorRow({
         (edited ? ' border-primary bg-primary/5' : '')
       }
     >
+      <div className={'flex min-w-0 flex-1 items-center gap-1.5' + (hidden ? ' opacity-40' : '')}>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
@@ -1254,7 +1265,7 @@ function ColorRow({
               openOn(binding ? 'libraries' : 'custom')
             }}
           >
-            <span className="absolute inset-0" style={{ background: visible ? paint : 'transparent' }} />
+            <span className="absolute inset-0" style={{ background: shown ? paint : 'transparent' }} />
           </button>
         </PopoverTrigger>
         <PopoverContent align="start" side="left" className="w-auto p-0">
@@ -1284,7 +1295,7 @@ function ColorRow({
       ) : (
         <>
           <input
-            value={visible ? formatColor(value, 'hex').replace(/^#/, '').toUpperCase() : '—'}
+            value={shown ? formatColor(paint, 'hex').replace(/^#/, '').toUpperCase() : '—'}
             readOnly={!visible}
             onChange={(e) => {
               const raw = e.target.value.trim()
@@ -1295,7 +1306,7 @@ function ColorRow({
           <NumericInput
             min={0}
             max={100}
-            value={visible ? Math.round(parsed.alpha * 100) : 0}
+            value={shown ? Math.round(parsed.alpha * 100) : 0}
             disabled={!visible}
             onChange={(n) => onChange(composeColor(parsed, Math.min(1, Math.max(0, n / 100))))}
             className="h-auto w-8 border-0 bg-transparent p-0 text-right font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
@@ -1303,7 +1314,8 @@ function ColorRow({
           <span className="text-[11px] text-muted-foreground">%</span>
         </>
       )}
-      {binding && (
+      </div>
+      {binding && !hidden && (
         // Figma's "Detach variable": keep the color, drop the link to it.
         <button
           type="button"
@@ -1321,7 +1333,9 @@ function ColorRow({
         type="button"
         className="shrink-0 text-muted-foreground hover:text-foreground"
         title={visible ? 'Hide' : 'Show'}
-        onClick={() => onChange(visible ? 'transparent' : lastVisible.current)}
+        onClick={() =>
+          onToggleHidden ? onToggleHidden() : onChange(visible ? 'transparent' : lastVisible.current)
+        }
       >
         {visible ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />}
       </button>
@@ -1823,6 +1837,11 @@ export default function App() {
   // reported it, keyed "elementId|prop" — the payloads are snapshots, so
   // without this the shared Fill would keep showing the old color.
   const [multiDraft, setMultiDraft] = useState<Record<string, string>>({})
+  // Paints hidden with the eye, keyed "elementId|prop", holding what they
+  // painted before (a color, or "var(--x)" so the variable link survives).
+  // On the page a hidden paint is simply transparent; this is what lets the
+  // row stay put and bring the exact paint back.
+  const [hiddenPaints, setHiddenPaints] = useState<Record<string, string>>({})
 
   // Layers
   const [tree, setTree] = useState<LayerNode[]>([])
@@ -2613,6 +2632,57 @@ export default function App() {
     return name ? (tokenValues.get(name) ?? v) : v
   }
 
+  const resolveValue = (v: string) => {
+    const name = v.match(VAR_REF)?.[1]
+    return name ? (tokenValues.get(name) ?? v) : v
+  }
+  const rememberHidden = (id: number, prop: string, value: string | null) =>
+    setHiddenPaints((h) => {
+      const next = { ...h }
+      if (value == null) delete next[`${id}|${prop}`]
+      else next[`${id}|${prop}`] = value
+      return next
+    })
+
+  /** The single selection's hidden paint for a prop, if it's currently hidden
+   * (a remembered value whose paint is back on the page doesn't count — undo
+   * can bring it back without going through the eye). */
+  function hiddenFor(prop: PaintProp): string | undefined {
+    if (!selection) return undefined
+    const v = hiddenPaints[`${selection.elementId}|${prop}`]
+    return v !== undefined && !isVisibleColor(resolvedFor(prop)) ? v : undefined
+  }
+
+  /** Props for a single-selection paint row, hidden or not. */
+  function paintRowProps(prop: PaintProp) {
+    const hid = hiddenFor(prop)
+    const current = draft[prop] ?? ''
+    return hid !== undefined
+      ? {
+          value: hid,
+          binding: hid.match(VAR_REF)?.[1] ?? '',
+          resolved: resolveValue(hid),
+          hidden: true,
+          onToggleHidden: () => {
+            applyStyle(prop, hid)
+            if (selection) rememberHidden(selection.elementId, prop, null)
+          },
+        }
+      : {
+          value: current,
+          binding: bindingFor(prop),
+          resolved: resolvedFor(prop),
+          hidden: false,
+          onToggleHidden: () => {
+            if (!selection) return
+            // Keep the variable link if there is one, not just its color.
+            const b = bindingFor(prop)
+            rememberHidden(selection.elementId, prop, b ? `var(${b})` : current)
+            applyStyle(prop, 'transparent')
+          },
+        }
+  }
+
   // ---------- editing several layers at once ----------
   type PaintProp = 'backgroundColor' | 'color' | 'borderColor'
   const multiTargets: SelectionPayload[] =
@@ -2635,11 +2705,24 @@ export default function App() {
   }
   /** What makes two paints "the same" to Figma: the same variable, or else
    * the same color once normalized (rgb vs hex spelling doesn't matter). */
-  const paintKey = (t: SelectionPayload, prop: PaintProp) => {
+  const multiHidden = (t: SelectionPayload, prop: PaintProp) => {
+    const v = hiddenPaints[`${t.elementId}|${prop}`]
+    return v !== undefined && !isVisibleColor(multiResolved(t, prop)) ? v : undefined
+  }
+  /** What a layer's paint is, counting a hidden one as the paint it hides —
+   * the value you'd get back by showing it. */
+  const multiEffective = (t: SelectionPayload, prop: PaintProp) => {
+    const hid = multiHidden(t, prop)
+    if (hid !== undefined) return hid
     const b = multiBinding(t, prop)
+    return b ? `var(${b})` : multiValue(t, prop)
+  }
+  const paintKey = (t: SelectionPayload, prop: PaintProp) => {
+    const v = multiEffective(t, prop)
+    const b = v.match(VAR_REF)?.[1]
     if (b) return 'var:' + b
-    const c = parseColor(multiResolved(t, prop))
-    return c.unknown ? multiResolved(t, prop) : c.transparent ? 'none' : composeColor(c, c.alpha)
+    const c = parseColor(resolveValue(v))
+    return c.unknown ? v : c.transparent ? 'none' : composeColor(c, c.alpha)
   }
 
   /**
@@ -3463,27 +3546,64 @@ export default function App() {
                   a single value for all. */}
               {multiTargets.length >= 2 && (() => {
                 const fillProp = (t: SelectionPayload): PaintProp => (t.text ? 'color' : 'backgroundColor')
-                const withFill = multiTargets.filter((t) => isVisibleColor(multiResolved(t, fillProp(t))))
+                const hasPaint = (t: SelectionPayload, prop: PaintProp) =>
+                  isVisibleColor(multiResolved(t, prop)) || multiHidden(t, prop) !== undefined
+                const withFill = multiTargets.filter((t) => hasPaint(t, fillProp(t)))
                 const fillKeys = new Set(multiTargets.map((t) => paintKey(t, fillProp(t))))
                 const fillShared = withFill.length === multiTargets.length && fillKeys.size === 1
                 const first = multiTargets[0]
-                const setFill = (v: string) => applyToMany(multiTargets, (t) => [{ prop: fillProp(t), value: v }])
+                const clearHidden = (prop: (t: SelectionPayload) => PaintProp) =>
+                  multiTargets.forEach((t) => rememberHidden(t.elementId, prop(t), null))
+                const setFill = (v: string) => {
+                  clearHidden(fillProp)
+                  applyToMany(multiTargets, (t) => [{ prop: fillProp(t), value: v }])
+                }
+                /** Figma: if any selected paint is showing, the eye hides all
+                 * of them; if all are hidden, it shows all. */
+                const toggleHiddenAll = (prop: (t: SelectionPayload) => PaintProp) => {
+                  const allHidden = multiTargets.every((t) => multiHidden(t, prop(t)) !== undefined)
+                  if (allHidden) {
+                    const restore = new Map(multiTargets.map((t) => [t.elementId, multiHidden(t, prop(t))!]))
+                    clearHidden(prop)
+                    applyToMany(multiTargets, (t) => [{ prop: prop(t), value: restore.get(t.elementId)! }])
+                  } else {
+                    const toHide = multiTargets.filter((t) => multiHidden(t, prop(t)) === undefined)
+                    toHide.forEach((t) => rememberHidden(t.elementId, prop(t), multiEffective(t, prop(t))))
+                    applyToMany(toHide, (t) => [{ prop: prop(t), value: 'transparent' }])
+                  }
+                }
+                const sharedRow = (prop: (t: SelectionPayload) => PaintProp) => {
+                  const p0 = prop(first)
+                  const eff = multiEffective(first, p0)
+                  return {
+                    value: eff,
+                    binding: eff.match(VAR_REF)?.[1] ?? '',
+                    resolved: resolveValue(eff),
+                    hidden: multiTargets.every((t) => multiHidden(t, prop(t)) !== undefined),
+                    onToggleHidden: () => toggleHiddenAll(prop),
+                  }
+                }
 
                 const strokeOn = (t: SelectionPayload) =>
                   multiValue(t, 'borderStyle') !== 'none' &&
                   parseFloat(multiValue(t, 'borderWidth') || '0') > 0 &&
                   isVisibleColor(multiResolved(t, 'borderColor'))
-                const withStroke = multiTargets.filter(strokeOn)
+                const strokeProp = (): PaintProp => 'borderColor'
+                const withStroke = multiTargets.filter(
+                  (t) => strokeOn(t) || (multiHidden(t, 'borderColor') !== undefined && parseFloat(multiValue(t, 'borderWidth') || '0') > 0)
+                )
                 const strokeKeys = new Set(multiTargets.map((t) => paintKey(t, 'borderColor')))
                 const strokeShared = withStroke.length === multiTargets.length && strokeKeys.size === 1
-                const setStroke = (v: string) =>
-                  applyToMany(multiTargets, (t) => [
+                const setStroke = (v: string) => {
+                  clearHidden(strokeProp)
+                  return applyToMany(multiTargets, (t) => [
                     { prop: 'borderColor', value: v },
                     ...(parseFloat(multiValue(t, 'borderWidth') || '0') > 0 ? [] : [{ prop: 'borderWidth', value: '1px' }]),
                     ...(multiValue(t, 'borderStyle') === 'none' || !multiValue(t, 'borderStyle')
                       ? [{ prop: 'borderStyle', value: 'solid' }]
                       : []),
                   ])
+                }
 
                 const mixedRow = (what: string) => (
                   <p className="flex h-8 items-center rounded-md border border-dashed px-2 text-xs text-muted-foreground">
@@ -3499,8 +3619,8 @@ export default function App() {
                           <HeaderVariablesButton
                             title="Apply color variable to all"
                             variables={colorVariables}
-                            binding={fillShared ? multiBinding(first, fillProp(first)) : ''}
-                            value={fillShared ? multiResolved(first, fillProp(first)) : '#d9d9d9'}
+                            binding={fillShared ? sharedRow(fillProp).binding : ''}
+                            value={fillShared ? sharedRow(fillProp).resolved : '#d9d9d9'}
                             onOpen={ensureTokens}
                             onChange={setFill}
                           />
@@ -3516,13 +3636,11 @@ export default function App() {
                     >
                       {fillShared ? (
                         <ColorRow
-                          value={multiValue(first, fillProp(first))}
+                          {...sharedRow(fillProp)}
                           edited={multiTargets.some((t) => editsRef.current.some((e) => e.target.elementId === t.elementId && e.prop === fillProp(t)))}
                           onChange={setFill}
                           onRemove={() => setFill('transparent')}
                           variables={colorVariables}
-                          binding={multiBinding(first, fillProp(first))}
-                          resolved={multiResolved(first, fillProp(first))}
                           onOpen={ensureTokens}
                         />
                       ) : withFill.length ? (
@@ -3536,8 +3654,8 @@ export default function App() {
                           <HeaderVariablesButton
                             title="Apply color variable to all"
                             variables={colorVariables}
-                            binding={strokeShared ? multiBinding(first, 'borderColor') : ''}
-                            value={strokeShared ? multiResolved(first, 'borderColor') : '#000000'}
+                            binding={strokeShared ? sharedRow(strokeProp).binding : ''}
+                            value={strokeShared ? sharedRow(strokeProp).resolved : '#000000'}
                             onOpen={ensureTokens}
                             onChange={setStroke}
                           />
@@ -3553,13 +3671,18 @@ export default function App() {
                     >
                       {strokeShared ? (
                         <ColorRow
-                          value={multiValue(first, 'borderColor')}
+                          {...sharedRow(strokeProp)}
                           edited={multiTargets.some((t) => editsRef.current.some((e) => e.target.elementId === t.elementId && e.prop === 'borderColor'))}
                           onChange={setStroke}
-                          onRemove={() => applyToMany(multiTargets, () => [{ prop: 'borderStyle', value: 'none' }])}
+                          onRemove={() => {
+                            const restore = new Map(multiTargets.map((t) => [t.elementId, multiHidden(t, 'borderColor')]))
+                            clearHidden(strokeProp)
+                            applyToMany(multiTargets, (t) => [
+                              ...(restore.get(t.elementId) !== undefined ? [{ prop: 'borderColor', value: restore.get(t.elementId)! }] : []),
+                              { prop: 'borderStyle', value: 'none' },
+                            ])
+                          }}
                           variables={colorVariables}
-                          binding={multiBinding(first, 'borderColor')}
-                          resolved={multiResolved(first, 'borderColor')}
                           onOpen={ensureTokens}
                         />
                       ) : withStroke.length ? (
@@ -3939,8 +4062,11 @@ export default function App() {
                   text layer the fill *is* the text color; its background is a
                   second paint underneath. */}
               {(() => {
-                const hasColor = !!selection.text && isVisibleColor(resolvedFor('color'))
-                const hasBg = isVisibleColor(resolvedFor('backgroundColor'))
+                // A hidden paint is still a paint: its row stays, dimmed.
+                const hasColor =
+                  !!selection.text && (isVisibleColor(resolvedFor('color')) || hiddenFor('color') !== undefined)
+                const hasBg =
+                  isVisibleColor(resolvedFor('backgroundColor')) || hiddenFor('backgroundColor') !== undefined
                 const canAdd = selection.text ? !hasColor || !hasBg : !hasBg
                 const add = () => {
                   if (selection.text && !hasColor) applyStyle('color', '#000000')
@@ -3968,25 +4094,33 @@ export default function App() {
                   >
                     {hasColor && (
                       <ColorRow
-                        value={draft.color ?? ''}
+                        {...paintRowProps('color')}
                         edited={isEdited('color')}
-                        onChange={(v) => applyStyle('color', v)}
-                        onRemove={() => applyStyle('color', 'transparent')}
+                        onChange={(v) => {
+                          rememberHidden(selection.elementId, 'color', null)
+                          applyStyle('color', v)
+                        }}
+                        onRemove={() => {
+                          rememberHidden(selection.elementId, 'color', null)
+                          applyStyle('color', 'transparent')
+                        }}
                         variables={colorVariables}
-                        binding={bindingFor('color')}
-                        resolved={resolvedFor('color')}
                         onOpen={ensureTokens}
                       />
                     )}
                     {hasBg && (
                       <ColorRow
-                        value={draft.backgroundColor ?? ''}
+                        {...paintRowProps('backgroundColor')}
                         edited={isEdited('backgroundColor')}
-                        onChange={(v) => applyStyle('backgroundColor', v)}
-                        onRemove={() => applyStyle('backgroundColor', 'transparent')}
+                        onChange={(v) => {
+                          rememberHidden(selection.elementId, 'backgroundColor', null)
+                          applyStyle('backgroundColor', v)
+                        }}
+                        onRemove={() => {
+                          rememberHidden(selection.elementId, 'backgroundColor', null)
+                          applyStyle('backgroundColor', 'transparent')
+                        }}
                         variables={colorVariables}
-                        binding={bindingFor('backgroundColor')}
-                        resolved={resolvedFor('backgroundColor')}
                         onOpen={ensureTokens}
                       />
                     )}
@@ -4001,7 +4135,7 @@ export default function App() {
                 const hasStroke =
                   draft.borderStyle !== 'none' &&
                   parseFloat(draft.borderWidth ?? '0') > 0 &&
-                  isVisibleColor(resolvedFor('borderColor'))
+                  (isVisibleColor(resolvedFor('borderColor')) || hiddenFor('borderColor') !== undefined)
                 // A stroke needs a style and a weight to show at all; the
                 // first time one is added, give it Figma's defaults.
                 const ensureVisible = () => {
@@ -4035,13 +4169,21 @@ export default function App() {
                     {hasStroke && (
                       <>
                         <ColorRow
-                          value={draft.borderColor ?? ''}
+                          {...paintRowProps('borderColor')}
                           edited={isEdited('borderColor')}
-                          onChange={(v) => applyStyle('borderColor', v)}
-                          onRemove={() => applyStyle('borderStyle', 'none')}
+                          onChange={(v) => {
+                            rememberHidden(selection.elementId, 'borderColor', null)
+                            applyStyle('borderColor', v)
+                          }}
+                          onRemove={() => {
+                            // Removing a hidden stroke: bring its color back so
+                            // re-adding it later restores what it was.
+                            const hid = hiddenFor('borderColor')
+                            rememberHidden(selection.elementId, 'borderColor', null)
+                            if (hid !== undefined) applyStyle('borderColor', hid)
+                            applyStyle('borderStyle', 'none')
+                          }}
                           variables={colorVariables}
-                          binding={bindingFor('borderColor')}
-                          resolved={resolvedFor('borderColor')}
                           onOpen={ensureTokens}
                         />
                         <div className="grid grid-cols-2 gap-2">
