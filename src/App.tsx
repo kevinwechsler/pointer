@@ -61,6 +61,9 @@ import {
   Group,
   Ungroup,
   Minus,
+  Unlink,
+  Search,
+  List,
 } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -258,9 +261,9 @@ function HeaderIconButton({
   title,
   onClick,
 }: {
-  icon: typeof Plus
+  icon: React.ComponentType<{ className?: string }>
   title: string
-  onClick: () => void
+  onClick?: () => void
 }) {
   return (
     <button
@@ -956,11 +959,246 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (css: strin
  * Figma's fill/stroke row: swatch (opens the picker), value, opacity, and an
  * eye to toggle the paint off without losing the color.
  */
+/** Figma's "apply styles and variables" glyph: four dots in a square. */
+function VariablesIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.3">
+      <circle cx="4.5" cy="4.5" r="2" />
+      <circle cx="11.5" cy="4.5" r="2" />
+      <circle cx="4.5" cy="11.5" r="2" />
+      <circle cx="11.5" cy="11.5" r="2" />
+    </svg>
+  )
+}
+
+type ColorVariable = { name: string; value: string }
+
+/** The header's four-dot button: opens the paint popover straight on
+ * Libraries, to bind the section's paint to a variable — adding the paint
+ * if the section is empty, as in Figma. */
+function HeaderVariablesButton({
+  title,
+  variables,
+  binding,
+  value,
+  onOpen,
+  onChange,
+}: {
+  title: string
+  variables: ColorVariable[]
+  binding: string
+  value: string
+  onOpen: () => void
+  onChange: (v: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(o) => {
+        setOpen(o)
+        if (o) onOpen()
+      }}
+    >
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          title={title}
+          className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <VariablesIcon className="size-3.5" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" side="left" className="w-auto p-0">
+        <PaintPopover
+          value={value}
+          onChange={onChange}
+          variables={variables}
+          binding={binding}
+          onPickVariable={(n) => onChange(`var(${n})`)}
+          initialTab="libraries"
+          onClose={() => setOpen(false)}
+        />
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+/** `--color-red-500` → group "color/red", leaf "500": Figma shows variable
+ * collections as slash-separated groups, and CSS custom properties encode
+ * the same hierarchy with dashes. */
+function variablePath(name: string): { group: string; leaf: string; full: string } {
+  const parts = name.replace(/^--/, '').split('-').filter(Boolean)
+  const leaf = parts.pop() ?? name
+  const group = parts.join('/')
+  return { group, leaf, full: group ? `${group}/${leaf}` : leaf }
+}
+
+const VAR_REF = /^var\(\s*(--[A-Za-z0-9_-]+)/
+
+/**
+ * The Libraries tab of Figma's paint picker: search, then the page's color
+ * variables grouped by path, as a list or a swatch grid. The page is the
+ * only "library" a live app has, so the library dropdown becomes a label.
+ */
+function VariableList({
+  variables,
+  selected,
+  onPick,
+}: {
+  variables: ColorVariable[]
+  selected: string
+  onPick: (name: string) => void
+}) {
+  const [query, setQuery] = useState('')
+  const [grid, setGrid] = useState(false)
+  const q = query.trim().toLowerCase()
+  const matches = variables.filter((v) => !q || variablePath(v.name).full.toLowerCase().includes(q) || v.name.includes(q))
+  const groups = new Map<string, ColorVariable[]>()
+  for (const v of matches) {
+    const g = variablePath(v.name).group
+    groups.set(g, [...(groups.get(g) ?? []), v])
+  }
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center gap-2 border-b px-3 py-2">
+        <Search className="size-3.5 shrink-0 text-muted-foreground" />
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search"
+          className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+        />
+      </div>
+      <div className="flex items-center justify-between border-b px-3 py-1.5">
+        <span className="text-[11px] text-muted-foreground">This page</span>
+        <button
+          type="button"
+          title={grid ? 'Show as list' : 'Show as grid'}
+          onClick={() => setGrid((g) => !g)}
+          className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          {grid ? <List className="size-3.5" /> : <VariablesIcon className="size-3.5" />}
+        </button>
+      </div>
+      <div className="max-h-72 overflow-y-auto py-1">
+        {variables.length === 0 ? (
+          <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">
+            No color variables on this page. Colors declared as CSS variables on :root show up here.
+          </p>
+        ) : matches.length === 0 ? (
+          <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">No matches</p>
+        ) : (
+          Array.from(groups, ([group, items]) => (
+            <div key={group || '·'} className="py-1">
+              {group && <p className="px-3 py-1 text-[11px] text-muted-foreground">{group}</p>}
+              {grid ? (
+                <div className="flex flex-wrap gap-1.5 px-3 py-1">
+                  {items.map((v) => (
+                    <button
+                      key={v.name}
+                      type="button"
+                      title={variablePath(v.name).full}
+                      onClick={() => onPick(v.name)}
+                      className={
+                        'size-5 rounded-sm border' +
+                        (v.name === selected ? ' ring-2 ring-[#0D99FF] ring-offset-1' : '')
+                      }
+                      style={{ background: v.value }}
+                    />
+                  ))}
+                </div>
+              ) : (
+                items.map((v) => (
+                  <button
+                    key={v.name}
+                    type="button"
+                    onClick={() => onPick(v.name)}
+                    className={
+                      'flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-[#F5F5F5] dark:hover:bg-white/5' +
+                      (v.name === selected ? ' bg-[#E5F4FF] dark:bg-[#0D99FF]/20' : '')
+                    }
+                  >
+                    <span className="size-4 shrink-0 rounded-sm border" style={{ background: v.value }} />
+                    <span className="truncate">{variablePath(v.name).leaf}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Figma's paint popover: "Custom" (the color picker) and "Libraries" (the
+ * page's color variables), with a close button. Stays open while you try
+ * variables, the way Figma's does. */
+function PaintPopover({
+  value,
+  onChange,
+  variables,
+  binding,
+  onPickVariable,
+  initialTab,
+  onClose,
+}: {
+  value: string
+  onChange: (v: string) => void
+  variables?: ColorVariable[]
+  binding: string
+  onPickVariable?: (name: string) => void
+  initialTab: 'custom' | 'libraries'
+  onClose: () => void
+}) {
+  const [tab, setTab] = useState<'custom' | 'libraries'>(variables ? initialTab : 'custom')
+  const tabClass = (t: string) =>
+    'rounded-md px-2 py-1 text-xs ' +
+    (tab === t ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground hover:text-foreground')
+  return (
+    <div className="w-64">
+      <div className="flex items-center justify-between border-b px-2 py-1.5">
+        <div className="flex gap-0.5">
+          <button type="button" className={tabClass('custom')} onClick={() => setTab('custom')}>
+            Custom
+          </button>
+          {variables && (
+            <button type="button" className={tabClass('libraries')} onClick={() => setTab('libraries')}>
+              Libraries
+            </button>
+          )}
+        </div>
+        <button
+          type="button"
+          title="Close"
+          onClick={onClose}
+          className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <X className="size-3.5" />
+        </button>
+      </div>
+      {tab === 'custom' || !variables ? (
+        <div className="p-3">
+          <ColorPicker value={value} onChange={onChange} />
+        </div>
+      ) : (
+        <VariableList variables={variables} selected={binding} onPick={(n) => onPickVariable?.(n)} />
+      )}
+    </div>
+  )
+}
+
 function ColorRow({
   value,
   edited,
   onChange,
   onRemove,
+  variables,
+  binding = '',
+  resolved,
+  onOpen,
 }: {
   value: string
   edited: boolean
@@ -968,60 +1206,117 @@ function ColorRow({
   /** Figma's "−": the row disappears entirely, unlike the eye which only
    * hides the paint and keeps the row for turning it back on. */
   onRemove?: () => void
+  /** The page's color variables — when given, the popover gets its
+   * Libraries tab, like any paint in Figma. */
+  variables?: ColorVariable[]
+  /** The variable this paint is bound to ('' when it's a plain color). */
+  binding?: string
+  /** What `value` paints as, when it's a variable reference the panel can't
+   * resolve on its own. */
+  resolved?: string
+  onOpen?: () => void
 }) {
-  const parsed = parseColor(value)
+  const paint = resolved ?? value
+  const parsed = parseColor(paint)
   // Seed for the picker when there's no color yet. Was #000000, which made
   // a transparent fill look like Pointer "knew" the color was black
   // whenever the element's text happened to be black. Figma's default for
   // a newly added fill is this light gray, and it can't be mistaken for a
   // real value.
   const lastVisible = useRef<string>('#d9d9d9')
-  if (!parsed.transparent && !parsed.unknown) lastVisible.current = value
-  const visible = !parsed.transparent
+  const visible = binding ? true : !parsed.transparent
+  if (binding) lastVisible.current = `var(${binding})`
+  else if (!parsed.transparent && !parsed.unknown) lastVisible.current = value
+  const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState<'custom' | 'libraries'>('custom')
+  const openOn = (t: 'custom' | 'libraries') => {
+    setTab(t)
+    setOpen(true)
+    onOpen?.()
+  }
 
   return (
     <div
       className={
-        'flex h-8 items-center gap-1.5 rounded-md border bg-background px-1.5' +
+        'group/paint flex h-8 items-center gap-1.5 rounded-md border bg-background px-1.5' +
         (edited ? ' border-primary bg-primary/5' : '')
       }
     >
-      <Popover>
+      <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
             type="button"
             className="relative size-5 shrink-0 overflow-hidden rounded-sm border"
             style={{ background: CHECKER }}
-            title={visible ? value : 'No color'}
+            title={binding ? variablePath(binding).full : visible ? value : 'No color'}
+            onClick={(e) => {
+              e.preventDefault()
+              openOn(binding ? 'libraries' : 'custom')
+            }}
           >
-            <span
-              className="absolute inset-0"
-              style={{ background: visible ? value : 'transparent' }}
-            />
+            <span className="absolute inset-0" style={{ background: visible ? paint : 'transparent' }} />
           </button>
         </PopoverTrigger>
-        <PopoverContent align="start" side="left" className="w-auto p-3">
-          <ColorPicker key={visible ? 'on' : 'off'} value={visible ? value : lastVisible.current} onChange={onChange} />
+        <PopoverContent align="start" side="left" className="w-auto p-0">
+          <PaintPopover
+            key={tab}
+            value={visible && !parsed.unknown ? paint : lastVisible.current.startsWith('var(') ? '#d9d9d9' : lastVisible.current}
+            onChange={onChange}
+            variables={variables}
+            binding={binding}
+            onPickVariable={(n) => onChange(`var(${n})`)}
+            initialTab={tab}
+            onClose={() => setOpen(false)}
+          />
         </PopoverContent>
       </Popover>
-      <input
-        value={visible ? formatColor(value, 'hex').replace(/^#/, '').toUpperCase() : '—'}
-        readOnly={!visible}
-        onChange={(e) => {
-          const raw = e.target.value.trim()
-          if (/^[0-9a-f]{6}([0-9a-f]{2})?$/i.test(raw)) onChange('#' + raw)
-        }}
-        className="min-w-0 flex-1 bg-transparent font-mono text-xs uppercase outline-none"
-      />
-      <NumericInput
-        min={0}
-        max={100}
-        value={visible ? Math.round(parsed.alpha * 100) : 0}
-        disabled={!visible}
-        onChange={(n) => onChange(composeColor(parsed, Math.min(1, Math.max(0, n / 100))))}
-        className="h-auto w-8 border-0 bg-transparent p-0 text-right font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
-      />
-      <span className="text-[11px] text-muted-foreground">%</span>
+      {binding ? (
+        // Bound to a variable: Figma shows the variable's name in place of
+        // the hex and opacity, and clicking it swaps to another variable.
+        <button
+          type="button"
+          onClick={() => openOn('libraries')}
+          className="min-w-0 flex-1 truncate text-left text-xs"
+          title={binding}
+        >
+          {variablePath(binding).full}
+        </button>
+      ) : (
+        <>
+          <input
+            value={visible ? formatColor(value, 'hex').replace(/^#/, '').toUpperCase() : '—'}
+            readOnly={!visible}
+            onChange={(e) => {
+              const raw = e.target.value.trim()
+              if (/^[0-9a-f]{6}([0-9a-f]{2})?$/i.test(raw)) onChange('#' + raw)
+            }}
+            className="min-w-0 flex-1 bg-transparent font-mono text-xs uppercase outline-none"
+          />
+          <NumericInput
+            min={0}
+            max={100}
+            value={visible ? Math.round(parsed.alpha * 100) : 0}
+            disabled={!visible}
+            onChange={(n) => onChange(composeColor(parsed, Math.min(1, Math.max(0, n / 100))))}
+            className="h-auto w-8 border-0 bg-transparent p-0 text-right font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
+          />
+          <span className="text-[11px] text-muted-foreground">%</span>
+        </>
+      )}
+      {binding && (
+        // Figma's "Detach variable": keep the color, drop the link to it.
+        <button
+          type="button"
+          className="hidden shrink-0 text-muted-foreground group-hover/paint:block hover:text-foreground"
+          title="Detach variable"
+          onClick={() => {
+            const c = parseColor(paint)
+            if (!c.unknown) onChange(c.transparent ? 'transparent' : composeColor(c, c.alpha))
+          }}
+        >
+          <Unlink className="size-3.5" />
+        </button>
+      )}
       <button
         type="button"
         className="shrink-0 text-muted-foreground hover:text-foreground"
@@ -1521,7 +1816,13 @@ export default function App() {
   // the primary/most-recently-clicked element; this holds every element
   // currently selected (including the primary) whenever there's more than
   // one — length < 2 means "no multi-selection, ignore this".
-  const [multiSelection, setMultiSelection] = useState<{ elementId: number; descriptor: string }[]>([])
+  const [multiSelection, setMultiSelection] = useState<
+    { elementId: number; descriptor: string; payload?: SelectionPayload }[]
+  >([])
+  // Values the panel has applied to a multi-selection since the page last
+  // reported it, keyed "elementId|prop" — the payloads are snapshots, so
+  // without this the shared Fill would keep showing the old color.
+  const [multiDraft, setMultiDraft] = useState<Record<string, string>>({})
 
   // Layers
   const [tree, setTree] = useState<LayerNode[]>([])
@@ -1659,6 +1960,7 @@ export default function App() {
       }
       if (msg.type === 'PTR_MULTI_SELECTED') {
         setMultiSelection(msg.payload.items)
+        setMultiDraft({})
       }
       if (msg.type === 'PTR_COMMENT_CLICKED') {
         lastFrameRef.current = msg.payload.frameToken
@@ -2275,6 +2577,109 @@ export default function App() {
             }
       return [...rest, edit]
     })
+  }
+
+  // ---------- color variables ----------
+  /** The page's design tokens that are colors — what the Libraries tab
+   * lists. Read from the same token list the Tokens tab uses. */
+  const colorVariables: ColorVariable[] = tokens.filter((t) => {
+    const c = parseColor(t.value)
+    return !c.unknown && !c.transparent
+  })
+  const tokenValues = new Map(tokens.map((t) => [t.name, t.value]))
+
+  /** Tokens are loaded lazily (by the Tokens/Comments tabs); a paint
+   * popover needs them too, the moment it opens. */
+  function ensureTokens() {
+    if (!tokens.length) loadCommentsAndTokens()
+  }
+
+  /** The variable a paint is bound to: one applied in the panel shows up in
+   * the draft itself; otherwise it's whatever the page's CSS binds it to,
+   * for as long as the value is still the one the page started with. */
+  function bindingFor(prop: 'backgroundColor' | 'color' | 'borderColor'): string {
+    const v = draft[prop] ?? ''
+    const own = v.match(VAR_REF)?.[1]
+    if (own) return own
+    if (selection && v === selection.styles[prop]) return selection.bindings?.[prop] ?? ''
+    return ''
+  }
+
+  /** What a paint actually looks like, resolving a variable the panel
+   * applied (the draft then holds "var(--x)", not a color). */
+  function resolvedFor(prop: 'backgroundColor' | 'color' | 'borderColor'): string {
+    const v = draft[prop] ?? ''
+    const name = v.match(VAR_REF)?.[1]
+    return name ? (tokenValues.get(name) ?? v) : v
+  }
+
+  // ---------- editing several layers at once ----------
+  type PaintProp = 'backgroundColor' | 'color' | 'borderColor'
+  const multiTargets: SelectionPayload[] =
+    multiSelection.length >= 2
+      ? multiSelection.map((m) => m.payload).filter((p): p is SelectionPayload => !!p)
+      : []
+
+  const multiValue = (t: SelectionPayload, prop: string) =>
+    multiDraft[`${t.elementId}|${prop}`] ?? t.styles[prop] ?? ''
+  const multiBinding = (t: SelectionPayload, prop: PaintProp) => {
+    const v = multiValue(t, prop)
+    const own = v.match(VAR_REF)?.[1]
+    if (own) return own
+    return v === t.styles[prop] ? (t.bindings?.[prop] ?? '') : ''
+  }
+  const multiResolved = (t: SelectionPayload, prop: PaintProp) => {
+    const v = multiValue(t, prop)
+    const name = v.match(VAR_REF)?.[1]
+    return name ? (tokenValues.get(name) ?? v) : v
+  }
+  /** What makes two paints "the same" to Figma: the same variable, or else
+   * the same color once normalized (rgb vs hex spelling doesn't matter). */
+  const paintKey = (t: SelectionPayload, prop: PaintProp) => {
+    const b = multiBinding(t, prop)
+    if (b) return 'var:' + b
+    const c = parseColor(multiResolved(t, prop))
+    return c.unknown ? multiResolved(t, prop) : c.transparent ? 'none' : composeColor(c, c.alpha)
+  }
+
+  /**
+   * One edit across every selected layer, recorded as a single history step
+   * — so one Cmd+Z puts all of them back, as in Figma. Each layer can get a
+   * different property (a text's fill is its color, a box's its background).
+   */
+  async function applyToMany(
+    targets: SelectionPayload[],
+    changesFor: (t: SelectionPayload) => { prop: string; value: string }[]
+  ) {
+    const steps: { t: SelectionPayload; prop: string; from: string; to: string; origin: string }[] = []
+    for (const t of targets) {
+      for (const { prop, value } of changesFor(t)) {
+        const existing = editsRef.current.find((e) => e.target.elementId === t.elementId && e.prop === prop)
+        steps.push({ t, prop, from: multiValue(t, prop), to: value, origin: existing?.from ?? t.styles[prop] ?? '' })
+      }
+    }
+    const run = async (dir: 'to' | 'from') => {
+      const draft: Record<string, string> = {}
+      for (const st of steps) {
+        const value = st[dir]
+        try {
+          await sendToPage({
+            type: 'PTR_APPLY_STYLE',
+            frameToken: st.t.frameToken,
+            elementId: st.t.elementId,
+            prop: toKebab(st.prop),
+            value,
+          })
+        } catch {
+          continue
+        }
+        upsertEdit(st.t, 'style', st.prop, st.origin, value)
+        draft[`${st.t.elementId}|${st.prop}`] = value
+      }
+      setMultiDraft((d) => ({ ...d, ...draft }))
+    }
+    await run('to')
+    pushHistory({ kind: 'structure', undo: () => run('from'), redo: () => run('to') })
   }
 
   function selectLayer(id: number) {
@@ -3051,6 +3456,119 @@ export default function App() {
                 Wraps the selected layers in a new flex container. They need to share
                 the same parent.
               </p>
+
+              {/* Figma's multi-selection panel: a property that every
+                  selected layer shares shows its value and edits them all
+                  at once; one that differs shows "Mixed", replaceable with
+                  a single value for all. */}
+              {multiTargets.length >= 2 && (() => {
+                const fillProp = (t: SelectionPayload): PaintProp => (t.text ? 'color' : 'backgroundColor')
+                const withFill = multiTargets.filter((t) => isVisibleColor(multiResolved(t, fillProp(t))))
+                const fillKeys = new Set(multiTargets.map((t) => paintKey(t, fillProp(t))))
+                const fillShared = withFill.length === multiTargets.length && fillKeys.size === 1
+                const first = multiTargets[0]
+                const setFill = (v: string) => applyToMany(multiTargets, (t) => [{ prop: fillProp(t), value: v }])
+
+                const strokeOn = (t: SelectionPayload) =>
+                  multiValue(t, 'borderStyle') !== 'none' &&
+                  parseFloat(multiValue(t, 'borderWidth') || '0') > 0 &&
+                  isVisibleColor(multiResolved(t, 'borderColor'))
+                const withStroke = multiTargets.filter(strokeOn)
+                const strokeKeys = new Set(multiTargets.map((t) => paintKey(t, 'borderColor')))
+                const strokeShared = withStroke.length === multiTargets.length && strokeKeys.size === 1
+                const setStroke = (v: string) =>
+                  applyToMany(multiTargets, (t) => [
+                    { prop: 'borderColor', value: v },
+                    ...(parseFloat(multiValue(t, 'borderWidth') || '0') > 0 ? [] : [{ prop: 'borderWidth', value: '1px' }]),
+                    ...(multiValue(t, 'borderStyle') === 'none' || !multiValue(t, 'borderStyle')
+                      ? [{ prop: 'borderStyle', value: 'solid' }]
+                      : []),
+                  ])
+
+                const mixedRow = (what: string) => (
+                  <p className="flex h-8 items-center rounded-md border border-dashed px-2 text-xs text-muted-foreground">
+                    Mixed — use + or the variables button to set one {what} for all
+                  </p>
+                )
+                return (
+                  <div className="-mx-4 divide-y border-t">
+                    <Section
+                      title="Fill"
+                      action={
+                        <div className="flex items-center gap-0.5">
+                          <HeaderVariablesButton
+                            title="Apply color variable to all"
+                            variables={colorVariables}
+                            binding={fillShared ? multiBinding(first, fillProp(first)) : ''}
+                            value={fillShared ? multiResolved(first, fillProp(first)) : '#d9d9d9'}
+                            onOpen={ensureTokens}
+                            onChange={setFill}
+                          />
+                          {!fillShared && (
+                            <HeaderIconButton
+                              icon={Plus}
+                              title={withFill.length ? 'Replace mixed fills' : 'Add fill'}
+                              onClick={() => setFill('#d9d9d9')}
+                            />
+                          )}
+                        </div>
+                      }
+                    >
+                      {fillShared ? (
+                        <ColorRow
+                          value={multiValue(first, fillProp(first))}
+                          edited={multiTargets.some((t) => editsRef.current.some((e) => e.target.elementId === t.elementId && e.prop === fillProp(t)))}
+                          onChange={setFill}
+                          onRemove={() => setFill('transparent')}
+                          variables={colorVariables}
+                          binding={multiBinding(first, fillProp(first))}
+                          resolved={multiResolved(first, fillProp(first))}
+                          onOpen={ensureTokens}
+                        />
+                      ) : withFill.length ? (
+                        mixedRow('fill')
+                      ) : null}
+                    </Section>
+                    <Section
+                      title="Stroke"
+                      action={
+                        <div className="flex items-center gap-0.5">
+                          <HeaderVariablesButton
+                            title="Apply color variable to all"
+                            variables={colorVariables}
+                            binding={strokeShared ? multiBinding(first, 'borderColor') : ''}
+                            value={strokeShared ? multiResolved(first, 'borderColor') : '#000000'}
+                            onOpen={ensureTokens}
+                            onChange={setStroke}
+                          />
+                          {!strokeShared && (
+                            <HeaderIconButton
+                              icon={Plus}
+                              title={withStroke.length ? 'Replace mixed strokes' : 'Add stroke'}
+                              onClick={() => setStroke('#000000')}
+                            />
+                          )}
+                        </div>
+                      }
+                    >
+                      {strokeShared ? (
+                        <ColorRow
+                          value={multiValue(first, 'borderColor')}
+                          edited={multiTargets.some((t) => editsRef.current.some((e) => e.target.elementId === t.elementId && e.prop === 'borderColor'))}
+                          onChange={setStroke}
+                          onRemove={() => applyToMany(multiTargets, () => [{ prop: 'borderStyle', value: 'none' }])}
+                          variables={colorVariables}
+                          binding={multiBinding(first, 'borderColor')}
+                          resolved={multiResolved(first, 'borderColor')}
+                          onOpen={ensureTokens}
+                        />
+                      ) : withStroke.length ? (
+                        mixedRow('stroke')
+                      ) : null}
+                    </Section>
+                  </div>
+                )
+              })()}
             </div>
           ) : !selection ? (
             <p className="p-4 pt-8 text-center text-sm text-muted-foreground">
@@ -3421,17 +3939,32 @@ export default function App() {
                   text layer the fill *is* the text color; its background is a
                   second paint underneath. */}
               {(() => {
-                const hasColor = !!selection.text && isVisibleColor(draft.color)
-                const hasBg = isVisibleColor(draft.backgroundColor)
+                const hasColor = !!selection.text && isVisibleColor(resolvedFor('color'))
+                const hasBg = isVisibleColor(resolvedFor('backgroundColor'))
                 const canAdd = selection.text ? !hasColor || !hasBg : !hasBg
                 const add = () => {
                   if (selection.text && !hasColor) applyStyle('color', '#000000')
                   else applyStyle('backgroundColor', '#d9d9d9')
                 }
+                // The paint the header's variables button acts on: the
+                // text color for a text layer, the background otherwise.
+                const primary: 'color' | 'backgroundColor' = selection.text ? 'color' : 'backgroundColor'
                 return (
                   <Section
                     title="Fill"
-                    action={canAdd && <HeaderIconButton icon={Plus} title="Add fill" onClick={add} />}
+                    action={
+                      <div className="flex items-center gap-0.5">
+                        <HeaderVariablesButton
+                          title="Apply color variable"
+                          variables={colorVariables}
+                          binding={bindingFor(primary)}
+                          value={resolvedFor(primary)}
+                          onOpen={ensureTokens}
+                          onChange={(v) => applyStyle(primary, v)}
+                        />
+                        {canAdd && <HeaderIconButton icon={Plus} title="Add fill" onClick={add} />}
+                      </div>
+                    }
                   >
                     {hasColor && (
                       <ColorRow
@@ -3439,6 +3972,10 @@ export default function App() {
                         edited={isEdited('color')}
                         onChange={(v) => applyStyle('color', v)}
                         onRemove={() => applyStyle('color', 'transparent')}
+                        variables={colorVariables}
+                        binding={bindingFor('color')}
+                        resolved={resolvedFor('color')}
+                        onOpen={ensureTokens}
                       />
                     )}
                     {hasBg && (
@@ -3447,6 +3984,10 @@ export default function App() {
                         edited={isEdited('backgroundColor')}
                         onChange={(v) => applyStyle('backgroundColor', v)}
                         onRemove={() => applyStyle('backgroundColor', 'transparent')}
+                        variables={colorVariables}
+                        binding={bindingFor('backgroundColor')}
+                        resolved={resolvedFor('backgroundColor')}
+                        onOpen={ensureTokens}
                       />
                     )}
                   </Section>
@@ -3460,16 +4001,36 @@ export default function App() {
                 const hasStroke =
                   draft.borderStyle !== 'none' &&
                   parseFloat(draft.borderWidth ?? '0') > 0 &&
-                  isVisibleColor(draft.borderColor)
-                const add = () => {
-                  if (!isVisibleColor(draft.borderColor)) applyStyle('borderColor', '#000000')
+                  isVisibleColor(resolvedFor('borderColor'))
+                // A stroke needs a style and a weight to show at all; the
+                // first time one is added, give it Figma's defaults.
+                const ensureVisible = () => {
                   if (!parseFloat(draft.borderWidth ?? '0')) applyStyle('borderWidth', '1px')
-                  applyStyle('borderStyle', 'solid')
+                  if (draft.borderStyle === 'none' || !draft.borderStyle) applyStyle('borderStyle', 'solid')
+                }
+                const add = () => {
+                  if (!isVisibleColor(resolvedFor('borderColor'))) applyStyle('borderColor', '#000000')
+                  ensureVisible()
                 }
                 return (
                   <Section
                     title="Stroke"
-                    action={!hasStroke && <HeaderIconButton icon={Plus} title="Add stroke" onClick={add} />}
+                    action={
+                      <div className="flex items-center gap-0.5">
+                        <HeaderVariablesButton
+                          title="Apply color variable"
+                          variables={colorVariables}
+                          binding={bindingFor('borderColor')}
+                          value={resolvedFor('borderColor')}
+                          onOpen={ensureTokens}
+                          onChange={(v) => {
+                            applyStyle('borderColor', v)
+                            ensureVisible()
+                          }}
+                        />
+                        {!hasStroke && <HeaderIconButton icon={Plus} title="Add stroke" onClick={add} />}
+                      </div>
+                    }
                   >
                     {hasStroke && (
                       <>
@@ -3478,6 +4039,10 @@ export default function App() {
                           edited={isEdited('borderColor')}
                           onChange={(v) => applyStyle('borderColor', v)}
                           onRemove={() => applyStyle('borderStyle', 'none')}
+                          variables={colorVariables}
+                          binding={bindingFor('borderColor')}
+                          resolved={resolvedFor('borderColor')}
+                          onOpen={ensureTokens}
                         />
                         <div className="grid grid-cols-2 gap-2">
                           {renderField({ prop: 'borderWidth', label: 'Weight', type: 'unit' })}

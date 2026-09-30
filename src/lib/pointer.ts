@@ -35,6 +35,10 @@ export type SelectionPayload = {
   /** The size each axis actually asks for ('', 'auto', '100%', '240px', ...),
    * so a typed length can be shown back exactly as it was written. */
   specified: { width: string; height: string }
+  /** The design token (CSS variable name, e.g. "--primary") each paint is
+   * bound to, or '' when it's a plain color — Figma's fill-bound-to-a-
+   * variable. Text color is inherited, so it can come from an ancestor. */
+  bindings: { backgroundColor: string; color: string; borderColor: string }
   /** The parent's layout mode, which decides what Hug/Fixed/Fill have to
    * write: grow along the parent's main axis, stretch across it, or a plain
    * percentage when the parent isn't a flex container at all. */
@@ -181,7 +185,14 @@ export function generatePrompt(edits: Edit[], tokenEdits: TokenEdit[] = []): str
         `   Reorder it within ${e.detail ?? 'its parent'}: move it from position ${e.from} to position ${e.to} among its siblings.`
       )
     } else {
-      lines.push(`   Change \`${e.prop}\` from \`${e.from}\` to \`${e.to}\`.`)
+      const token = e.to.match(/^var\(\s*(--[A-Za-z0-9_-]+)/)?.[1]
+      if (token) {
+        lines.push(
+          `   Change \`${e.prop}\` from \`${e.from}\` to the design token \`${token}\` — reference the existing token (its variable, Tailwind class or theme key), don't hardcode its value.`
+        )
+      } else {
+        lines.push(`   Change \`${e.prop}\` from \`${e.from}\` to \`${e.to}\`.`)
+      }
     }
     lines.push('')
   })

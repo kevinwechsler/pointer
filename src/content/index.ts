@@ -451,6 +451,7 @@ function buildPayload(el: Element): SelectionPayload {
     },
     sizing: readSizing(el),
     specified: readSpecified(el),
+    bindings: readBindings(el),
     parentLayout: readParentLayout(el),
     transform: getTransformParts(registerEl(el)),
   }
@@ -476,18 +477,27 @@ function readParentLayout(el: Element): SelectionPayload['parentLayout'] {
 // *specified* value, which means reading the stylesheets the way the
 // browser's own Styles pane does.
 
-/** Style rules that set a width or height, gathered once — matching one
- * element against only these (usually a few dozen) instead of against every
- * rule in a framework's stylesheet (often thousands) is what keeps this
- * cheap enough to redo after every edit. */
-type SizeRule = { selector: string; width: string; height: string; spec: number }
-let sizeRules: SizeRule[] | null = null
-let sizeRulesStamp = ''
+/** Style rules that declare one of the properties Pointer needs the
+ * *specified* value of, gathered once. Matching an element against only
+ * these (usually a few dozen) instead of every rule in a framework's
+ * stylesheet (often thousands) keeps it cheap enough to redo per edit. */
+const WATCHED_PROPS = [
+  'width',
+  'height',
+  'background-color',
+  'background',
+  'color',
+  'border-color',
+  'border-top-color',
+]
+type DeclRule = { selector: string; decls: Record<string, string>; important: Set<string>; spec: number }
+let declRules: DeclRule[] | null = null
+let declRulesStamp = ''
 
 /** Rough CSS specificity: ids, then classes/attributes/pseudo-classes, then
- * element names, with !important on top. Enough to pick the winner among the
- * handful of rules that size one element; a faithful implementation would
- * need the whole selector grammar. */
+ * element names. Enough to pick the winner among the handful of rules that
+ * set one property on one element; a faithful implementation would need
+ * the whole selector grammar. */
 function specificityOf(selector: string): number {
   const ids = (selector.match(/#[\w-]+/g) || []).length
   const classes = (selector.match(/\.[\w-]+|\[[^\]]+\]|:(?!:)[\w-]+/g) || []).length
@@ -495,7 +505,39 @@ function specificityOf(selector: string): number {
   return ids * 10000 + classes * 100 + els
 }
 
-function collectSizeRules(): SizeRule[] {
+/** Every style rule currently in effect, descending into the at-rules that
+ * wrap them. Tailwind v4 puts *all* of its output inside @layer blocks —
+ * theme variables and utilities alike — so walking only top-level rules
+ * (as this used to) saw none of it: no design tokens, and no class-driven
+ * sizes. */
+function forEachStyleRule(visit: (rule: CSSStyleRule) => void) {
+  const walk = (rules: CSSRuleList) => {
+    for (const rule of Array.from(rules)) {
+      if (rule instanceof CSSStyleRule) visit(rule)
+      else if (rule instanceof CSSMediaRule) {
+        if (window.matchMedia(rule.conditionText).matches) walk(rule.cssRules)
+      } else if (rule instanceof CSSImportRule) {
+        try {
+          if (rule.styleSheet) walk(rule.styleSheet.cssRules)
+        } catch {
+          /* cross-origin import */
+        }
+      } else if ('cssRules' in rule) {
+        // @layer, @supports, @container and friends.
+        walk((rule as CSSGroupingRule).cssRules)
+      }
+    }
+  }
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      walk(sheet.cssRules)
+    } catch {
+      // A cross-origin stylesheet — unreadable by design, nothing to do.
+    }
+  }
+}
+
+function collectDeclRules(): DeclRule[] {
   // Stylesheets change when a dev server hot-reloads CSS; the count plus the
   // last sheet's rule count is a cheap enough stand-in for "still the same".
   const sheets = Array.from(document.styleSheets)
@@ -506,64 +548,92 @@ function collectSizeRules(): SizeRule[] {
     lastCount = 0
   }
   const stamp = `${sheets.length}:${lastCount}`
-  if (sizeRules && sizeRulesStamp === stamp) return sizeRules
+  if (declRules && declRulesStamp === stamp) return declRules
 
-  const out: SizeRule[] = []
-  const visit = (rules: CSSRuleList) => {
-    for (const rule of Array.from(rules)) {
-      if (rule instanceof CSSMediaRule) {
-        // Only rules that apply right now, at this viewport.
-        if (window.matchMedia(rule.conditionText).matches) visit(rule.cssRules)
-      } else if (rule instanceof CSSSupportsRule) {
-        visit(rule.cssRules)
-      } else if (rule instanceof CSSStyleRule) {
-        const width = rule.style.getPropertyValue('width')
-        const height = rule.style.getPropertyValue('height')
-        if (!width && !height) continue
-        const important =
-          rule.style.getPropertyPriority('width') === 'important' ||
-          rule.style.getPropertyPriority('height') === 'important'
-        out.push({
-          selector: rule.selectorText,
-          width,
-          height,
-          spec: specificityOf(rule.selectorText) + (important ? 1e6 : 0),
-        })
-      }
+  const out: DeclRule[] = []
+  forEachStyleRule((rule) => {
+    const decls: Record<string, string> = {}
+    const important = new Set<string>()
+    for (const prop of WATCHED_PROPS) {
+      const v = rule.style.getPropertyValue(prop)
+      if (!v) continue
+      decls[prop] = v.trim()
+      if (rule.style.getPropertyPriority(prop) === 'important') important.add(prop)
     }
-  }
-  for (const sheet of sheets) {
-    try {
-      visit(sheet.cssRules)
-    } catch {
-      // A cross-origin stylesheet — unreadable by design, nothing to do.
+    if (Object.keys(decls).length) {
+      out.push({ selector: rule.selectorText, decls, important, spec: specificityOf(rule.selectorText) })
     }
-  }
-  sizeRules = out
-  sizeRulesStamp = stamp
+  })
+  declRules = out
+  declRulesStamp = stamp
   return out
 }
 
-/** The size the author actually asked for on this axis ('', 'auto', '100%',
- * 'fit-content', '240px', ...) — inline style first, then the winning rule. */
-function specifiedSize(el: HTMLElement, axis: 'width' | 'height'): string {
-  const inline = el.style.getPropertyValue(axis)
+/** The value the author actually wrote for a property on this element
+ * ('', 'auto', '100%', 'var(--primary)', ...) — inline style first, then the
+ * winning rule. Computed styles can't answer this: they resolve lengths to
+ * pixels and variables to their colors. */
+function specifiedValue(el: HTMLElement, prop: string): string {
+  const inline = el.style.getPropertyValue(prop)
   if (inline) return inline.trim()
   let best = ''
   let bestSpec = -1
-  for (const rule of collectSizeRules()) {
-    const v = rule[axis]
-    if (!v || rule.spec < bestSpec) continue
+  for (const rule of collectDeclRules()) {
+    const v = rule.decls[prop]
+    if (!v) continue
+    const spec = rule.spec + (rule.important.has(prop) ? 1e6 : 0)
+    if (spec < bestSpec) continue
     try {
       if (!el.matches(rule.selector)) continue
     } catch {
       continue // a selector this browser can't parse (::v-deep and friends)
     }
     // Ties go to whichever comes last in document order, like the cascade.
-    bestSpec = rule.spec
-    best = v.trim()
+    bestSpec = spec
+    best = v
   }
   return best
+}
+
+function specifiedSize(el: HTMLElement, axis: 'width' | 'height'): string {
+  return specifiedValue(el, axis)
+}
+
+// ---------- color variables ----------
+// Which design token (CSS variable) a paint is bound to, like a Figma fill
+// bound to a variable. Only a value that *is* a variable counts — something
+// like color-mix(var(--a), white) is a derived color, not a binding.
+const VAR_ONLY = /^var\(\s*(--[A-Za-z0-9_-]+)\s*(,[^)]*)?\)$/
+
+function varName(value: string): string {
+  return value.match(VAR_ONLY)?.[1] ?? ''
+}
+
+function colorBinding(el: HTMLElement, prop: 'backgroundColor' | 'color' | 'borderColor'): string {
+  if (prop === 'backgroundColor') {
+    // A variable in the `background` shorthand leaves the longhand unset in
+    // the CSSOM (it can't be split until the variable is resolved).
+    return varName(specifiedValue(el, 'background-color')) || varName(specifiedValue(el, 'background'))
+  }
+  if (prop === 'borderColor') {
+    return varName(specifiedValue(el, 'border-color')) || varName(specifiedValue(el, 'border-top-color'))
+  }
+  // Text color is inherited: a paragraph with no color of its own is still
+  // painted with whatever variable its nearest ancestor set.
+  for (let node: HTMLElement | null = el; node && node !== document.documentElement; node = node.parentElement) {
+    const v = specifiedValue(node, 'color')
+    if (v && v !== 'inherit') return varName(v)
+  }
+  return ''
+}
+
+function readBindings(el: Element): SelectionPayload['bindings'] {
+  if (!(el instanceof HTMLElement)) return { backgroundColor: '', color: '', borderColor: '' }
+  return {
+    backgroundColor: colorBinding(el, 'backgroundColor'),
+    color: colorBinding(el, 'color'),
+    borderColor: colorBinding(el, 'borderColor'),
+  }
 }
 
 /** Sizes that ask to hug the content outright, as opposed to "auto", which
@@ -678,7 +748,14 @@ function broadcastMultiSelection() {
     .sort((a, b) =>
       a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
     )
-    .map(({ id, el }) => ({ elementId: id, descriptor: shortDescriptor(el) }))
+    // With several selected, the panel edits their shared properties (Fill,
+    // Stroke) all at once, Figma-style — so it needs each one's full payload,
+    // not just a label. A single selection travels as PTR_SELECTED already.
+    .map(({ id, el }, _i, all) => ({
+      elementId: id,
+      descriptor: shortDescriptor(el),
+      payload: all.length >= 2 ? buildPayload(el) : undefined,
+    }))
   chrome.runtime.sendMessage({ type: 'PTR_MULTI_SELECTED', payload: { items } })
 }
 
@@ -1271,29 +1348,19 @@ const tokenPristine = new Map<string, string>()
 
 function getTokens(): { name: string; value: string }[] {
   const seen = new Map<string, string>()
-  // Walk same-origin stylesheets for :root / html custom property declarations.
-  for (const sheet of Array.from(document.styleSheets)) {
-    let rules: CSSRuleList
-    try {
-      rules = sheet.cssRules
-    } catch {
-      continue // cross-origin stylesheet
+  const rootStyle = getComputedStyle(document.documentElement)
+  // :root / html custom properties, wherever they live — including inside
+  // @layer, which is where Tailwind v4 puts its whole theme.
+  forEachStyleRule((rule) => {
+    if (!/(^|,)\s*(:root|html)\s*($|,)/.test(rule.selectorText)) return
+    for (const prop of Array.from(rule.style)) {
+      if (!prop.startsWith('--')) continue
+      // Live value: any variable it references is already substituted, and
+      // it reflects any override Pointer applied.
+      const live = rootStyle.getPropertyValue(prop).trim()
+      seen.set(prop, live || rule.style.getPropertyValue(prop).trim())
     }
-    for (const rule of Array.from(rules)) {
-      if (!(rule instanceof CSSStyleRule)) continue
-      const sel = rule.selectorText
-      if (!/(^|,)\s*(:root|html)\s*($|,)/.test(sel)) continue
-      for (const prop of Array.from(rule.style)) {
-        if (prop.startsWith('--')) {
-          // Live value (reflects any override we applied).
-          const live = getComputedStyle(document.documentElement)
-            .getPropertyValue(prop)
-            .trim()
-          seen.set(prop, live || rule.style.getPropertyValue(prop).trim())
-        }
-      }
-    }
-  }
+  })
   return Array.from(seen, ([name, value]) => ({ name, value }))
 }
 
