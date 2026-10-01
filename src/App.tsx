@@ -890,7 +890,7 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (css: strin
   }
 
   return (
-    <div className="w-60 space-y-2">
+    <div className="w-full space-y-2">
       <div
         {...sv}
         className="relative h-40 w-full cursor-crosshair touch-none rounded-md"
@@ -1054,7 +1054,7 @@ function HeaderVariablesButton({
           <VariablesIcon className="size-3.5" />
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" side="left" className="w-auto p-0">
+      <PopoverContent align="end" side="bottom" className="w-auto overflow-hidden p-0">
         <PaintPopover
           value={value}
           onChange={onChange}
@@ -1113,8 +1113,8 @@ function VariableList({
     groups.set(g, [...(groups.get(g) ?? []), v])
   }
   return (
-    <div className="flex flex-col">
-      <div className="flex items-center gap-2 border-b px-3 py-2">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2">
         <Search className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           autoFocus
@@ -1124,7 +1124,7 @@ function VariableList({
           className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
         />
       </div>
-      <div className="flex items-center justify-between border-b px-3 py-1.5">
+      <div className="flex shrink-0 items-center justify-between border-b px-3 py-1.5">
         <span className="text-[11px] text-muted-foreground">This page</span>
         {mode === 'color' && (
           <button
@@ -1137,7 +1137,7 @@ function VariableList({
           </button>
         )}
       </div>
-      <div className="max-h-72 overflow-y-auto py-1">
+      <div className="max-h-72 min-h-0 flex-1 overflow-y-auto py-1">
         {variables.length === 0 ? (
           <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">
             {mode === 'color'
@@ -1212,8 +1212,8 @@ function ValuePopover({
   onClose: () => void
 }) {
   return (
-    <div className="w-64">
-      <div className="flex items-center justify-between border-b px-2 py-1.5">
+    <div className="flex min-h-0 w-56 max-w-full flex-col">
+      <div className="flex shrink-0 items-center justify-between border-b px-2 py-1.5">
         <span className="rounded-md bg-muted px-2 py-1 text-xs font-medium">Libraries</span>
         <button
           type="button"
@@ -1267,7 +1267,7 @@ function BindableField({
   const [open, setOpen] = useState(false)
   if (!bind) return <>{children}</>
   const content = (
-    <PopoverContent align="start" side="left" className="w-auto p-0">
+    <PopoverContent align="start" side="bottom" className="w-auto overflow-hidden p-0">
       <ValuePopover
         variables={bind.variables}
         binding={bind.binding}
@@ -1358,8 +1358,8 @@ function PaintPopover({
     'rounded-md px-2 py-1 text-xs ' +
     (tab === t ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground hover:text-foreground')
   return (
-    <div className="w-64">
-      <div className="flex items-center justify-between border-b px-2 py-1.5">
+    <div className="flex min-h-0 w-56 max-w-full flex-col">
+      <div className="flex shrink-0 items-center justify-between border-b px-2 py-1.5">
         <div className="flex gap-0.5">
           <button type="button" className={tabClass('custom')} onClick={() => setTab('custom')}>
             Custom
@@ -1380,7 +1380,7 @@ function PaintPopover({
         </button>
       </div>
       {tab === 'custom' || !variables ? (
-        <div className="p-3">
+        <div className="min-h-0 overflow-y-auto p-2.5">
           <ColorPicker value={value} onChange={onChange} />
         </div>
       ) : (
@@ -1468,7 +1468,7 @@ function ColorRow({
             <span className="absolute inset-0" style={{ background: shown ? paint : 'transparent' }} />
           </button>
         </PopoverTrigger>
-        <PopoverContent align="start" side="left" className="w-auto p-0">
+        <PopoverContent align="start" side="bottom" className="w-auto overflow-hidden p-0">
           <PaintPopover
             key={tab}
             value={visible && !parsed.unknown ? paint : lastVisible.current.startsWith('var(') ? '#d9d9d9' : lastVisible.current}
