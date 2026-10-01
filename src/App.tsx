@@ -390,11 +390,13 @@ function PaddingPairField({
   a,
   b,
   onChange,
+  bind,
 }: {
   label: string
   a?: string
   b?: string
   onChange: (v: string) => void
+  bind?: BindProps
 }) {
   const pa = parseUnit(a ?? '')
   const pb = parseUnit(b ?? '')
@@ -403,39 +405,51 @@ function PaddingPairField({
   return (
     <div className="space-y-1">
       <Label className="text-[11px] text-muted-foreground">{label}</Label>
-      <div className="relative">
-        <NumericInput
-          value={same ? Number(pa!.num) : 0}
-          blank={!same}
-          placeholder={same ? undefined : 'Mixed'}
-          onChange={(n) => onChange(`${n}${unit}`)}
-          className="h-8 pr-7 font-mono text-xs"
-        />
-        <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
-          {unit}
-        </span>
-      </div>
+      <BindableField bind={bind} offset="right-7">
+        <div className="relative">
+          <NumericInput
+            value={same ? Number(pa!.num) : 0}
+            blank={!same}
+            placeholder={same ? undefined : 'Mixed'}
+            onChange={(n) => onChange(`${n}${unit}`)}
+            className="h-8 pr-7 font-mono text-xs"
+          />
+          <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
+            {unit}
+          </span>
+        </div>
+      </BindableField>
     </div>
   )
 }
 
-function OpacityField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function OpacityField({
+  value,
+  onChange,
+  bind,
+}: {
+  value: string
+  onChange: (v: string) => void
+  bind?: BindProps
+}) {
   const pct = Math.round((parseFloat(value) || 1) * 100)
   return (
     <div className="space-y-1">
       <Label className="text-[11px] text-muted-foreground">Opacity</Label>
-      <div className="relative">
-        <NumericInput
-          min={0}
-          max={100}
-          value={pct}
-          onChange={(n) => onChange(String(Math.min(100, Math.max(0, n)) / 100))}
-          className="h-8 font-mono text-xs"
-        />
-        <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
-          %
-        </span>
-      </div>
+      <BindableField bind={bind} offset="right-6">
+        <div className="relative">
+          <NumericInput
+            min={0}
+            max={100}
+            value={pct}
+            onChange={(n) => onChange(String(Math.min(100, Math.max(0, n)) / 100))}
+            className="h-8 font-mono text-xs"
+          />
+          <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 font-mono text-[11px] text-muted-foreground">
+            %
+          </span>
+        </div>
+      </BindableField>
     </div>
   )
 }
@@ -542,6 +556,7 @@ function trackCount(value: string | undefined): number {
 }
 
 const TYPOGRAPHY_FIELDS: StyleField[] = [
+  { prop: 'fontFamily', label: 'Font', type: 'text' },
   { prop: 'fontSize', label: 'Size', type: 'unit' },
   {
     prop: 'fontWeight',
@@ -604,11 +619,14 @@ function DimensionField({
   label,
   selection,
   onApply,
+  bind,
 }: {
   axis: 'width' | 'height'
   label: string
   selection: SelectionPayload
   onApply: ApplyFn
+  /** Only offered while the axis is Fixed — Hug and Fill have no number. */
+  bind?: BindProps
 }) {
   const role = axisRole(axis, selection.parentLayout)
   // Worked out by the page, which is the only side that can see the
@@ -624,12 +642,19 @@ function DimensionField({
   return (
     <div className="flex h-8 items-center rounded-md border bg-background pl-2 focus-within:ring-1 focus-within:ring-ring">
       <span className="w-4 font-mono text-[11px] text-muted-foreground">{label}</span>
-      <NumericInput
-        value={shown}
-        disabled={mode !== 'fixed'}
-        onChange={(n) => onApply(axis, `${n}px`)}
-        className="h-full min-w-0 flex-1 border-0 bg-transparent p-0 font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
-      />
+      <BindableField
+        bind={mode === 'fixed' ? bind : undefined}
+        offset="right-1"
+        wrapperClassName="h-full min-w-0 flex-1"
+        chipClassName="h-full"
+      >
+        <NumericInput
+          value={shown}
+          disabled={mode !== 'fixed'}
+          onChange={(n) => onApply(axis, `${n}px`)}
+          className="h-full min-w-0 flex-1 border-0 bg-transparent p-0 font-mono text-xs outline-none focus-visible:ring-0 disabled:bg-transparent disabled:text-muted-foreground"
+        />
+      </BindableField>
       <Select
         value={mode}
         onValueChange={(m: SizeMode) => {
@@ -971,7 +996,27 @@ function VariablesIcon({ className }: { className?: string }) {
   )
 }
 
-type ColorVariable = { name: string; value: string }
+/** What a variable's value is, like Figma's variable types — decides which
+ * fields it can be applied to. */
+type VarKind = 'length' | 'weight' | 'lineHeight' | 'opacity' | 'family'
+
+/** A design token as the page reports it: its name and value, plus what the
+ * browser says that value *is* (a length in px, a plain number, a font
+ * stack). Colors carry no kind — they're recognised by parseColor. */
+type PageToken = {
+  name: string
+  value: string
+  kind?: 'length' | 'number' | 'family' | 'other'
+  px?: number
+  num?: number
+}
+
+type ColorVariable = {
+  name: string
+  value: string
+  /** Shown on the right of the row for non-color variables (16, 700, ...). */
+  label?: string
+}
 
 /** The header's four-dot button: opens the paint popover straight on
  * Libraries, to bind the section's paint to a variable — adding the paint
@@ -1045,15 +1090,23 @@ function VariableList({
   variables,
   selected,
   onPick,
+  mode = 'color',
 }: {
   variables: ColorVariable[]
   selected: string
   onPick: (name: string) => void
+  /** Colors get a swatch and an optional grid view; everything else lists
+   * its name on the left and its value on the right, like Figma's number
+   * variables. */
+  mode?: 'color' | 'value'
 }) {
   const [query, setQuery] = useState('')
   const [grid, setGrid] = useState(false)
+  const asGrid = grid && mode === 'color'
   const q = query.trim().toLowerCase()
-  const matches = variables.filter((v) => !q || variablePath(v.name).full.toLowerCase().includes(q) || v.name.includes(q))
+  const matches = variables.filter(
+    (v) => !q || variablePath(v.name).full.toLowerCase().includes(q) || v.name.includes(q)
+  )
   const groups = new Map<string, ColorVariable[]>()
   for (const v of matches) {
     const g = variablePath(v.name).group
@@ -1073,19 +1126,23 @@ function VariableList({
       </div>
       <div className="flex items-center justify-between border-b px-3 py-1.5">
         <span className="text-[11px] text-muted-foreground">This page</span>
-        <button
-          type="button"
-          title={grid ? 'Show as list' : 'Show as grid'}
-          onClick={() => setGrid((g) => !g)}
-          className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-        >
-          {grid ? <List className="size-3.5" /> : <VariablesIcon className="size-3.5" />}
-        </button>
+        {mode === 'color' && (
+          <button
+            type="button"
+            title={grid ? 'Show as list' : 'Show as grid'}
+            onClick={() => setGrid((g) => !g)}
+            className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            {grid ? <List className="size-3.5" /> : <VariablesIcon className="size-3.5" />}
+          </button>
+        )}
       </div>
       <div className="max-h-72 overflow-y-auto py-1">
         {variables.length === 0 ? (
           <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">
-            No color variables on this page. Colors declared as CSS variables on :root show up here.
+            {mode === 'color'
+              ? 'No color variables on this page. Colors declared as CSS variables on :root show up here.'
+              : 'No variables of this type on this page. Values declared as CSS variables on :root show up here.'}
           </p>
         ) : matches.length === 0 ? (
           <p className="px-3 py-6 text-center text-[11px] text-muted-foreground">No matches</p>
@@ -1093,7 +1150,7 @@ function VariableList({
           Array.from(groups, ([group, items]) => (
             <div key={group || '·'} className="py-1">
               {group && <p className="px-3 py-1 text-[11px] text-muted-foreground">{group}</p>}
-              {grid ? (
+              {asGrid ? (
                 <div className="flex flex-wrap gap-1.5 px-3 py-1">
                   {items.map((v) => (
                     <button
@@ -1120,8 +1177,15 @@ function VariableList({
                       (v.name === selected ? ' bg-[#E5F4FF] dark:bg-[#0D99FF]/20' : '')
                     }
                   >
-                    <span className="size-4 shrink-0 rounded-sm border" style={{ background: v.value }} />
-                    <span className="truncate">{variablePath(v.name).leaf}</span>
+                    {mode === 'color' && (
+                      <span className="size-4 shrink-0 rounded-sm border" style={{ background: v.value }} />
+                    )}
+                    <span className="min-w-0 flex-1 truncate">{variablePath(v.name).leaf}</span>
+                    {mode === 'value' && (
+                      <span className="max-w-[45%] shrink-0 truncate font-mono text-[11px] text-muted-foreground">
+                        {v.label ?? v.value}
+                      </span>
+                    )}
                   </button>
                 ))
               )}
@@ -1129,6 +1193,142 @@ function VariableList({
           ))
         )}
       </div>
+    </div>
+  )
+}
+
+/** The picker for non-color variables: Figma's popover with just its
+ * Libraries tab (there's no custom picker for a number), search, grouped
+ * list, and a close button. */
+function ValuePopover({
+  variables,
+  binding,
+  onPick,
+  onClose,
+}: {
+  variables: ColorVariable[]
+  binding: string
+  onPick: (name: string) => void
+  onClose: () => void
+}) {
+  return (
+    <div className="w-64">
+      <div className="flex items-center justify-between border-b px-2 py-1.5">
+        <span className="rounded-md bg-muted px-2 py-1 text-xs font-medium">Libraries</span>
+        <button
+          type="button"
+          title="Close"
+          onClick={onClose}
+          className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <X className="size-3.5" />
+        </button>
+      </div>
+      <VariableList mode="value" variables={variables} selected={binding} onPick={onPick} />
+    </div>
+  )
+}
+
+/** Everything a numeric or text field needs to take part in Figma's
+ * "apply a variable" flow. */
+type BindProps = {
+  variables: ColorVariable[]
+  /** The variable the field is bound to ('' when it holds a plain value). */
+  binding: string
+  /** The bound variable's value, shown on the right of the chip. */
+  valueLabel: string
+  onPick: (name: string) => void
+  /** "Detach variable": keep the value, drop the link. */
+  onDetach: () => void
+  onOpen?: () => void
+}
+
+/**
+ * Wraps a field the way Figma does: a small variables button appears inside
+ * it on hover, opening the variable picker; once a variable is applied, the
+ * field is replaced by a chip showing the variable's name (and value), which
+ * reopens the picker when clicked and offers Detach on hover.
+ */
+function BindableField({
+  bind,
+  children,
+  offset = 'right-1.5',
+  wrapperClassName = '',
+  chipClassName = 'h-8 rounded-md border bg-background px-2',
+}: {
+  bind?: BindProps
+  children: React.ReactNode
+  /** Where the hover button sits (a right-* class), clear of anything at
+   * the field's edge such as a unit dropdown. */
+  offset?: string
+  wrapperClassName?: string
+  chipClassName?: string
+}) {
+  const [open, setOpen] = useState(false)
+  if (!bind) return <>{children}</>
+  const content = (
+    <PopoverContent align="start" side="left" className="w-auto p-0">
+      <ValuePopover
+        variables={bind.variables}
+        binding={bind.binding}
+        onPick={(n) => {
+          bind.onPick(n)
+          setOpen(false)
+        }}
+        onClose={() => setOpen(false)}
+      />
+    </PopoverContent>
+  )
+  const onOpenChange = (o: boolean) => {
+    setOpen(o)
+    if (o) bind.onOpen?.()
+  }
+  if (bind.binding) {
+    return (
+      <div className={'group/var flex items-center gap-1.5 ' + chipClassName + ' ' + wrapperClassName}>
+        <Popover open={open} onOpenChange={onOpenChange}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              title={bind.binding}
+              className="flex min-w-0 flex-1 items-center gap-1.5 text-left text-xs"
+            >
+              <VariablesIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="truncate">{variablePath(bind.binding).full}</span>
+            </button>
+          </PopoverTrigger>
+          {content}
+        </Popover>
+        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{bind.valueLabel}</span>
+        <button
+          type="button"
+          title="Detach variable"
+          onClick={bind.onDetach}
+          className="hidden shrink-0 text-muted-foreground group-hover/var:block hover:text-foreground"
+        >
+          <Unlink className="size-3.5" />
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className={'group/var relative ' + wrapperClassName}>
+      {children}
+      <Popover open={open} onOpenChange={onOpenChange}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            title="Apply variable"
+            className={
+              'absolute top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded bg-background text-muted-foreground opacity-0 transition-opacity group-hover/var:opacity-100 hover:text-foreground focus-visible:opacity-100 data-[state=open]:opacity-100 ' +
+              offset
+            }
+          >
+            <VariablesIcon className="size-3.5" />
+          </button>
+        </PopoverTrigger>
+        {content}
+      </Popover>
     </div>
   )
 }
@@ -1854,6 +2054,7 @@ export default function App() {
   // Last frame the user interacted with; frame-scoped requests that aren't
   // tied to a specific element (tokens, comments) go to this frame.
   const lastFrameRef = useRef<string | null>(null)
+  const tokensRequested = useRef(false)
   // Current values for code that runs later than the render it was created
   // in (async undo/redo, history bookkeeping).
   const selectionRef = useRef<SelectionPayload | null>(null)
@@ -1896,7 +2097,7 @@ export default function App() {
   const [selectedCommentId, setSelectedCommentId] = useState<string | null>(null)
 
   // Design tokens
-  const [tokens, setTokens] = useState<{ name: string; value: string }[]>([])
+  const [tokens, setTokens] = useState<PageToken[]>([])
   const [tokenDraft, setTokenDraft] = useState<Record<string, string>>({})
   const [tokenEdits, setTokenEdits] = useState<TokenEdit[]>([])
   const [advancedTokens, setAdvancedTokens] = useState(false)
@@ -2606,6 +2807,97 @@ export default function App() {
     return !c.unknown && !c.transparent
   })
   const tokenValues = new Map(tokens.map((t) => [t.name, t.value]))
+  const tokensByName = new Map(tokens.map((t) => [t.name, t]))
+
+  // ---------- number, font and text variables ----------
+  /** Which kind of variable each field takes. */
+  const VAR_KIND: Record<string, VarKind> = {
+    fontSize: 'length',
+    letterSpacing: 'length',
+    fontWeight: 'weight',
+    lineHeight: 'lineHeight',
+    fontFamily: 'family',
+    paddingTop: 'length',
+    paddingRight: 'length',
+    paddingBottom: 'length',
+    paddingLeft: 'length',
+    columnGap: 'length',
+    rowGap: 'length',
+    borderRadius: 'length',
+    borderWidth: 'length',
+    width: 'length',
+    height: 'length',
+    opacity: 'opacity',
+  }
+  const fmtNum = (n: number) => String(Math.round(n * 100) / 100)
+
+  /** Figma only offers a field the variables of a matching type. */
+  function acceptsToken(kind: VarKind, t: PageToken): boolean {
+    if (kind === 'length') return t.kind === 'length'
+    if (kind === 'family') return t.kind === 'family'
+    // Line height is usually a unitless ratio, but a length is valid too —
+    // offering every spacing and radius there would bury the real ones, so
+    // lengths only count when they're named like line heights.
+    if (kind === 'lineHeight' && t.kind === 'length') return /leading|line-?height/i.test(t.name)
+    if (t.kind !== 'number' || t.num === undefined) return false
+    // Font weights are the multiples of 50 in 100-900 (a z-index of 50 isn't
+    // one).
+    if (kind === 'weight') return t.num >= 100 && t.num <= 900 && t.num % 50 === 0
+    if (kind === 'opacity') return t.num >= 0 && t.num <= 1
+    return t.num >= 0.75 && t.num <= 10 // a plausible line-height ratio
+  }
+
+  /** The short value shown beside a variable: 16, 700, the first font. */
+  function tokenLabelFor(t: PageToken): string {
+    if (t.kind === 'length' && t.px !== undefined) return fmtNum(t.px)
+    if (t.kind === 'number' && t.num !== undefined) return fmtNum(t.num)
+    if (t.kind === 'family') return t.value.split(',')[0].replace(/["']/g, '').trim()
+    return t.value
+  }
+
+  function variablesFor(kind: VarKind): ColorVariable[] {
+    return tokens
+      .filter((t) => acceptsToken(kind, t))
+      .map((t) => ({ name: t.name, value: t.value, label: tokenLabelFor(t) }))
+  }
+
+  /** What a variable *is* as a plain value, for "Detach variable". */
+  function plainValueFor(prop: string, name: string): string {
+    const t = tokensByName.get(name)
+    if (t?.kind === 'length' && t.px !== undefined) return `${fmtNum(t.px)}px`
+    if (t?.kind === 'number' && t.num !== undefined) return fmtNum(t.num)
+    if (t?.kind === 'family') return t.value
+    // A token the panel hasn't seen (scoped to a component, say): fall back
+    // to what the page computed for the field.
+    return selection?.styles[prop] ?? ''
+  }
+
+  /**
+   * The apply-a-variable wiring for one field. `apply` writes a value to
+   * whichever properties the field drives (one, or both sides of a padding
+   * pair); `bindingProp` is the property whose binding the field reflects.
+   */
+  function bindFor(
+    prop: string,
+    apply: (value: string) => void,
+    /** The property whose binding the field reflects; null for "not bound"
+     * (a pair whose two sides disagree reads as Mixed, not as either). */
+    bindingProp: string | null = prop
+  ): BindProps | undefined {
+    const kind = VAR_KIND[prop]
+    if (!kind || !selection) return undefined
+    const binding = bindingProp ? bindingFor(bindingProp) : ''
+    const info = binding ? tokensByName.get(binding) : undefined
+    const computed = bindingProp ? (selection.styles[bindingProp] ?? '').replace(/px$/, '') : ''
+    return {
+      variables: variablesFor(kind),
+      binding,
+      valueLabel: info ? tokenLabelFor(info) : computed,
+      onPick: (name) => apply(`var(${name})`),
+      onDetach: () => apply(plainValueFor(bindingProp ?? prop, binding)),
+      onOpen: ensureTokens,
+    }
+  }
 
   /** Tokens are loaded lazily (by the Tokens/Comments tabs); a paint
    * popover needs them too, the moment it opens. */
@@ -2616,7 +2908,7 @@ export default function App() {
   /** The variable a paint is bound to: one applied in the panel shows up in
    * the draft itself; otherwise it's whatever the page's CSS binds it to,
    * for as long as the value is still the one the page started with. */
-  function bindingFor(prop: 'backgroundColor' | 'color' | 'borderColor'): string {
+  function bindingFor(prop: string): string {
     const v = draft[prop] ?? ''
     const own = v.match(VAR_REF)?.[1]
     if (own) return own
@@ -2764,6 +3056,16 @@ export default function App() {
     await run('to')
     pushHistory({ kind: 'structure', undo: () => run('from'), redo: () => run('to') })
   }
+
+  // Variable names and values are needed the moment something with a
+  // binding is selected (the chip shows its value), not only when a picker
+  // is opened — so fetch them on the first selection.
+  useEffect(() => {
+    if (!selection || tokensRequested.current) return
+    tokensRequested.current = true
+    loadCommentsAndTokens()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection?.elementId])
 
   function selectLayer(id: number) {
     sendToPage({
@@ -3252,6 +3554,7 @@ export default function App() {
             onChange={(v) => applyStyle(f.prop, v)}
           />
         ) : f.type === 'select' ? (
+          <BindableField bind={bindFor(f.prop, (v) => applyStyle(f.prop, v))} offset="right-8">
           <Select value={value} onValueChange={(v) => applyStyle(f.prop, v)}>
             <SelectTrigger
               className={
@@ -3275,6 +3578,7 @@ export default function App() {
               ))}
             </SelectContent>
           </Select>
+          </BindableField>
         ) : f.type === 'unit' ? (
           (() => {
             // A keyword like letter-spacing's "normal" means zero, so show a
@@ -3284,18 +3588,22 @@ export default function App() {
                 ? { num: '0', unit: 'px' }
                 : parseUnit(value)
             // Anything else we can't split into number+unit stays free text.
+            const bind = bindFor(f.prop, (v) => applyStyle(f.prop, v))
             if (!parsed)
               return (
-                <Input
-                  value={value}
-                  onChange={(e) => applyStyle(f.prop, e.target.value)}
-                  className={
-                    'h-8 font-mono text-xs' +
-                    (edited ? ' border-primary bg-primary/5' : '')
-                  }
-                />
+                <BindableField bind={bind}>
+                  <Input
+                    value={value}
+                    onChange={(e) => applyStyle(f.prop, e.target.value)}
+                    className={
+                      'h-8 font-mono text-xs' +
+                      (edited ? ' border-primary bg-primary/5' : '')
+                    }
+                  />
+                </BindableField>
               )
             return (
+              <BindableField bind={bind} offset="right-[72px]">
               <div className="flex items-center gap-1">
                 <NumericInput
                   value={Number(parsed.num)}
@@ -3321,17 +3629,20 @@ export default function App() {
                   </SelectContent>
                 </Select>
               </div>
+              </BindableField>
             )
           })()
         ) : (
-          <Input
-            value={value}
-            onChange={(e) => applyStyle(f.prop, e.target.value)}
-            className={
-              'h-8 font-mono text-xs' +
-              (edited ? ' border-primary bg-primary/5' : '')
-            }
-          />
+          <BindableField bind={bindFor(f.prop, (v) => applyStyle(f.prop, v))}>
+            <Input
+              value={value}
+              onChange={(e) => applyStyle(f.prop, e.target.value)}
+              className={
+                'h-8 font-mono text-xs' +
+                (edited ? ' border-primary bg-primary/5' : '')
+              }
+            />
+          </BindableField>
         )}
       </div>
     )
@@ -3942,12 +4253,14 @@ export default function App() {
                             label="W"
                             selection={selection}
                             onApply={applyStyle}
+                            bind={bindFor('width', (v) => applyStyle('width', v))}
                           />
                           <DimensionField
                             axis="height"
                             label="H"
                             selection={selection}
                             onApply={applyStyle}
+                            bind={bindFor('height', (v) => applyStyle('height', v))}
                           />
                         </div>
                       </FieldRow>
@@ -4005,6 +4318,16 @@ export default function App() {
                                 applyStyle('paddingLeft', v)
                                 applyStyle('paddingRight', v)
                               }}
+                              // Bound only when both sides use the same
+                              // variable; otherwise it's "Mixed".
+                              bind={bindFor(
+                                'paddingLeft',
+                                (v) => {
+                                  applyStyle('paddingLeft', v)
+                                  applyStyle('paddingRight', v)
+                                },
+                                bindingFor('paddingLeft') === bindingFor('paddingRight') ? 'paddingLeft' : null
+                              )}
                             />
                             <PaddingPairField
                               label="Vertical"
@@ -4014,6 +4337,14 @@ export default function App() {
                                 applyStyle('paddingTop', v)
                                 applyStyle('paddingBottom', v)
                               }}
+                              bind={bindFor(
+                                'paddingTop',
+                                (v) => {
+                                  applyStyle('paddingTop', v)
+                                  applyStyle('paddingBottom', v)
+                                },
+                                bindingFor('paddingTop') === bindingFor('paddingBottom') ? 'paddingTop' : null
+                              )}
                             />
                           </div>
                         )}
@@ -4044,6 +4375,7 @@ export default function App() {
                   <OpacityField
                     value={draft.opacity ?? '1'}
                     onChange={(v) => applyStyle('opacity', v)}
+                    bind={bindFor('opacity', (v) => applyStyle('opacity', v))}
                   />
                   {renderField({ prop: 'borderRadius', label: 'Corner radius', type: 'unit' })}
                 </div>

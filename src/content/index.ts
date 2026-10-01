@@ -367,6 +367,7 @@ function resolveSource(el: Element): { source: SourceInfo; chain: string[] } {
 // one consistent thing across whatever text is inside the selection.
 const TYPOGRAPHY_KEYS = [
   'color',
+  'fontFamily',
   'fontSize',
   'fontWeight',
   'lineHeight',
@@ -451,7 +452,7 @@ function buildPayload(el: Element): SelectionPayload {
     },
     sizing: readSizing(el),
     specified: readSpecified(el),
-    bindings: readBindings(el),
+    bindings: readBindings(el, textRuns[0] ?? el),
     parentLayout: readParentLayout(el),
     transform: getTransformParts(registerEl(el)),
   }
@@ -489,8 +490,33 @@ const WATCHED_PROPS = [
   'color',
   'border-color',
   'border-top-color',
+  'font-family',
+  'font-size',
+  'font-weight',
+  'line-height',
+  'letter-spacing',
+  'padding',
+  'padding-top',
+  'padding-right',
+  'padding-bottom',
+  'padding-left',
+  'gap',
+  'row-gap',
+  'column-gap',
+  'border-radius',
+  'border-top-left-radius',
+  'border-width',
+  'border-top-width',
+  'opacity',
 ]
-type DeclRule = { selector: string; decls: Record<string, string>; important: Set<string>; spec: number }
+type DeclRule = {
+  selector: string
+  decls: Record<string, string>
+  important: Set<string>
+  spec: number
+  /** Position in the stylesheets — the cascade's tiebreaker. */
+  order: number
+}
 let declRules: DeclRule[] | null = null
 let declRulesStamp = ''
 
@@ -561,7 +587,13 @@ function collectDeclRules(): DeclRule[] {
       if (rule.style.getPropertyPriority(prop) === 'important') important.add(prop)
     }
     if (Object.keys(decls).length) {
-      out.push({ selector: rule.selectorText, decls, important, spec: specificityOf(rule.selectorText) })
+      out.push({
+        selector: rule.selectorText,
+        decls,
+        important,
+        spec: specificityOf(rule.selectorText),
+        order: out.length,
+      })
     }
   })
   declRules = out
@@ -572,25 +604,36 @@ function collectDeclRules(): DeclRule[] {
 /** The value the author actually wrote for a property on this element
  * ('', 'auto', '100%', 'var(--primary)', ...) — inline style first, then the
  * winning rule. Computed styles can't answer this: they resolve lengths to
- * pixels and variables to their colors. */
-function specifiedValue(el: HTMLElement, prop: string): string {
-  const inline = el.style.getPropertyValue(prop)
-  if (inline) return inline.trim()
+ * pixels and variables to their colors.
+ *
+ * Takes every name that can set the property (`padding-top` and `padding`,
+ * `background-color` and `background`): a rule that writes the shorthand
+ * competes with one that writes the longhand, and the cascade — not which
+ * name happens to be checked first — decides the winner. */
+function specifiedValue(el: HTMLElement, props: string | string[]): string {
+  const names = Array.isArray(props) ? props : [props]
+  for (const name of names) {
+    const inline = el.style.getPropertyValue(name)
+    if (inline) return inline.trim()
+  }
   let best = ''
   let bestSpec = -1
+  let bestOrder = -1
   for (const rule of collectDeclRules()) {
-    const v = rule.decls[prop]
-    if (!v) continue
-    const spec = rule.spec + (rule.important.has(prop) ? 1e6 : 0)
-    if (spec < bestSpec) continue
-    try {
-      if (!el.matches(rule.selector)) continue
-    } catch {
-      continue // a selector this browser can't parse (::v-deep and friends)
+    for (const name of names) {
+      const v = rule.decls[name]
+      if (!v) continue
+      const spec = rule.spec + (rule.important.has(name) ? 1e6 : 0)
+      if (spec < bestSpec || (spec === bestSpec && rule.order < bestOrder)) continue
+      try {
+        if (!el.matches(rule.selector)) continue
+      } catch {
+        continue // a selector this browser can't parse (::v-deep and friends)
+      }
+      bestSpec = spec
+      bestOrder = rule.order
+      best = v
     }
-    // Ties go to whichever comes last in document order, like the cascade.
-    bestSpec = spec
-    best = v
   }
   return best
 }
@@ -609,31 +652,52 @@ function varName(value: string): string {
   return value.match(VAR_ONLY)?.[1] ?? ''
 }
 
-function colorBinding(el: HTMLElement, prop: 'backgroundColor' | 'color' | 'borderColor'): string {
-  if (prop === 'backgroundColor') {
-    // A variable in the `background` shorthand leaves the longhand unset in
-    // the CSSOM (it can't be split until the variable is resolved).
-    return varName(specifiedValue(el, 'background-color')) || varName(specifiedValue(el, 'background'))
-  }
-  if (prop === 'borderColor') {
-    return varName(specifiedValue(el, 'border-color')) || varName(specifiedValue(el, 'border-top-color'))
-  }
-  // Text color is inherited: a paragraph with no color of its own is still
-  // painted with whatever variable its nearest ancestor set.
-  for (let node: HTMLElement | null = el; node && node !== document.documentElement; node = node.parentElement) {
-    const v = specifiedValue(node, 'color')
+/** Every property that can be bound to a design token, with the CSS names
+ * that can set it, and whether it inherits — an inherited one (a paragraph's
+ * font, its color) is bound by whichever ancestor last wrote it. */
+const BINDABLE: Record<string, { names: string[]; inherited: boolean; typography?: boolean }> = {
+  backgroundColor: { names: ['background-color', 'background'], inherited: false },
+  borderColor: { names: ['border-color', 'border-top-color'], inherited: false },
+  color: { names: ['color'], inherited: true, typography: true },
+  fontFamily: { names: ['font-family'], inherited: true, typography: true },
+  fontSize: { names: ['font-size'], inherited: true, typography: true },
+  fontWeight: { names: ['font-weight'], inherited: true, typography: true },
+  lineHeight: { names: ['line-height'], inherited: true, typography: true },
+  letterSpacing: { names: ['letter-spacing'], inherited: true, typography: true },
+  paddingTop: { names: ['padding-top', 'padding'], inherited: false },
+  paddingRight: { names: ['padding-right', 'padding'], inherited: false },
+  paddingBottom: { names: ['padding-bottom', 'padding'], inherited: false },
+  paddingLeft: { names: ['padding-left', 'padding'], inherited: false },
+  columnGap: { names: ['column-gap', 'gap'], inherited: false },
+  rowGap: { names: ['row-gap', 'gap'], inherited: false },
+  borderRadius: { names: ['border-radius', 'border-top-left-radius'], inherited: false },
+  borderWidth: { names: ['border-width', 'border-top-width'], inherited: false },
+  width: { names: ['width'], inherited: false },
+  height: { names: ['height'], inherited: false },
+  opacity: { names: ['opacity'], inherited: false },
+}
+
+function bindingFor(el: HTMLElement, prop: string): string {
+  const def = BINDABLE[prop]
+  if (!def) return ''
+  if (!def.inherited) return varName(specifiedValue(el, def.names))
+  for (let node: HTMLElement | null = el; node; node = node.parentElement) {
+    const v = specifiedValue(node, def.names)
     if (v && v !== 'inherit') return varName(v)
   }
   return ''
 }
 
-function readBindings(el: Element): SelectionPayload['bindings'] {
-  if (!(el instanceof HTMLElement)) return { backgroundColor: '', color: '', borderColor: '' }
-  return {
-    backgroundColor: colorBinding(el, 'backgroundColor'),
-    color: colorBinding(el, 'color'),
-    borderColor: colorBinding(el, 'borderColor'),
+/** Which design token each property is bound to ('' for none). Typography
+ * is read off the text itself — for a container that's its one shared text
+ * run — to match the values the panel shows for it. */
+function readBindings(el: Element, textEl: Element): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const prop of Object.keys(BINDABLE)) {
+    const source = BINDABLE[prop].typography ? textEl : el
+    out[prop] = source instanceof HTMLElement ? bindingFor(source, prop) : ''
   }
+  return out
 }
 
 /** Sizes that ask to hug the content outright, as opposed to "auto", which
@@ -1346,7 +1410,48 @@ function resetAll() {
 
 const tokenPristine = new Map<string, string>()
 
-function getTokens(): { name: string; value: string }[] {
+type TokenKind = 'length' | 'number' | 'family' | 'other'
+
+/**
+ * What a token's value is — Figma's variable *types* — so a picker only
+ * offers values a field can actually take. Asked of the browser itself
+ * instead of guessed from the text: a probe element is handed the value as
+ * a width (valid → it's a length, and its computed width is the pixel
+ * value, whatever the unit or calc()), then as a flex-grow (valid → a plain
+ * number). Colors fall through both and are recognised by the panel.
+ */
+function classifyToken(raw: string, probe: HTMLElement): { kind: TokenKind; px?: number; num?: number } {
+  const v = raw.trim()
+  if (!v) return { kind: 'other' }
+  // Bare keywords (auto, inherit, a color name...) are valid for these
+  // properties but aren't numbers.
+  const keyword = /^[a-z-]+$/i.test(v)
+  if (!keyword && !v.includes('%')) {
+    // margin-left, not width: it's the one length property that also takes
+    // negatives, which letter-spacing tokens like -0.025em are.
+    probe.style.marginLeft = ''
+    probe.style.marginLeft = v
+    if (probe.style.marginLeft) {
+      const px = parseFloat(getComputedStyle(probe).marginLeft)
+      if (!Number.isNaN(px)) return { kind: 'length', px }
+    }
+    probe.style.flexGrow = ''
+    probe.style.flexGrow = v
+    if (probe.style.flexGrow) {
+      const num = parseFloat(getComputedStyle(probe).flexGrow)
+      if (!Number.isNaN(num)) return { kind: 'number', num }
+    }
+  }
+  // A font stack: names and quoted names separated by commas, with no
+  // function calls or digits (that would be a cubic-bezier, a shadow, ...).
+  const bare = v.replace(/"[^"]*"|'[^']*'/g, '')
+  if (!/[()\d]/.test(bare) && (/,|["']/.test(v) || /\b(serif|sans-serif|monospace|system-ui|cursive|fantasy)\b/i.test(v))) {
+    return { kind: 'family' }
+  }
+  return { kind: 'other' }
+}
+
+function getTokens(): { name: string; value: string; kind?: TokenKind; px?: number; num?: number }[] {
   const seen = new Map<string, string>()
   const rootStyle = getComputedStyle(document.documentElement)
   // :root / html custom properties, wherever they live — including inside
@@ -1361,7 +1466,14 @@ function getTokens(): { name: string; value: string }[] {
       seen.set(prop, live || rule.style.getPropertyValue(prop).trim())
     }
   })
-  return Array.from(seen, ([name, value]) => ({ name, value }))
+  const probe = document.createElement('div')
+  probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;width:0;height:0'
+  document.documentElement.appendChild(probe)
+  try {
+    return Array.from(seen, ([name, value]) => ({ name, value, ...classifyToken(value, probe) }))
+  } finally {
+    probe.remove()
+  }
 }
 
 function setToken(name: string, value: string) {

@@ -38,7 +38,7 @@ export type SelectionPayload = {
   /** The design token (CSS variable name, e.g. "--primary") each paint is
    * bound to, or '' when it's a plain color — Figma's fill-bound-to-a-
    * variable. Text color is inherited, so it can come from an ancestor. */
-  bindings: { backgroundColor: string; color: string; borderColor: string }
+  bindings: Record<string, string>
   /** The parent's layout mode, which decides what Hug/Fixed/Fill have to
    * write: grow along the parent's main axis, stretch across it, or a plain
    * percentage when the parent isn't a flex container at all. */
